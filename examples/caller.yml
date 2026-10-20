@@ -1,0 +1,35 @@
+name: bugbot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: bugbot-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  bugbot:
+    # A caller can forward every `labeled` event, but only the draft label
+    # starts a review. Keep this in sync with the draft_label input.
+    if: github.event.action != 'labeled' || github.event.label.name == 'bugbot'
+    uses: anduraio/bugbot/.github/workflows/review.yml@v1
+    with:
+      pr: ${{ inputs.pr }}
+    # Pass secrets explicitly. `inherit` only works inside one organization or
+    # enterprise, and this caller is under a different owner.
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      BUGBOT_APP_ID: ${{ secrets.BUGBOT_APP_ID }}
+      BUGBOT_APP_PRIVATE_KEY: ${{ secrets.BUGBOT_APP_PRIVATE_KEY }}

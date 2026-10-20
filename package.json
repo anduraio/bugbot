@@ -1,0 +1,26 @@
+{
+  "name": "bugbot",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Comment-only pull request reviewer. Never approves, blocks or merges.",
+  "license": "MIT",
+  "bin": {
+    "bugbot": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12"
+  }
+}

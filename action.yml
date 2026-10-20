@@ -1,0 +1,41 @@
+name: Bugbot
+description: Comment-only pull request reviewer. Never approves, blocks or merges.
+inputs:
+  model:
+    description: OpenRouter model id for a normal PR.
+    required: false
+    default: deepseek/deepseek-v4.1-flash-1017
+  big_pr_model:
+    description: Model for PRs over 1,500 changed lines or over budget. Empty disables.
+    required: false
+    default: ""
+  max_tokens:
+    description: Input token budget, estimated at about 4 characters per token.
+    required: false
+    default: "120000"
+  min_confidence:
+    description: Minimum confidence for an inline comment.
+    required: false
+    default: "0.8"
+  dry_run:
+    description: Log findings without posting anything.
+    required: false
+    default: "false"
+  comment_sicko:
+    description: Enable the optional comment-sicko second pass.
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Review
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: node dist/cli.js review
+      env:
+        BUGBOT_MODEL: ${{ inputs.model }}
+        BUGBOT_BIG_PR_MODEL: ${{ inputs.big_pr_model }}
+        BUGBOT_MAX_TOKENS: ${{ inputs.max_tokens }}
+        BUGBOT_MIN_CONFIDENCE: ${{ inputs.min_confidence }}
+        BUGBOT_DRY_RUN: ${{ inputs.dry_run }}
+        BUGBOT_COMMENT_SICKO: ${{ inputs.comment_sicko }}

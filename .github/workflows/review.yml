@@ -1,0 +1,266 @@
+name: bugbot
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: Pull request number. Defaults to the triggering pull_request event.
+        required: false
+        type: string
+        default: ""
+      draft_label:
+        description: Label that opts a draft PR into review.
+        required: false
+        type: string
+        default: bugbot
+      model:
+        description: OpenRouter model id for a normal PR.
+        required: false
+        type: string
+        default: deepseek/deepseek-v4.1-flash-1017
+      big_pr_model:
+        description: Model for PRs over 1,500 changed lines or over budget. Empty disables.
+        required: false
+        type: string
+        default: ""
+      max_tokens:
+        description: Input token budget, estimated at about 4 characters per token.
+        required: false
+        type: string
+        default: "120000"
+      min_confidence:
+        description: Minimum confidence for an inline comment.
+        required: false
+        type: string
+        default: "0.8"
+      dry_run:
+        description: Log findings without posting anything.
+        required: false
+        type: string
+        default: "false"
+      comment_sicko:
+        description: Enable the optional comment-sicko second pass.
+        required: false
+        type: string
+        default: "false"
+    secrets:
+      OPENROUTER_API_KEY:
+        required: false
+      BUGBOT_APP_ID:
+        required: false
+      BUGBOT_APP_PRIVATE_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number.
+        required: true
+        type: string
+      draft_label:
+        description: Label that opts a draft PR into review.
+        required: false
+        type: string
+        default: bugbot
+      model:
+        description: OpenRouter model id for a normal PR.
+        required: false
+        type: string
+        default: deepseek/deepseek-v4.1-flash-1017
+      big_pr_model:
+        description: Model for PRs over 1,500 changed lines or over budget. Empty disables.
+        required: false
+        type: string
+        default: ""
+      max_tokens:
+        description: Input token budget, estimated at about 4 characters per token.
+        required: false
+        type: string
+        default: "120000"
+      min_confidence:
+        description: Minimum confidence for an inline comment.
+        required: false
+        type: string
+        default: "0.8"
+      dry_run:
+        description: Log findings without posting anything.
+        required: false
+        type: string
+        default: "false"
+      comment_sicko:
+        description: Enable the optional comment-sicko second pass.
+        required: false
+        type: string
+        default: "false"
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  review:
+    name: bugbot
+    # Bugbot never fails a PR. A missing secret, a setup error and a draft, fork
+    # or unrelated-label skip all end with a job summary and a green run. The
+    # draft/fork/label gate runs first, so a fork PR gets the skip summary
+    # rather than a missing secret; it is a step so the skip stays visible. It
+    # runs for any event with a PR payload, and the CLI re-applies it from that
+    # payload (or from the API when the event has none) before posting.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preflight
+        id: preflight
+        continue-on-error: true
+        shell: bash
+        env:
+          ACTION: ${{ github.event.action }}
+          HAS_PR: ${{ github.event.pull_request != null }}
+          DRAFT_LABEL: ${{ inputs.draft_label }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HAS_DRAFT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, inputs.draft_label) }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BUGBOT_APP_ID: ${{ secrets.BUGBOT_APP_ID }}
+          BUGBOT_APP_PRIVATE_KEY: ${{ secrets.BUGBOT_APP_PRIVATE_KEY }}
+        run: |
+          review=true
+          if [ "$HAS_PR" = "true" ]; then
+            if [ "$IS_FORK" = "true" ]; then
+              echo "Bugbot skipped: fork" >> "$GITHUB_STEP_SUMMARY"
+              review=false
+            elif [ "$IS_DRAFT" = "true" ] && [ "$HAS_DRAFT_LABEL" != "true" ]; then
+              echo "Bugbot skipped: draft" >> "$GITHUB_STEP_SUMMARY"
+              review=false
+            elif [ "$ACTION" = "labeled" ]; then
+              # A caller may forward every `labeled` event. Only the draft label
+              # starts a review; any other label would be a duplicate pass.
+              label="$(printf '%s' "$LABEL_NAME" | tr '[:upper:]' '[:lower:]')"
+              wanted="$(printf '%s' "$DRAFT_LABEL" | tr '[:upper:]' '[:lower:]')"
+              if [ "$label" != "$wanted" ]; then
+                echo "Bugbot skipped: label $LABEL_NAME" >> "$GITHUB_STEP_SUMMARY"
+                review=false
+              fi
+            fi
+          fi
+          echo "review=$review" >> "$GITHUB_OUTPUT"
+
+          if [ "$review" != "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          missing=""
+          for name in OPENROUTER_API_KEY BUGBOT_APP_ID BUGBOT_APP_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then
+              missing="$name"
+              break
+            fi
+          done
+
+          if [ -n "$missing" ]; then
+            echo "Bugbot couldn't review: missing secret $missing" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App token
+        id: app-token
+        if: steps.preflight.outputs.ready == 'true' && steps.preflight.outputs.review == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # v3 recommends client-id, but that input takes the App's Client ID.
+          # BUGBOT_APP_ID is the numeric App ID, so keep the legacy app-id.
+          app-id: ${{ secrets.BUGBOT_APP_ID }}
+          private-key: ${{ secrets.BUGBOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-checks: write
+
+      - name: Checkout Bugbot
+        id: checkout
+        if: >-
+          steps.preflight.outputs.ready == 'true' &&
+          steps.preflight.outputs.review == 'true' &&
+          steps.app-token.outcome == 'success'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: anduraio/bugbot
+          ref: ${{ job.workflow_sha }}
+          path: .bugbot
+          persist-credentials: false
+
+      - name: Install dependencies
+        id: install
+        if: >-
+          steps.preflight.outputs.ready == 'true' &&
+          steps.preflight.outputs.review == 'true' &&
+          steps.app-token.outcome == 'success' &&
+          steps.checkout.outcome == 'success'
+        continue-on-error: true
+        working-directory: .bugbot
+        run: npm ci
+
+      - name: Build
+        id: build
+        if: >-
+          steps.preflight.outputs.ready == 'true' &&
+          steps.preflight.outputs.review == 'true' &&
+          steps.app-token.outcome == 'success' &&
+          steps.checkout.outcome == 'success' &&
+          steps.install.outcome == 'success'
+        continue-on-error: true
+        working-directory: .bugbot
+        run: npm run build
+
+      - name: Run Bugbot
+        id: run
+        if: >-
+          steps.preflight.outputs.ready == 'true' &&
+          steps.preflight.outputs.review == 'true' &&
+          steps.app-token.outcome == 'success' &&
+          steps.checkout.outcome == 'success' &&
+          steps.install.outcome == 'success' &&
+          steps.build.outcome == 'success'
+        continue-on-error: true
+        uses: ./.bugbot
+        with:
+          model: ${{ inputs.model }}
+          big_pr_model: ${{ inputs.big_pr_model }}
+          max_tokens: ${{ inputs.max_tokens }}
+          min_confidence: ${{ inputs.min_confidence }}
+          dry_run: ${{ inputs.dry_run }}
+          comment_sicko: ${{ inputs.comment_sicko }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BUGBOT_REPOSITORY: ${{ github.repository }}
+          BUGBOT_PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          BUGBOT_RUN_ID: ${{ github.run_id }}
+          BUGBOT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BUGBOT_PR_DRAFT: ${{ github.event.pull_request && github.event.pull_request.draft }}
+          BUGBOT_PR_FORK: ${{ github.event.pull_request && (github.event.pull_request.head.repo.full_name != github.repository) }}
+          BUGBOT_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BUGBOT_DRAFT_LABEL: ${{ inputs.draft_label }}
+
+      - name: Report failure
+        if: >-
+          !cancelled() &&
+          (steps.preflight.outcome == 'failure' ||
+           (steps.preflight.outputs.review == 'true' &&
+            steps.preflight.outputs.ready == 'true' &&
+            (steps.app-token.outcome == 'failure' ||
+             steps.checkout.outcome == 'failure' ||
+             steps.install.outcome == 'failure' ||
+             steps.build.outcome == 'failure' ||
+             steps.run.outcome == 'failure')))
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Bugbot couldn't review: a setup or review step failed; see the workflow log." >> "$GITHUB_STEP_SUMMARY"
