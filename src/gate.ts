@@ -33,9 +33,33 @@ export type ReviewGate =
 export interface EventPullRequest {
   readonly draft: string;
   readonly fork: string;
+  /**
+   * `toJSON(github.event.pull_request.labels.*.name)`: a JSON array of names,
+   * so a label containing a comma stays one label. Empty when absent.
+   */
   readonly labels: string;
   readonly headSha: string;
   readonly number: number;
+}
+
+/**
+ * Parses the labels env value. The workflow passes JSON rather than a comma
+ * join, so "needs, review" stays one label. An empty value, and the `null`
+ * that `toJSON` produces when the PR payload is absent, both mean no labels.
+ * Malformed JSON throws; the CLI turns that into a neutral failed review
+ * instead of guessing which labels were intended.
+ */
+function parseLabels(raw: string): string[] {
+  if (raw.trim() === "") {
+    return [];
+  }
+
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  return parsed.filter((label): label is string => typeof label === "string");
 }
 
 /**
@@ -55,10 +79,7 @@ export function pullRequestFromEvent(
     headSha: event.headSha,
     draft: event.draft === "true",
     fork: event.fork === "true",
-    labels: event.labels
-      .split(",")
-      .map((label) => label.trim())
-      .filter((label) => label !== ""),
+    labels: parseLabels(event.labels),
   };
 }
 

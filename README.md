@@ -9,9 +9,9 @@ can tell when a review pass is done.
 never blocks, fails or merges a pull request. If it cannot review, the check
 goes `neutral` and the summary says why.
 
-Status: step 2, repository skeleton. The TypeScript modules other than the
-finding filter and the draft/fork gate are typed stubs; the review pipeline is
-built in later steps.
+Status: step 3, prompts vendored. The review texts live in `prompts/`; step 4
+assembles them. The TypeScript modules other than the finding filter and the
+draft/fork gate are typed stubs; the review pipeline is built in later steps.
 
 ## Layout
 
@@ -24,8 +24,32 @@ built in later steps.
 - `src/gate.ts` - pure draft/fork gate shared by the workflow and the CLI
 - `src/github.ts` - inline comments, summary, check run, reply/resolve
 - `src/cli.ts` - `bugbot review|status`
+- `prompts/` - pstack review texts, vendored with source headers (MIT)
+- `scripts/sync-prompts.sh` - manual refresh of `prompts/` from a local pstack
 - `examples/caller.yml` - per-repo caller workflow with explicit secrets
 - `test/` - Vitest tests
+
+## Prompts
+
+`prompts/` holds the pstack review texts Bugbot will use: the interrogate
+reviewer angles, blast radius, the Bugbot triage self-filter, comment-sicko,
+TypeScript patterns and two principle skills. Every file starts with an HTML
+comment naming its pstack source path, the pstack version and the sha256 of the
+original file. `prompts/README.md` has the full table and the directory shape.
+
+They are vendored from pstack 0.15.25, MIT licensed,
+Copyright (c) 2026 Lauren Tan. The license text is in
+[prompts/LICENSE-pstack](prompts/LICENSE-pstack).
+
+Refresh manually from a local pstack checkout:
+
+```sh
+scripts/sync-prompts.sh                          # uses ~/.pstack
+PSTACK_DIR=/path/to/pstack scripts/sync-prompts.sh
+```
+
+The script rewrites the headers and the README hashes, prints what changed,
+and makes no network calls. CI never runs it and it never commits.
 
 ## Development
 
@@ -41,5 +65,6 @@ Bugbot targets Node 20.
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 anduraio.
 
-The review prompts are adapted from pstack, which is MIT licensed:
-Copyright (c) 2026 Lauren Tan.
+The review prompts in `prompts/` are vendored from pstack, which is MIT
+licensed: Copyright (c) 2026 Lauren Tan. See
+[prompts/LICENSE-pstack](prompts/LICENSE-pstack).

@@ -246,7 +246,8 @@ jobs:
           BUGBOT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BUGBOT_PR_DRAFT: ${{ github.event.pull_request && github.event.pull_request.draft }}
           BUGBOT_PR_FORK: ${{ github.event.pull_request && (github.event.pull_request.head.repo.full_name != github.repository) }}
-          BUGBOT_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          # JSON, not a comma join: a label can contain a comma. gate.ts parses it.
+          BUGBOT_PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           BUGBOT_DRAFT_LABEL: ${{ inputs.draft_label }}
 
       - name: Report failure

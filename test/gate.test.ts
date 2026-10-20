@@ -80,9 +80,12 @@ describe("pullRequestFromEvent", () => {
     ).toEqual({ number: 7, headSha: "abc123", draft: true, fork: true, labels: [] });
   });
 
-  it("splits, trims and drops empty labels", () => {
+  it("parses the JSON labels the workflow passes", () => {
     expect(
-      pullRequestFromEvent({ ...event, labels: "bugbot, review-me ," }),
+      pullRequestFromEvent({
+        ...event,
+        labels: JSON.stringify(["bugbot", "review-me"]),
+      }),
     ).toEqual({
       number: 7,
       headSha: "abc123",
@@ -90,6 +93,30 @@ describe("pullRequestFromEvent", () => {
       fork: false,
       labels: ["bugbot", "review-me"],
     });
+  });
+
+  it("keeps a label containing a comma in one piece", () => {
+    // toJSON pretty-prints, so the env value can span lines.
+    const state = pullRequestFromEvent({
+      ...event,
+      draft: "true",
+      labels: JSON.stringify(["needs, review"], null, 2),
+    });
+
+    if (state === null) {
+      throw new Error("expected a pull request event state");
+    }
+
+    expect(state.labels).toEqual(["needs, review"]);
+    expect(shouldReview(state, { label: "needs, review" })).toEqual({
+      review: true,
+    });
+  });
+
+  it("treats empty, null and non-array label values as no labels", () => {
+    for (const labels of ["", "null", '"bugbot"']) {
+      expect(pullRequestFromEvent({ ...event, labels })?.labels).toEqual([]);
+    }
   });
 
   it("gates a draft event exactly like the workflow", () => {
