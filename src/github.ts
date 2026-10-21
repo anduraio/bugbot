@@ -1,13 +1,232 @@
-import type { Finding } from "./filter.js";
+import {
+  MAX_POSTED_COMMENTS,
+  formatComment,
+  parseMarker,
+  type Category,
+  type DiffSide,
+  type ParsedMarker,
+  type PlannedComment,
+} from "./filter.js";
 import type { PullRequestState } from "./gate.js";
+import type { FetchLike, Sleep } from "./model.js";
 
 /**
  * GitHub output: inline comments, the summary comment, the `bugbot` check run
- * and reply/resolve for fixed threads. Step 2 ships only the typed surface;
- * step 6 implements it. Nothing here may approve, request changes or merge.
+ * and reply/resolve for fixed threads.
+ *
+ * Every request goes through `request()`, which checks a small allowlist
+ * BEFORE calling fetch. There is deliberately no code path that can build a
+ * merge, approve, dismiss or requested-reviewer request: those routes are not
+ * in the allowlist, review events must be exactly `COMMENT`, and only the two
+ * GraphQL documents below are accepted. Bugbot stays comment-only.
  */
 
-export interface PullRequestQuery {
+const DEFAULT_BASE_URL = "https://api.github.com";
+const DEFAULT_BOT_LOGIN = "andura-bugbot";
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_RETRIES = 2;
+const MAX_RETRY_WAIT_MS = 10_000;
+const MAX_PAGES = 20;
+const MAX_CHECK_SUMMARY = 60_000;
+const MAX_ERROR_CHARS = 200;
+const MAX_TRUNCATED_FILES = 50;
+const SUMMARY_MARKER = "<!-- bugbot:summary -->";
+const COMMENT_ONLY_NOTE = "Bugbot only comments; it never approves or blocks.";
+const REVIEW_BODY =
+  "Bugbot review. Inline comments only; it never approves or blocks.";
+
+/**
+ * Skip replies: the keyword must open the reply (after @mentions), or the whole
+ * reply must be short. The curly apostrophe is what macOS and mobile keyboards
+ * send; `wontfix`, `wont fix` and `won't fix` are all accepted.
+ */
+const SKIP_AT_START = /^(?:skip\b|won[’']?t\s*fix\b|wontfix\b)/i;
+const SKIP_ANYWHERE = /\b(?:skip|won[’']?t\s*fix|wontfix)\b/i;
+const NEGATED_SKIP =
+  /\b(?:can(?:not|['’]t)|don(?:['’]t)|not|never)\b[^.!?\n]*\b(?:skip|won[’']?t\s*fix|wontfix)\b/i;
+const MENTION_PREFIX = /^(?:@[A-Za-z0-9-]+\s*)+/;
+const SHORT_REPLY_CHARS = 40;
+
+const REVIEW_THREADS_QUERY = `query BugbotReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          path
+          line
+          originalLine
+          diffSide
+          comments(first: 100) {
+            pageInfo { hasNextPage }
+            nodes { databaseId author { login __typename } body }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const RESOLVE_REVIEW_THREAD_MUTATION = `mutation BugbotResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}`;
+
+/** The only GraphQL documents this file may send. */
+const GRAPHQL_DOCUMENTS: ReadonlySet<string> = new Set([
+  REVIEW_THREADS_QUERY,
+  RESOLVE_REVIEW_THREAD_MUTATION,
+]);
+
+type HttpMethod = "GET" | "POST" | "PATCH";
+
+/** One request, as it appears in a dry-run plan and in test recordings. */
+export interface PlannedRequest {
+  readonly method: HttpMethod;
+  /** API path only, for example `/repos/o/r/pulls/1`. */
+  readonly path: string;
+  readonly body?: unknown;
+}
+
+interface AllowedRoute {
+  readonly method: HttpMethod;
+  readonly pattern: RegExp;
+  /** A pull review must carry `event: "COMMENT"`. */
+  readonly review?: boolean;
+}
+
+const OWNER_NAME = "[A-Za-z0-9-]+/[A-Za-z0-9._-]+";
+
+/**
+ * The complete write/read surface. Anything else throws before fetch.
+ * Deliberately absent: merge, approve, review dismissals and requested
+ * reviewers. The tests assert these rejections with no fetch call.
+ */
+const ALLOWED_ROUTES: readonly AllowedRoute[] = [
+  {
+    method: "GET",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/pulls/[1-9][0-9]*$`),
+  },
+  {
+    method: "GET",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/issues/[1-9][0-9]*/comments$`),
+  },
+  {
+    method: "POST",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/issues/[1-9][0-9]*/comments$`),
+  },
+  {
+    method: "PATCH",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/issues/comments/[1-9][0-9]*$`),
+  },
+  {
+    method: "POST",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/pulls/[1-9][0-9]*/reviews$`),
+    review: true,
+  },
+  {
+    method: "POST",
+    pattern: new RegExp(
+      `^/repos/${OWNER_NAME}/pulls/[1-9][0-9]*/comments/[1-9][0-9]*/replies$`,
+    ),
+  },
+  {
+    method: "POST",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/check-runs$`),
+  },
+  {
+    method: "PATCH",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/check-runs/[0-9]+$`),
+  },
+  {
+    method: "POST",
+    pattern: /^\/graphql$/,
+  },
+];
+
+export interface GuardedRequest {
+  readonly method: string;
+  readonly path: string;
+  readonly body?: unknown;
+}
+
+/**
+ * Throws unless the request is one of the allowlisted operations. This is the
+ * single gate before every fetch; it rejects the method and path first, then
+ * requires review events to be exactly `COMMENT` and GraphQL bodies to use
+ * one of the two known documents.
+ */
+export function assertAllowedRequest(request: GuardedRequest): void {
+  const method = request.method.toUpperCase();
+  if (method !== "GET" && method !== "POST" && method !== "PATCH") {
+    throw new Error(`GitHub request not allowed: ${method} ${request.path}`);
+  }
+
+  const route = ALLOWED_ROUTES.find(
+    (candidate) =>
+      candidate.method === method && candidate.pattern.test(request.path),
+  );
+  if (route === undefined) {
+    throw new Error(`GitHub request not allowed: ${method} ${request.path}`);
+  }
+
+  const repository = /^\/repos\/([^/]+)\/([^/]+)(?:\/|$)/.exec(request.path);
+  if (
+    repository !== null &&
+    (isDotOnly(repository[1] ?? "") || isDotOnly(repository[2] ?? ""))
+  ) {
+    throw new Error("GitHub request not allowed: invalid repository");
+  }
+
+  const body = asRecord(request.body);
+  if (body !== null && "event" in body && body.event !== "COMMENT") {
+    throw new Error("GitHub review event must be COMMENT");
+  }
+
+  if (route.review === true && (body === null || body.event !== "COMMENT")) {
+    throw new Error("GitHub review event must be COMMENT");
+  }
+
+  if (request.path === "/graphql") {
+    const query = body === null ? null : asString(body.query);
+    if (query === null || !GRAPHQL_DOCUMENTS.has(query)) {
+      throw new Error("GitHub GraphQL operation not allowed");
+    }
+  }
+}
+
+/** A safe GitHub failure: never carries the token or a response body. */
+export class GitHubError extends Error {
+  readonly status: number | null;
+
+  constructor(message: string, status: number | null = null) {
+    super(message);
+    this.name = "GitHubError";
+    this.status = status;
+  }
+}
+
+export interface GitHubTransportOptions {
+  /** Injectable fetch, so tests make no network call. */
+  fetch?: FetchLike;
+  /** Injectable sleep, so tests do not wait for backoff. */
+  sleep?: Sleep;
+  /** API base URL. Default https://api.github.com. */
+  baseUrl?: string;
+  /** Per-attempt timeout covering fetch and the body read. Default 30 s. */
+  timeoutMs?: number;
+  /** Build the request (and return it) without sending any write. */
+  dryRun?: boolean;
+  /** Login of the GitHub App, with or without a trailing `[bot]`. */
+  botLogin?: string;
+  /** Where failures are logged. Defaults to console.error. */
+  log?: (line: string) => void;
+}
+
+export interface PullRequestQuery extends GitHubTransportOptions {
   token: string;
   /** "owner/name" of the repository under review. */
   repository: string;
@@ -21,12 +240,61 @@ export interface PullRequestQuery {
  * posting.
  */
 export async function fetchPullRequest(
-  _options: PullRequestQuery,
+  query: PullRequestQuery,
 ): Promise<PullRequestState> {
-  throw new Error("fetchPullRequest is not implemented yet (bugbot step 6)");
+  validateRepository(query.repository);
+  validatePrNumber(query.prNumber);
+  const context = transport(query);
+
+  const response = await request(context, {
+    method: "GET",
+    path: pullPath(query.repository, query.prNumber),
+  });
+  const payload = asRecord(response.json);
+  if (payload === null) {
+    throw new GitHubError(
+      "GitHub pull request response was not an object",
+      response.status,
+    );
+  }
+
+  const head = asRecord(payload.head);
+  const headSha = head === null ? null : asString(head.sha);
+  if (headSha === null) {
+    throw new GitHubError(
+      "GitHub pull request response had no head SHA",
+      response.status,
+    );
+  }
+
+  const headRepo = head === null ? null : asRecord(head.repo);
+  const base = asRecord(payload.base);
+  const baseRepo = base === null ? null : asRecord(base.repo);
+  const headFullName = headRepo === null ? null : asString(headRepo.full_name);
+  const baseFullName = baseRepo === null ? null : asString(baseRepo.full_name);
+
+  const labels: string[] = [];
+  for (const label of asArray(payload.labels)) {
+    const record = asRecord(label);
+    const name = record === null ? null : asString(record.name);
+    if (name !== null) {
+      labels.push(name);
+    }
+  }
+
+  return {
+    number: query.prNumber,
+    headSha,
+    draft: payload.draft === true,
+    fork:
+      headFullName === null ||
+      baseFullName === null ||
+      headFullName !== baseFullName,
+    labels,
+  };
 }
 
-export interface GitHubOptions {
+export interface GitHubOptions extends GitHubTransportOptions {
   /** Short-lived GitHub App token minted by actions/create-github-app-token. */
   token: string;
   /** "owner/name" of the repository under review. */
@@ -38,27 +306,55 @@ export interface GitHubOptions {
 
 export interface CheckRunHandle {
   id: number;
+  /** The request that created (or, in a dry run, would create) the run. */
+  planned?: PlannedRequest;
 }
 
 /** A neutral check never fails the PR. Bugbot has no failure conclusion. */
 export type CheckConclusion = "neutral" | "success";
 
-/**
- * Records the completed neutral `bugbot` check and summary for a draft or
- * fork PR Bugbot chose not to review. Step 6 implements it; until then the
- * job summary written in review.yml is the visible result.
- */
-export async function reportSkipped(
-  _options: GitHubOptions,
-  _summary: string,
-): Promise<void> {
-  throw new Error("reportSkipped is not implemented yet (bugbot step 6)");
+export interface BugbotThread {
+  threadId: string;
+  firstCommentId: number;
+  path: string;
+  /** Null when GitHub no longer maps the thread to a diff line. */
+  line: number | null;
+  originalLine: number | null;
+  side: DiffSide | null;
+  isResolved: boolean;
+  marker: ParsedMarker;
+  category: Category | null;
+  reason: string;
+  state: "open" | "resolved" | "skipped";
 }
 
-export interface ExistingBugbotComment {
-  id: number;
-  hash: string;
-  resolved: boolean;
+export interface ParsedThreadBody {
+  category: Category | null;
+  reason: string;
+}
+
+export interface FailedComment {
+  file: string;
+  line: number;
+  status: number;
+}
+
+export interface PostReviewResult {
+  posted: number;
+  failed: readonly FailedComment[];
+  /** Every review request sent, or planned when `dryRun` is set. */
+  planned: readonly PlannedRequest[];
+}
+
+export interface SummaryResult {
+  action: "created" | "updated";
+  planned: PlannedRequest;
+}
+
+export interface ResolveThreadsResult {
+  resolved: number;
+  failed: number;
+  planned: readonly PlannedRequest[];
 }
 
 export interface ReviewSummary {
@@ -70,51 +366,1107 @@ export interface ReviewSummary {
   skipped: number;
   resolved: number;
   truncated: readonly string[];
-  /** Always ends with: Bugbot only comments; it never approves or blocks. */
-  note: string;
+  /** Optional one-line failure shown as "Bugbot couldn't review: <reason>". */
+  error?: string;
 }
 
-export async function startCheck(_options: GitHubOptions): Promise<CheckRunHandle> {
-  throw new Error("startCheck is not implemented yet (bugbot step 6)");
+/**
+ * Records the in-progress `bugbot` check for this pass, so babysitters see a
+ * pending check while the review runs.
+ */
+export async function startCheck(
+  options: GitHubOptions,
+): Promise<CheckRunHandle> {
+  validateOptions(options);
+  const context = transport(options);
+
+  const response = await request(context, {
+    method: "POST",
+    path: repoPath(options.repository, "check-runs"),
+    body: {
+      name: "bugbot",
+      head_sha: options.headSha,
+      status: "in_progress",
+      external_id: options.runId,
+    },
+  });
+
+  if (options.dryRun === true) {
+    return { id: 0, planned: response.plan };
+  }
+
+  const payload = asRecord(response.json);
+  const id = payload === null ? null : asNumber(payload.id);
+  if (id === null || !Number.isSafeInteger(id) || id <= 0) {
+    throw new GitHubError(
+      "GitHub check run response had no id",
+      response.status,
+    );
+  }
+
+  return { id, planned: response.plan };
 }
 
+/**
+ * Completes a check run with `neutral` or `success` only. Any other conclusion
+ * is rejected here, before a request, so Bugbot can never fail a PR.
+ */
 export async function finishCheck(
-  _options: GitHubOptions,
-  _check: CheckRunHandle,
-  _conclusion: CheckConclusion,
-  _summary: string,
-): Promise<void> {
-  throw new Error("finishCheck is not implemented yet (bugbot step 6)");
+  options: GitHubOptions,
+  check: CheckRunHandle,
+  conclusion: CheckConclusion,
+  summary: string,
+): Promise<PlannedRequest> {
+  validateOptions(options);
+  if (conclusion !== "neutral" && conclusion !== "success") {
+    throw new Error("Bugbot check conclusion must be neutral or success");
+  }
+
+  const context = transport(options);
+  const response = await request(context, {
+    method: "PATCH",
+    path: repoPath(options.repository, `check-runs/${check.id}`),
+    body: {
+      status: "completed",
+      conclusion,
+      output: {
+        title: "Bugbot",
+        summary: redact(summary, options.token).slice(0, MAX_CHECK_SUMMARY),
+      },
+    },
+  });
+
+  return response.plan;
 }
 
-/** Reads Bugbot's existing comments, including resolved ones, for dedupe. */
-export async function listExistingBugbotComments(
-  _options: GitHubOptions,
-): Promise<readonly ExistingBugbotComment[]> {
-  throw new Error("listExistingBugbotComments is not implemented yet (bugbot step 6)");
+/**
+ * Records the completed neutral `bugbot` check and summary for a draft or
+ * fork PR Bugbot chose not to review.
+ */
+export async function reportSkipped(
+  options: GitHubOptions,
+  summary: string,
+): Promise<PlannedRequest> {
+  validateOptions(options);
+  const context = transport(options);
+
+  const response = await request(context, {
+    method: "POST",
+    path: repoPath(options.repository, "check-runs"),
+    body: {
+      name: "bugbot",
+      head_sha: options.headSha,
+      status: "completed",
+      conclusion: "neutral",
+      external_id: options.runId,
+      output: {
+        title: "Bugbot",
+        summary: redact(summary, options.token).slice(0, MAX_CHECK_SUMMARY),
+      },
+    },
+  });
+
+  return response.plan;
 }
 
-/** Posts one review with event COMMENT, never APPROVE or REQUEST_CHANGES. */
+/**
+ * Parses the visible shape `formatComment` writes: a bold title line, a blank
+ * line, then the reason paragraph. A body that does not have that shape keeps
+ * `category: null` rather than guessing. The hidden marker is ignored here.
+ */
+export function parseThreadBody(body: string): ParsedThreadBody {
+  const lines = body.split(/\r?\n/);
+  let index = 0;
+  while (index < lines.length && (lines[index] ?? "").trim() === "") {
+    index += 1;
+  }
+
+  const title = lines[index] ?? "";
+  const titleMatch = /^\*\*(.+)\*\*\s*$/.exec(title);
+  if (titleMatch === null) {
+    return { category: null, reason: "" };
+  }
+
+  const inner = titleMatch[1] ?? "";
+  const label = /^[A-Za-z]+ ([a-z-]+):/.exec(inner);
+  const rawCategory = label?.[1] ?? "";
+  const category = isCategory(rawCategory) ? rawCategory : null;
+
+  let reason = lines.slice(index + 1).join("\n");
+  const cuts = [
+    reason.indexOf("\n\n**Suggested fix:**"),
+    reason.indexOf("\n<!-- bugbot:v1 "),
+    reason.indexOf("\nRUN_ID:"),
+  ].filter((position) => position >= 0);
+  if (cuts.length > 0) {
+    reason = reason.slice(0, Math.min(...cuts));
+  }
+
+  return { category, reason: reason.trim() };
+}
+
+/**
+ * Lists Bugbot's review threads with their state. A thread counts only when its
+ * FIRST comment is authored by the bot AND carries a valid marker: a look-alike
+ * marker copied into a human comment is ignored, and a deleted user (null
+ * author) is never the bot.
+ */
+export async function listBugbotThreads(
+  options: GitHubOptions,
+): Promise<readonly BugbotThread[]> {
+  validateOptions(options);
+  const context = transport(options);
+  const [owner, name] = splitRepository(options.repository);
+
+  const threads: BugbotThread[] = [];
+  const botLogin = botLoginOf(options.botLogin);
+  let after: string | null = null;
+  let complete = false;
+
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const result = await graphqlRequest(
+      context,
+      REVIEW_THREADS_QUERY,
+      { owner, name, number: options.prNumber, after },
+    );
+    const reviewThreads = asRecord(
+      nested(result.data, "repository", "pullRequest", "reviewThreads"),
+    );
+    if (reviewThreads === null) {
+      throw new GitHubError("GitHub GraphQL response had no review threads");
+    }
+
+    for (const node of asArray(reviewThreads.nodes)) {
+      if (threadCommentsHaveNextPage(node)) {
+        throw new GitHubError(
+          "GitHub review thread has more comments than one page",
+        );
+      }
+      const thread = parseThreadNode(node, botLogin);
+      if (thread !== null) {
+        threads.push(thread);
+      }
+    }
+
+    const pageInfo = asRecord(reviewThreads.pageInfo);
+    const hasNextPage = pageInfo !== null && pageInfo.hasNextPage === true;
+    const endCursor = pageInfo === null ? null : asString(pageInfo.endCursor);
+    if (!hasNextPage || endCursor === null || endCursor === "") {
+      complete = true;
+      break;
+    }
+    after = endCursor;
+  }
+
+  if (!complete) {
+    throw new GitHubError(
+      `GitHub review thread pagination exceeded ${MAX_PAGES} pages`,
+    );
+  }
+
+  return threads;
+}
+
+/**
+ * Posts one review with `event: "COMMENT"` and the planned inline comments.
+ * A 422 on the batch falls back to one review per comment, so one bad anchor
+ * cannot drop every finding. Returns what was posted and what failed.
+ */
 export async function postReview(
-  _options: GitHubOptions,
-  _findings: readonly Finding[],
-): Promise<void> {
-  throw new Error("postReview is not implemented yet (bugbot step 6)");
+  options: GitHubOptions,
+  comments: readonly PlannedComment[],
+): Promise<PostReviewResult> {
+  validateOptions(options);
+  if (comments.length > MAX_POSTED_COMMENTS) {
+    throw new Error(
+      `too many inline comments: ${comments.length} exceeds ${MAX_POSTED_COMMENTS}`,
+    );
+  }
+  if (comments.length === 0) {
+    return { posted: 0, failed: [], planned: [] };
+  }
+
+  const context = transport(options);
+  const planned: PlannedRequest[] = [];
+  const reviewRequest: PlannedRequest = {
+    method: "POST",
+    path: pullPath(options.repository, options.prNumber, "reviews"),
+    body: {
+      commit_id: options.headSha,
+      event: "COMMENT",
+      body: REVIEW_BODY,
+      comments: comments.map((comment) => inlineComment(comment, options)),
+    },
+  };
+
+  try {
+    const response = await request(context, reviewRequest);
+    return { posted: comments.length, failed: [], planned: [response.plan] };
+  } catch (error) {
+    if (!(error instanceof GitHubError) || error.status !== 422) {
+      throw error;
+    }
+  }
+
+  const log = logger(options);
+  const failed: FailedComment[] = [];
+  let posted = 0;
+
+  for (const comment of comments) {
+    try {
+      const response = await request(context, {
+        method: "POST",
+        path: pullPath(options.repository, options.prNumber, "reviews"),
+        body: {
+          commit_id: options.headSha,
+          event: "COMMENT",
+          body: REVIEW_BODY,
+          comments: [inlineComment(comment, options)],
+        },
+      });
+      planned.push(response.plan);
+      posted += 1;
+    } catch (error) {
+      const status = error instanceof GitHubError ? (error.status ?? 0) : 0;
+      failed.push({ file: comment.file, line: comment.line, status });
+      log(
+        `Bugbot could not post ${comment.file}:${comment.line} (status ${status})`,
+      );
+    }
+  }
+
+  return { posted, failed, planned };
 }
 
-/** Creates or edits the single summary comment, marked <!-- bugbot:summary -->. */
+/**
+ * Creates or edits the single summary comment, marked `<!-- bugbot:summary -->`.
+ * Only a comment by the bot is edited; a human's look-alike marker is ignored.
+ */
 export async function upsertSummary(
-  _options: GitHubOptions,
-  _summary: ReviewSummary,
-): Promise<void> {
-  throw new Error("upsertSummary is not implemented yet (bugbot step 6)");
+  options: GitHubOptions,
+  summary: ReviewSummary,
+): Promise<SummaryResult> {
+  validateOptions(options);
+  const context = transport(options);
+  const body = renderSummary(summary, options.token);
+  const botLogin = botLoginOf(options.botLogin);
+
+  let existingId: number | null = null;
+  let hasNext = false;
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const response = await request(context, {
+      method: "GET",
+      path: repoPath(
+        options.repository,
+        `issues/${options.prNumber}/comments`,
+      ),
+      query: { per_page: 100, page },
+    });
+
+    if (!Array.isArray(response.json)) {
+      throw new GitHubError(
+        "GitHub issue comments response was not an array",
+        response.status,
+      );
+    }
+
+    for (const item of response.json) {
+      const comment = asRecord(item);
+      if (comment === null) {
+        continue;
+      }
+      const user = asRecord(comment.user);
+      if (!isBotAuthor(user, botLogin, "rest")) {
+        continue;
+      }
+      const text = asString(comment.body) ?? "";
+      if (!text.includes(SUMMARY_MARKER)) {
+        continue;
+      }
+      const id = asNumber(comment.id);
+      if (id !== null && Number.isSafeInteger(id) && id > 0) {
+        existingId = id;
+        break;
+      }
+    }
+
+    hasNext = response.hasNext;
+    if (existingId !== null || !hasNext) {
+      break;
+    }
+  }
+
+  if (existingId === null && hasNext) {
+    throw new GitHubError(
+      `GitHub issue comment pagination exceeded ${MAX_PAGES} pages`,
+    );
+  }
+
+  if (existingId !== null) {
+    const response = await request(context, {
+      method: "PATCH",
+      path: repoPath(options.repository, `issues/comments/${existingId}`),
+      body: { body },
+    });
+    return { action: "updated", planned: response.plan };
+  }
+
+  const response = await request(context, {
+    method: "POST",
+    path: repoPath(options.repository, `issues/${options.prNumber}/comments`),
+    body: { body },
+  });
+  return { action: "created", planned: response.plan };
 }
 
-/** Replies "Fixed in <sha>" and resolves Bugbot's own review threads. */
+/**
+ * Renders the one summary comment. The fixed final line is always appended,
+ * even if a caller passes an empty or malformed summary. `secret` is the
+ * options token and is always applied to the model name and error line.
+ */
+export function renderSummary(summary: ReviewSummary, secret: string): string {
+  const lines: string[] = [
+    SUMMARY_MARKER,
+    "## Bugbot review",
+    "",
+    `- Passes: ${summary.passCount}`,
+    `- Model: ${redact(summary.model, secret)}`,
+    `- Tokens: ${summary.tokensIn} in / ${summary.tokensOut} out`,
+    `- Posted: ${summary.posted}`,
+    `- Skipped: ${summary.skipped}`,
+    `- Resolved: ${summary.resolved}`,
+  ];
+
+  if (summary.error !== undefined && summary.error.trim() !== "") {
+    lines.push(
+      "",
+      `Bugbot couldn't review: ${oneLine(redact(summary.error, secret), 500)}`,
+    );
+  }
+
+  if (summary.truncated.length > 0) {
+    const shown = summary.truncated.slice(0, MAX_TRUNCATED_FILES);
+    const more = summary.truncated.length - shown.length;
+    const list = shown.map((file) => `\`${file}\``).join(", ");
+    lines.push(
+      "",
+      `**Files reduced to fit the context budget:** ${list}${
+        more > 0 ? ` and ${more} more` : ""
+      }`,
+    );
+  }
+
+  lines.push("", COMMENT_ONLY_NOTE);
+  return lines.join("\n");
+}
+
+/**
+ * Replies "Fixed in <sha7>." to each open thread Bugbot owns, then resolves it
+ * with GraphQL. Resolved and skipped threads are untouched. One failure is
+ * logged and the rest continue.
+ */
 export async function resolveFixedThreads(
-  _options: GitHubOptions,
-  _hashes: readonly string[],
-  _fixedSha: string,
-): Promise<void> {
-  throw new Error("resolveFixedThreads is not implemented yet (bugbot step 6)");
+  options: GitHubOptions,
+  threads: readonly BugbotThread[],
+  fixedSha: string,
+): Promise<ResolveThreadsResult> {
+  validateOptions(options);
+  validateHeadSha(fixedSha, "fixedSha");
+  const context = transport(options);
+  const log = logger(options);
+  const planned: PlannedRequest[] = [];
+  let resolved = 0;
+  let failed = 0;
+
+  for (const thread of threads) {
+    if (thread.state !== "open") {
+      continue;
+    }
+
+    try {
+      const reply = await request(context, {
+        method: "POST",
+        path: pullPath(
+          options.repository,
+          options.prNumber,
+          `comments/${thread.firstCommentId}/replies`,
+        ),
+        body: { body: `Fixed in ${fixedSha.slice(0, 7)}.` },
+      });
+      planned.push(reply.plan);
+
+      const mutation = await graphqlRequest(
+        context,
+        RESOLVE_REVIEW_THREAD_MUTATION,
+        { threadId: thread.threadId },
+      );
+      planned.push(mutation.planned);
+      resolved += 1;
+    } catch (error) {
+      failed += 1;
+      log(
+        `Bugbot could not resolve ${thread.threadId}: ${safeErrorMessage(
+          error,
+          options.token,
+        )}`,
+      );
+    }
+  }
+
+  return { resolved, failed, planned };
+}
+
+// --- transport ------------------------------------------------------------
+
+interface RequestSpec {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly body?: unknown;
+  readonly query?: Readonly<Record<string, string | number>>;
+  /**
+   * True for a POST that only reads (the review-threads query). Dry runs let
+   * reads through and skip every write.
+   */
+  readonly read?: boolean;
+}
+
+interface RequestContext {
+  readonly token: string;
+  readonly baseUrl: string;
+  readonly fetchFn: FetchLike;
+  readonly sleep: Sleep;
+  readonly timeoutMs: number;
+  readonly dryRun: boolean;
+}
+
+interface RequestResult {
+  readonly status: number;
+  readonly json: unknown;
+  /** True when the response's Link header has rel="next". */
+  readonly hasNext: boolean;
+  readonly plan: PlannedRequest;
+}
+
+const defaultSleep: Sleep = (milliseconds) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+
+const LINK_NEXT = /<[^>]*>\s*;\s*rel="?next"?/i;
+
+function transport(
+  options: GitHubTransportOptions & { token: string },
+): RequestContext {
+  return {
+    token: options.token,
+    baseUrl: (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    fetchFn: options.fetch ?? globalThis.fetch,
+    sleep: options.sleep ?? defaultSleep,
+    timeoutMs:
+      options.timeoutMs !== undefined && options.timeoutMs > 0
+        ? options.timeoutMs
+        : DEFAULT_TIMEOUT_MS,
+    dryRun: options.dryRun === true,
+  };
+}
+
+/** A timeout during one attempt. Retried only for idempotent methods. */
+class RequestTimeoutError extends GitHubError {
+  constructor(message: string) {
+    super(message, null);
+  }
+}
+
+/**
+ * Rejects when the per-attempt AbortController fires, even if the injected
+ * fetch or its body read ignores the signal. A real fetch aborts too; the race
+ * keeps the timeout honest for any FetchLike.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new Error("request aborted by timeout"));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** One guarded HTTP call, with bounded retries. */
+async function request(
+  context: RequestContext,
+  spec: RequestSpec,
+): Promise<RequestResult> {
+  assertAllowedRequest(spec);
+
+  const plan: PlannedRequest = {
+    method: spec.method,
+    path: spec.path,
+    ...(spec.body === undefined ? {} : { body: spec.body }),
+  };
+
+  // A dry run never sends a write. Reads (GET, and the GraphQL thread query)
+  // still go through the fake/real fetch.
+  const isRead = spec.read === true || spec.method === "GET";
+  if (context.dryRun && !isRead) {
+    return { status: 200, json: {}, hasNext: false, plan };
+  }
+
+  const url = buildUrl(context.baseUrl, spec.path, spec.query);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${context.token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "bugbot",
+  };
+  const init: RequestInit = { method: spec.method, headers };
+  if (spec.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(spec.body);
+  }
+  const fetch = context.fetchFn;
+
+  for (let attempt = 0; ; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), context.timeoutMs);
+    let response: Response;
+    let text: string;
+    try {
+      response = await raceAbort(
+        fetch(url, { ...init, signal: controller.signal }),
+        controller.signal,
+      );
+      text = await raceAbort(response.text(), controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        const timeout = new RequestTimeoutError(
+          capError(
+            `GitHub ${spec.method} ${spec.path} timed out after ${context.timeoutMs} ms`,
+            context.token,
+          ),
+        );
+        if (attempt < MAX_RETRIES && isIdempotentMethod(spec.method)) {
+          await context.sleep(retryDelayMs(null, attempt));
+          continue;
+        }
+        throw timeout;
+      }
+
+      throw new GitHubError(
+        capError(
+          `GitHub ${spec.method} ${spec.path} failed: ${errorMessage(error)}`,
+          context.token,
+        ),
+        null,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const retryAfter = response.headers.get("retry-after");
+      const failure = new GitHubError(
+        capError(
+          `GitHub ${spec.method} ${spec.path} returned ${response.status}${errorDetail(
+            text,
+            context.token,
+          )}`,
+          context.token,
+        ),
+        response.status,
+      );
+
+      if (
+        attempt < MAX_RETRIES &&
+        isRetryableStatus(
+          spec.method,
+          response.status,
+          retryAfter !== null,
+        )
+      ) {
+        const delay = retryDelayMs(retryAfter, attempt);
+        if (delay > MAX_RETRY_WAIT_MS) {
+          throw new GitHubError(
+            capError(
+              `GitHub ${spec.method} ${spec.path} returned ${response.status} with a Retry-After above the ${
+                MAX_RETRY_WAIT_MS / 1000
+              } s cap`,
+              context.token,
+            ),
+            response.status,
+          );
+        }
+        await context.sleep(delay);
+        continue;
+      }
+
+      throw failure;
+    }
+
+    let json: unknown = null;
+    if (text.trim() !== "") {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new GitHubError(
+          capError(
+            `GitHub ${spec.method} ${spec.path} returned invalid JSON`,
+            context.token,
+          ),
+          response.status,
+        );
+      }
+    }
+
+    return {
+      status: response.status,
+      json,
+      hasNext: LINK_NEXT.test(response.headers.get("link") ?? ""),
+      plan,
+    };
+  }
+}
+
+async function graphqlRequest(
+  context: RequestContext,
+  query: string,
+  variables: Readonly<Record<string, unknown>>,
+): Promise<{ data: unknown; planned: PlannedRequest }> {
+  const response = await request(context, {
+    method: "POST",
+    path: "/graphql",
+    body: { query, variables },
+    read: query === REVIEW_THREADS_QUERY,
+  });
+
+  const payload = asRecord(response.json);
+  if (payload === null) {
+    throw new GitHubError(
+      "GitHub GraphQL response was not an object",
+      response.status,
+    );
+  }
+
+  const errors = payload.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    const first = asRecord(errors[0]);
+    const message =
+      first === null ? "unknown error" : (asString(first.message) ?? "unknown error");
+    throw new GitHubError(
+      capError(`GitHub GraphQL error: ${message}`, context.token),
+      response.status,
+    );
+  }
+
+  return { data: payload.data, planned: response.plan };
+}
+
+function buildUrl(
+  baseUrl: string,
+  path: string,
+  query?: Readonly<Record<string, string | number>>,
+): string {
+  const url = new URL(`${baseUrl}${path}`);
+  for (const [key, value] of Object.entries(query ?? {})) {
+    url.searchParams.set(key, String(value));
+  }
+  return url.toString();
+}
+
+/** 5xx retries are safe only when repeating the request cannot double-write. */
+function isIdempotentMethod(method: HttpMethod): boolean {
+  return method === "GET" || method === "PATCH";
+}
+
+function isRetryableStatus(
+  method: HttpMethod,
+  status: number,
+  hasRetryAfter: boolean,
+): boolean {
+  // A rejected 403/429 with Retry-After happened before processing, so even a
+  // POST is safe to repeat.
+  if ((status === 403 || status === 429) && hasRetryAfter) {
+    return true;
+  }
+  return (
+    isIdempotentMethod(method) &&
+    (status === 502 || status === 503 || status === 504)
+  );
+}
+
+/**
+ * The wait the server asked for. No clamping: callers must throw when this is
+ * above MAX_RETRY_WAIT_MS rather than retrying early. Invalid headers fall
+ * back to a short exponential backoff.
+ */
+function retryDelayMs(retryAfter: string | null, attempt: number): number {
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter.trim());
+    if (Number.isFinite(seconds)) {
+      return seconds > 0 ? Math.round(seconds * 1000) : 0;
+    }
+    const date = Date.parse(retryAfter);
+    if (!Number.isNaN(date)) {
+      return Math.max(0, date - Date.now());
+    }
+  }
+
+  // 5xx or timeout without a Retry-After header: a short, bounded backoff.
+  return 500 * 2 ** attempt;
+}
+
+/** Last-resort token scrub plus a hard 200-character cap. */
+function capError(text: string, token: string): string {
+  return redact(oneLine(text, MAX_ERROR_CHARS * 4), token).slice(
+    0,
+    MAX_ERROR_CHARS,
+  );
+}
+
+/**
+ * The single redaction primitive. Exported so its exact-token, URL-encoded and
+ * `gh*_` layers can each be tested on their own. An empty secret leaves only
+ * the `gh*_` regex layer, which is why every production caller passes the
+ * options token.
+ */
+export function redact(text: string, secret: string): string {
+  let result = text;
+  for (const variant of secretVariants(secret)) {
+    result = result.split(variant).join("[redacted]");
+  }
+  result = result.replace(/gh[pousr]_[A-Za-z0-9_]+/g, "[redacted]");
+  result = result.replace(/github[._]pat_[A-Za-z0-9_]+/g, "[redacted]");
+  return result;
+}
+
+function secretVariants(secret: string): readonly string[] {
+  if (secret === "") {
+    return [];
+  }
+
+  const encoded = encodeURIComponent(secret);
+  const variants = new Set<string>([secret, encoded]);
+  if (encoded !== secret) {
+    variants.add(
+      encoded.replace(/%[0-9A-F]{2}/g, (match) => match.toLowerCase()),
+    );
+  }
+  return [...variants].filter((variant) => variant !== "");
+}
+
+/**
+ * At most 200 chars of a structured GitHub `message`, never a raw body.
+ * Exported so its redaction layer is tested directly rather than through the
+ * outer cap that would otherwise mask it.
+ */
+export function errorDetail(body: string, token: string): string {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const record = asRecord(parsed);
+    const message = record === null ? null : asString(record.message);
+    if (message !== null && message.trim() !== "") {
+      return `: ${redact(oneLine(message, MAX_ERROR_CHARS), token)}`;
+    }
+  } catch {
+    // A non-JSON error body is intentionally not echoed.
+  }
+  return "";
+}
+
+function oneLine(text: string, max: number): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function safeErrorMessage(error: unknown, token: string): string {
+  return capError(errorMessage(error), token);
+}
+
+function logger(options: GitHubOptions): (line: string) => void {
+  return options.log ?? ((line: string) => console.error(line));
+}
+
+// --- response parsing -----------------------------------------------------
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function positiveInteger(value: unknown): number | null {
+  const number = asNumber(value);
+  return number !== null && Number.isSafeInteger(number) && number > 0
+    ? number
+    : null;
+}
+
+function nested(value: unknown, ...keys: string[]): unknown {
+  let current: unknown = value;
+  for (const key of keys) {
+    const record = asRecord(current);
+    if (record === null) {
+      return undefined;
+    }
+    current = record[key];
+  }
+  return current;
+}
+
+function isCategory(value: string): value is Category {
+  return (
+    value === "bug" ||
+    value === "security" ||
+    value === "edge-case" ||
+    value === "data" ||
+    value === "root-cause"
+  );
+}
+
+function blankToNull(value: string | null): string | null {
+  return value === null || value === "" ? null : value;
+}
+
+/**
+ * The bot must be a GitHub App bot account, not merely a login that matches.
+ * REST exposes it as `type: "Bot"`, GraphQL as `author.__typename: "Bot"`.
+ */
+function isBotAuthor(
+  author: Record<string, unknown> | null,
+  botLogin: string,
+  source: "rest" | "graphql",
+): boolean {
+  if (author === null) {
+    return false;
+  }
+  if (source === "rest" ? author.type !== "Bot" : author.__typename !== "Bot") {
+    return false;
+  }
+
+  const login = blankToNull(asString(author.login));
+  if (login === null) {
+    return false;
+  }
+
+  return normalizeLogin(login) === normalizeLogin(botLogin);
+}
+
+/** An empty or whitespace `botLogin` means "use the default". */
+function botLoginOf(botLogin: string | undefined): string {
+  const trimmed = botLogin?.trim() ?? "";
+  return trimmed === "" ? DEFAULT_BOT_LOGIN : trimmed;
+}
+
+export function normalizeLogin(login: string): string {
+  const withoutSuffix = login.replace(/\[bot\]$/i, "");
+  return withoutSuffix.trim().toLowerCase();
+}
+
+/**
+ * A reply declines a finding when the keyword opens the reply (after
+ * whitespace and @mentions) or the whole reply is short. A quoted first line
+ * is not the author's own words, and `you can't skip this` is negated.
+ */
+function isSkipReply(body: string): boolean {
+  const text = body.trim();
+  if (text === "" || text.startsWith(">")) {
+    return false;
+  }
+
+  const firstLine = text.split(/\r?\n/, 1)[0] ?? "";
+  const withoutMentions = firstLine.replace(MENTION_PREFIX, "").trimStart();
+  if (SKIP_AT_START.test(withoutMentions)) {
+    return true;
+  }
+
+  return (
+    text.length <= SHORT_REPLY_CHARS &&
+    SKIP_ANYWHERE.test(text) &&
+    !NEGATED_SKIP.test(text)
+  );
+}
+
+/**
+ * The thread query asks for `comments(first: 100)`. A page that is not the
+ * last one means replies were dropped, so fail loudly instead of guessing.
+ */
+function threadCommentsHaveNextPage(value: unknown): boolean {
+  const node = asRecord(value);
+  const comments = node === null ? null : asRecord(node.comments);
+  const pageInfo = comments === null ? null : asRecord(comments.pageInfo);
+  return pageInfo !== null && pageInfo.hasNextPage === true;
+}
+
+function parseThreadNode(value: unknown, botLogin: string): BugbotThread | null {
+  const node = asRecord(value);
+  if (node === null) {
+    return null;
+  }
+
+  const comments = asRecord(node.comments);
+  const nodes = comments === null ? [] : asArray(comments.nodes);
+  const first = asRecord(nodes[0]);
+  if (first === null) {
+    return null;
+  }
+  if (!isBotAuthor(asRecord(first.author), botLogin, "graphql")) {
+    return null;
+  }
+
+  const body = asString(first.body) ?? "";
+  const marker = parseMarker(body);
+  if (marker === null) {
+    return null;
+  }
+
+  const threadId = asString(node.id);
+  const firstCommentId = positiveInteger(first.databaseId);
+  if (threadId === null || threadId === "" || firstCommentId === null) {
+    return null;
+  }
+
+  const replies = nodes
+    .slice(1)
+    .map((reply) => asRecord(reply))
+    .filter((reply): reply is Record<string, unknown> => reply !== null);
+  const skipped = replies.some(
+    (reply) =>
+      !isBotAuthor(asRecord(reply.author), botLogin, "graphql") &&
+      isSkipReply(asString(reply.body) ?? ""),
+  );
+
+  const isResolved = node.isResolved === true;
+  const parsed = parseThreadBody(body);
+  const sideValue = asString(node.diffSide);
+  const side: DiffSide | null =
+    sideValue === "RIGHT" || sideValue === "LEFT" ? sideValue : null;
+
+  return {
+    threadId,
+    firstCommentId,
+    path: asString(node.path) ?? "",
+    line: positiveInteger(node.line),
+    originalLine: positiveInteger(node.originalLine),
+    side,
+    isResolved,
+    marker,
+    category: parsed.category,
+    reason: parsed.reason,
+    state: isResolved ? "resolved" : skipped ? "skipped" : "open",
+  };
+}
+
+function inlineComment(
+  comment: PlannedComment,
+  options: GitHubOptions,
+): Record<string, unknown> {
+  const end = comment.endLine ?? comment.line;
+  const item: Record<string, unknown> = {
+    path: comment.file,
+    body: formatComment(comment, options.runId, options.headSha),
+    side: comment.side,
+    line: end > comment.line ? end : comment.line,
+  };
+
+  if (end > comment.line) {
+    item.start_line = comment.line;
+    item.start_side = comment.side;
+  }
+
+  return item;
+}
+
+// --- boundary validation --------------------------------------------------
+
+const REPOSITORY_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/** `.` and `..` are path segments, not repository names. */
+function isDotOnly(value: string): boolean {
+  return value !== "" && /^\.+$/.test(value);
+}
+
+function validateRepository(repository: string): void {
+  if (!REPOSITORY_PATTERN.test(repository)) {
+    throw new Error("invalid repository: expected owner/name");
+  }
+  const slash = repository.indexOf("/");
+  const owner = repository.slice(0, slash);
+  const name = repository.slice(slash + 1);
+  if (isDotOnly(owner) || isDotOnly(name)) {
+    throw new Error("invalid repository: expected owner/name");
+  }
+}
+
+function validatePrNumber(prNumber: number): void {
+  if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
+    throw new Error("invalid prNumber: expected a positive safe integer");
+  }
+}
+
+function validateRunId(runId: string): void {
+  if (!/^\d+$/.test(runId)) {
+    throw new Error("invalid runId: expected digits only");
+  }
+}
+
+function validateHeadSha(sha: string, name = "headSha"): void {
+  if (!SHA_PATTERN.test(sha)) {
+    throw new Error(
+      `invalid ${name}: expected 40 lowercase hexadecimal characters`,
+    );
+  }
+}
+
+function validateOptions(options: GitHubOptions): void {
+  validateRepository(options.repository);
+  validatePrNumber(options.prNumber);
+  validateRunId(options.runId);
+  validateHeadSha(options.headSha);
+}
+
+function splitRepository(repository: string): [string, string] {
+  const slash = repository.indexOf("/");
+  return [repository.slice(0, slash), repository.slice(slash + 1)];
+}
+
+function repoPath(repository: string, suffix: string): string {
+  return `/repos/${repository}/${suffix}`;
+}
+
+function pullPath(
+  repository: string,
+  prNumber: number,
+  suffix?: string,
+): string {
+  const base = repoPath(repository, `pulls/${prNumber}`);
+  return suffix === undefined ? base : `${base}/${suffix}`;
 }
