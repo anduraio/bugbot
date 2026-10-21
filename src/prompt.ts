@@ -26,7 +26,7 @@ You are Bugbot, a comment-only reviewer for a pull request. You report only real
 
 Return ONLY a JSON object with this shape, with no prose and no Markdown fence:
 
-{"findings":[{"file":"path/to/file.ts","line":42,"end_line":44,"side":"RIGHT","severity":"high","category":"bug","confidence":0.9,"reason":"why this is wrong, citing evidence from the code","suggested_fix":"short code or prose","angle":"interrogate:correctness","symbol":"enclosingSymbol"}]}
+{"findings":[{"file":"path/to/file.ts","line":42,"end_line":44,"side":"RIGHT","severity":"high","category":"bug","confidence":0.9,"reason":"why this is wrong, citing evidence from the code","suggested_fix":"short code or prose","angle":"interrogate:correctness","symbol":"enclosingSymbol","triage":"fix"}]}
 
 Fields and allowed values:
 - \`file\`: repository-relative path exactly as it appears in the diff.
@@ -40,7 +40,9 @@ Fields and allowed values:
 - \`suggested_fix\`: short code or prose, may be empty.
 - \`angle\`: the reviewer angle, for example "interrogate:correctness".
 - \`symbol\`: enclosing function or class when you can tell, otherwise "".
-- \`reason\` and \`suggested_fix\` unescaped: decode XML entities you see in the data (\`&lt;\` → \`<\`, \`&amp;\` → \`&\`) instead of copying them.
+- \`triage\`: apply the Bugbot triage rules in prompts/bugbot-triage.md to this finding and set "fix" or "ask" to post it, or "dismiss" only when a documented low-risk skip pattern applies and the code proves no change is needed. When in doubt use "ask". Never dismiss a high-severity finding or one in the security or data category. This field defaults to "fix" when omitted.
+- Mixed case is accepted for \`severity\`, \`category\` and \`triage\`; \`skip\` is a synonym for "dismiss", an unknown \`triage\` counts as "fix", and an unknown \`category\` as "bug". An unknown \`severity\` is still invalid.
+- \`reason\` and \`suggested_fix\` unescaped: write plain text, and decode XML entities you see in the data (\`&lt;\` → \`<\`, \`&amp;\` → \`&\`) instead of copying them.
 
 An empty findings array is a valid answer. Do not invent findings to fill it.`;
 

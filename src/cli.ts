@@ -7,8 +7,12 @@ import { fetchPullRequest, reportSkipped, type GitHubOptions } from "./github.js
 import { pullRequestFromEvent, shouldReview } from "./gate.js";
 import {
   buildContext,
+  changedLinesFromDiff,
+  hunkContextsFromDiff,
+  parseDiff,
   selectModel,
   type ReadFile,
+  type ReviewContext,
   type ReviewRequest,
 } from "./context.js";
 import { buildPrompt, loadSystemPrompt } from "./prompt.js";
@@ -19,7 +23,15 @@ import {
   type DroppedFindings,
   type FetchLike,
 } from "./model.js";
-import type { Finding } from "./filter.js";
+import {
+  classifyFindings,
+  minConfidenceFromEnv,
+  type ClassifySummary,
+  type DiffSide,
+  type ExistingFinding,
+  type Finding,
+  type PlannedComment,
+} from "./filter.js";
 
 /**
  * `bugbot review|status` (spec section 8). The non-local review path still
@@ -85,6 +97,12 @@ export interface LocalReviewResult {
   model: string;
   findings: readonly Finding[];
   dropped: DroppedFindings;
+  /** Comments that would be posted, in cap order. */
+  planned: readonly PlannedComment[];
+  /** Counts for everything that will not become an inline comment. */
+  summary: ClassifySummary;
+  /** Cross-pass dedupe input; always empty for `--local`. */
+  existing: readonly ExistingFinding[];
   tokensIn: number;
   tokensOut: number;
   estimatedTokens: number;
@@ -98,6 +116,67 @@ const DEFAULT_MAX_TOKENS = 120_000;
 
 function emptyDropped(): DroppedFindings {
   return { count: 0, reasons: [] };
+}
+
+function emptySummary(): ClassifySummary {
+  return {
+    posted: 0,
+    belowConfidence: 0,
+    lowSeverity: 0,
+    notInDiff: 0,
+    triageDismissed: 0,
+    duplicate: 0,
+    overCap: 0,
+    schemaInvalid: 0,
+  };
+}
+
+interface SymbolContent {
+  content: string;
+  /** False when this is a truncated +/-80-line context window (N10). */
+  full: boolean;
+}
+
+/**
+ * Reads the post-change content of every file in the diff, for the
+ * deterministic symbol. The safe repo reader wins; a context file is the
+ * fallback when the reader cannot see the path (for example a dropped
+ * lockfile). Only paths named in the diff are ever requested.
+ * LEFT symbols use the hunk context; step 6 passes the old content through `contentFor`.
+ */
+async function symbolContents(
+  diff: string,
+  context: ReviewContext,
+  readFile: ReadFile,
+): Promise<Map<string, SymbolContent>> {
+  const byPath = new Map<string, SymbolContent>();
+  const contextFiles = new Map(
+    context.files.map((file) => [
+      file.path,
+      { content: file.content, full: !file.truncatedToHunks },
+    ]),
+  );
+
+  for (const file of parseDiff(diff).files) {
+    if (file.status === "deleted") {
+      continue;
+    }
+
+    let content: SymbolContent | null = null;
+    try {
+      const text = await readFile(file.path);
+      content = text === null ? null : { content: text, full: true };
+    } catch {
+      content = null;
+    }
+
+    content ??= contextFiles.get(file.path) ?? null;
+    if (content !== null) {
+      byPath.set(file.path, content);
+    }
+  }
+
+  return byPath;
 }
 
 /** True only for a real `..` path segment; `..foo` is a normal file name. */
@@ -179,7 +258,9 @@ function parseLocalArgs(args: readonly string[]): LocalReviewOptions {
   let printPrompt = false;
   let model = "";
   let bigPrModel = "";
-  let commentSicko = false;
+  // Deliberately undefined when the flag is absent, so BUGBOT_COMMENT_SICKO
+  // in the environment still applies.
+  let commentSicko: boolean | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] ?? "";
@@ -246,6 +327,15 @@ function skippedLine(paths: readonly string[]): string {
 }
 
 /**
+ * The `--local` JSON echoes the validated findings. `categoryCoerced` is an
+ * internal fail-safe flag, not part of the model contract, so it is stripped
+ * from the printed output (R3-N5). The safe behaviour it drives is unchanged.
+ */
+function findingsForPrint(findings: readonly Finding[]): Array<Omit<Finding, "categoryCoerced">> {
+  return findings.map(({ categoryCoerced: _categoryCoerced, ...rest }) => rest);
+}
+
+/**
  * The whole `--local` pipeline: diff -> context -> prompt -> OpenRouter ->
  * validated findings. Every dependency is injectable so a test can run this
  * end to end with a fake fetch and reader. Errors become a neutral message and
@@ -257,6 +347,12 @@ export async function runLocalReview(
 ): Promise<LocalReviewResult> {
   const log = deps.log ?? ((line: string) => console.log(line));
   const readEnv = deps.env ?? env;
+  // Read this one raw: minConfidenceFromEnv rejects whitespace instead of
+  // trimming it, so a malformed value cannot silently lower the bar.
+  const rawMinConfidence =
+    deps.env === undefined
+      ? process.env.BUGBOT_MIN_CONFIDENCE
+      : deps.env("BUGBOT_MIN_CONFIDENCE");
   const model =
     options.model?.trim() || readEnv("BUGBOT_MODEL").trim() || DEFAULT_MODEL;
   const bigPrModel =
@@ -265,12 +361,18 @@ export async function runLocalReview(
     undefined;
   const commentSicko =
     options.commentSicko ?? readEnv("BUGBOT_COMMENT_SICKO") === "true";
+  // One resolved option object feeds the prompt-size measurement, the budget
+  // context and the assembled prompt, so they cannot disagree about sicko.
+  const promptOptions = { commentSicko };
 
   const empty: LocalReviewResult = {
     exitCode: 0,
     model,
     findings: [],
     dropped: emptyDropped(),
+    planned: [],
+    summary: emptySummary(),
+    existing: [],
     tokensIn: 0,
     tokensOut: 0,
     estimatedTokens: 0,
@@ -292,7 +394,7 @@ export async function runLocalReview(
       agentsMd = "";
     }
 
-    const systemPromptChars = (await loadSystemPrompt({ commentSicko })).length;
+    const systemPromptChars = (await loadSystemPrompt(promptOptions)).length;
     const request: ReviewRequest = {
       repository: "local/local",
       prNumber: 0,
@@ -307,12 +409,13 @@ export async function runLocalReview(
     };
 
     const context = await buildContext(request, readFile, {
+      ...promptOptions,
       systemPromptChars,
     });
-    const prompt = await buildPrompt(context, { commentSicko });
+    const prompt = await buildPrompt(context, promptOptions);
 
     if (options.printPrompt === true) {
-      log(`Estimated tokens: ${prompt.estimatedTokens}`);
+      log(`Estimated tokens: ${context.estimatedTokens}`);
       log(`Skipped files: ${skippedLine(context.skipped)}`);
       log(`Truncated files: ${skippedLine(context.truncated)}`);
       log(`System prompt: ${prompt.system.length} chars`);
@@ -320,7 +423,7 @@ export async function runLocalReview(
 
       return {
         ...empty,
-        estimatedTokens: prompt.estimatedTokens,
+        estimatedTokens: context.estimatedTokens,
         skipped: context.skipped,
         truncated: context.truncated,
         overBudget: context.overBudget,
@@ -359,7 +462,7 @@ export async function runLocalReview(
     log(
       JSON.stringify(
         {
-          findings: parsed.findings,
+          findings: findingsForPrint(parsed.findings),
           dropped: parsed.dropped.count,
           tokens_in: result.tokensIn,
           tokens_out: result.tokensOut,
@@ -369,11 +472,55 @@ export async function runLocalReview(
       ),
     );
 
+    // Step 6 fills `existing` from Bugbot's own comments. A local run has no
+    // PR, so cross-pass dedupe starts empty.
+    const existing: readonly ExistingFinding[] = [];
+    const symbolContent = await symbolContents(diff, context, readFile);
+    const hunkRanges = hunkContextsFromDiff(diff);
+    const classified = classifyFindings(parsed.findings, {
+      changedLines: changedLinesFromDiff(diff),
+      minConfidence: minConfidenceFromEnv(rawMinConfidence),
+      existing,
+      schemaInvalid: parsed.dropped.count,
+      contentFor: (file, side) =>
+        side === "RIGHT" ? symbolContent.get(file)?.content : undefined,
+      contentIsFullFor: (file, side) =>
+        side === "RIGHT" ? (symbolContent.get(file)?.full ?? false) : false,
+      hunkContextFor: (file, line, side) => {
+        for (const range of hunkRanges.get(file) ?? []) {
+          if (range.side === side && line >= range.start && line <= range.end) {
+            return range.context;
+          }
+        }
+        return undefined;
+      },
+    });
+
+    log(`Planned comments: ${classified.post.length}`);
+    for (const comment of classified.post) {
+      log(
+        `- ${comment.file}:${comment.line} ${comment.side} ${comment.severity} ${comment.hash.slice(0, 12)} ${comment.title}`,
+      );
+    }
+    log(
+      `Summary: posted=${classified.summary.posted} belowConfidence=${classified.summary.belowConfidence} lowSeverity=${classified.summary.lowSeverity} notInDiff=${classified.summary.notInDiff} triageDismissed=${classified.summary.triageDismissed} duplicate=${classified.summary.duplicate} overCap=${classified.summary.overCap} schemaInvalid=${classified.summary.schemaInvalid}`,
+    );
+    log(
+      `Existing tokens: ${
+        existing.length === 0
+          ? "(none)"
+          : existing.map((item) => item.hash).join(", ")
+      }`,
+    );
+
     return {
       exitCode: 0,
       model: selection.model,
       findings: parsed.findings,
       dropped: parsed.dropped,
+      planned: classified.post,
+      summary: classified.summary,
+      existing,
       tokensIn: result.tokensIn,
       tokensOut: result.tokensOut,
       estimatedTokens: prompt.estimatedTokens,

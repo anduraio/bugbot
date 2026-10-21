@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyTokenBudget,
   buildContext,
+  hunkContextsFromDiff,
   hunkRangesByPath,
   parseDiff,
   selectModel,
@@ -446,12 +447,12 @@ describe("applyTokenBudget", () => {
 describe("files whose windows cover their whole content", () => {
   const fixtureDir = fileURLToPath(new URL("./fixtures/local/", import.meta.url));
 
-  it("drops the largest full file at --max-tokens 13900 and fits", async () => {
+  it("drops the largest full file at --max-tokens 14000 and fits", async () => {
     const diff = await readFile(join(fixtureDir, "change.diff"), "utf8");
     const systemPromptChars = (await loadSystemPrompt()).length;
 
     const context = await buildContext(
-      fakeRequest(diff, 13_900),
+      fakeRequest(diff, 14_000),
       async (path) => {
         try {
           return await readFile(join(fixtureDir, path), "utf8");
@@ -463,10 +464,10 @@ describe("files whose windows cover their whole content", () => {
     );
 
     expect(context.overBudget).toBe(false);
-    // Only the largest file has to go for 13,900; the 3-line file still fits.
+    // Only the largest file has to go for 14,000; the 3-line file still fits.
     expect(context.skipped).toEqual(["package-lock.json", "src/cart.ts"]);
     expect(context.files.map((file) => file.path)).toEqual(["src/discount.ts"]);
-    expect(context.estimatedTokens).toBeLessThanOrEqual(13_900);
+    expect(context.estimatedTokens).toBeLessThanOrEqual(14_000);
     expect(context.diff).toBe(diff);
   });
 
@@ -835,5 +836,63 @@ describe("selectModel", () => {
         overBudget: false,
       }),
     ).toEqual({ skip: "big PR over 1500 changed lines, no big_pr_model set" });
+  });
+});
+
+describe("hunkContextsFromDiff", () => {
+  it("returns side ranges and the hunk header context text", () => {
+    const diff = [
+      "diff --git a/src/order.ts b/src/order.ts",
+      "--- a/src/order.ts",
+      "+++ b/src/order.ts",
+      "@@ -23,2 +23,3 @@ export interface Order {",
+      " context",
+      "-old",
+      "+new",
+      "+extra",
+      "",
+    ].join("\n");
+
+    expect(hunkContextsFromDiff(diff).get("src/order.ts")).toEqual([
+      {
+        side: "RIGHT",
+        start: 23,
+        end: 25,
+        context: "export interface Order {",
+      },
+      {
+        side: "LEFT",
+        start: 23,
+        end: 24,
+        context: "export interface Order {",
+      },
+    ]);
+  });
+
+  it("returns an empty context when the header has none", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1 +1 @@",
+      "-const a = 1;",
+      "+const a = 2;",
+      "",
+    ].join("\n");
+
+    expect(hunkContextsFromDiff(diff).get("src/a.ts")?.[0]?.context).toBe("");
+  });
+});
+
+describe("comment-sicko in the budget", () => {
+  it("measures the same prompt buildPrompt assembles", async () => {
+    const diff = addedFileDiff("src/app.ts", ["export const answer = 42;"]);
+    const context = await buildContext(fakeRequest(diff, 120_000), READER, {
+      commentSicko: true,
+    });
+    const prompt = await buildPrompt(context, { commentSicko: true });
+
+    expect(context.systemPromptChars).toBe(prompt.system.length);
+    expect(context.estimatedTokens).toBe(prompt.estimatedTokens);
   });
 });

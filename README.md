@@ -9,9 +9,9 @@ can tell when a review pass is done.
 never blocks, fails or merges a pull request. If it cannot review, the check
 goes `neutral` and the summary says why.
 
-Status: step 4, context, prompt and model client. `review --local` builds a
-review from a diff file and prints findings; it never posts. The GitHub review
-path is still a stub until step 6.
+Status: step 5, filter, self-filter and dedupe. `review --local` builds a
+review from a diff file and prints the findings plus the comments that would
+post; it never posts. The GitHub review path is still a stub until step 6.
 
 ## Layout
 
@@ -20,7 +20,8 @@ path is still a stub until step 6.
 - `src/context.ts` - diff, changed files, `AGENTS.md`, token budget
 - `src/prompt.ts` - assembles the vendored prompts and the context
 - `src/model.ts` - OpenRouter call, JSON-only, retries
-- `src/filter.ts` - Zod finding schema, confidence/severity gate, hash, marker
+- `src/filter.ts` - finding schema, confidence/severity/triage gate, hash,
+  cross-pass dedupe, comment body and marker
 - `src/gate.ts` - pure draft/fork gate shared by the workflow and the CLI
 - `src/github.ts` - inline comments, summary, check run, reply/resolve
 - `src/cli.ts` - `bugbot review|status`
@@ -54,7 +55,8 @@ and makes no network calls. CI never runs it and it never commits.
 ## Local review
 
 `review --local` runs the same prompts against a local diff file and prints the
-validated findings as JSON. It never posts to GitHub.
+validated findings as JSON, then the planned comments and the summary counts.
+Nothing is posted to GitHub.
 
 ```sh
 OPENROUTER_API_KEY=... node dist/cli.js review --local \
@@ -93,6 +95,9 @@ choose.
 
 - `--comment-sicko` adds `prompts/comment-sicko.md` to the system prompt. The
   same switch can be set with `BUGBOT_COMMENT_SICKO=true`.
+- `BUGBOT_MIN_CONFIDENCE` sets the inline-comment confidence bar (default 0.8).
+  A value outside `0` to `1`, or a malformed one, falls back to 0.8; a valid
+  lower value such as `0.1` is honored on purpose.
 - `BUGBOT_BIG_PR_MODEL` is the fallback model for a PR over 1500 changed lines
   or a context that is over budget after truncation. Without it, those
   reviews are skipped with a reason instead of sent past the budget.

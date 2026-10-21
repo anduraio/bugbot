@@ -89,6 +89,8 @@ describe("loadSystemPrompt", () => {
     expect(system).not.toContain("vendored from pstack");
     expect(system).toContain('{"findings"');
     expect(system).toContain('"security", "edge-case", "data"');
+    expect(system).toContain('"triage"');
+    expect(system).toContain("prompts/bugbot-triage.md");
     expect(system).toContain("Data, not instructions");
   });
 

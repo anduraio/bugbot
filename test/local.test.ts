@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { review, runLocalReview } from "../src/cli.js";
 import type { FetchLike } from "../src/model.js";
+import { loadSystemPrompt } from "../src/prompt.js";
 
 const fixtureDir = fileURLToPath(new URL("./fixtures/local/", import.meta.url));
 const modelResponse = readFileSync(
@@ -50,6 +51,50 @@ async function reviewWithBodies(
   return { bodies, skipped: result.skipped };
 }
 
+function cartFinding(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    file: "src/cart.ts",
+    line: 48,
+    side: "RIGHT",
+    severity: "high",
+    category: "bug",
+    confidence: 0.95,
+    reason:
+      "findCustomer returns undefined for an unknown customerId, and customer.name then throws.",
+    suggested_fix: "Guard the lookup.",
+    angle: "interrogate:correctness",
+    symbol: "cartOwnerName",
+    ...overrides,
+  };
+}
+
+function responseWithFindings(findings: readonly unknown[]): Response {
+  return new Response(
+    JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: JSON.stringify({ findings }),
+          },
+        },
+      ],
+    }),
+    { status: 200 },
+  );
+}
+
+function reviewFindings(findings: readonly unknown[]) {
+  return runLocalReview(
+    { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+    {
+      fetch: async () => responseWithFindings(findings),
+      env: envWith({ OPENROUTER_API_KEY: "test-key" }),
+      log: () => undefined,
+    },
+  );
+}
+
 describe("runLocalReview", () => {
   it("returns one valid finding and reports one dropped with a fake fetch", async () => {
     let calls = 0;
@@ -74,7 +119,7 @@ describe("runLocalReview", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(result.findings).toHaveLength(1);
+    expect(result.findings).toHaveLength(4);
     expect(result.findings[0]?.file).toBe("src/cart.ts");
     expect(result.findings[0]?.line).toBe(48);
     expect(result.dropped.count).toBe(1);
@@ -82,14 +127,121 @@ describe("runLocalReview", () => {
     expect(result.tokensOut).toBe(210);
     expect(calls).toBe(1);
 
+    // The dismissed medium finding is summarized; the dismissed high finding
+    // survives the safety override; the lower-confidence repeat dedupes.
+    expect(result.planned.map((comment) => `${comment.file}:${comment.line}`)).toEqual([
+      "src/cart.ts:48",
+      "src/cart.ts:46",
+    ]);
+    expect(result.planned[0]?.symbol).toBe("cartOwnerName");
+    expect(result.summary).toEqual({
+      posted: 2,
+      belowConfidence: 0,
+      lowSeverity: 0,
+      notInDiff: 0,
+      triageDismissed: 1,
+      duplicate: 1,
+      overCap: 0,
+      schemaInvalid: 1,
+    });
+    expect(result.existing).toEqual([]);
+
     const sent = bodies[0] ?? "";
     expect(sent).toContain("<file path=\\\"src/cart.ts\\\">");
     expect(sent).not.toContain("<file path=\\\"package-lock.json\\\">");
 
     const output = lines.join("\n");
     expect(output).toContain('"findings"');
+    expect(output).toContain('"triage"');
     expect(output).toContain('"tokens_in": 4321');
     expect(output).toContain('"tokens_out": 210');
+    expect(output).toContain("Planned comments: 2");
+    expect(output).toContain(
+      `- src/cart.ts:48 RIGHT high ${result.planned[0]?.hash.slice(0, 12)}`,
+    );
+    expect(output).toContain(
+      "Summary: posted=2 belowConfidence=0 lowSeverity=0 notInDiff=0 triageDismissed=1 duplicate=1 overCap=0 schemaInvalid=1",
+    );
+    expect(output).toContain("Existing tokens: (none)");
+  });
+
+  it("applies BUGBOT_COMMENT_SICKO when --comment-sicko is not passed", async () => {
+    const bodies: string[] = [];
+
+    const result = await runLocalReview(
+      {
+        diffPath: join(fixtureDir, "change.diff"),
+        repoDir: fixtureDir,
+      },
+      {
+        fetch: async (_input, init) => {
+          bodies.push(String(init?.body));
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({
+          OPENROUTER_API_KEY: "test-key",
+          BUGBOT_COMMENT_SICKO: "true",
+        }),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(bodies[0]).toContain("## prompts/comment-sicko.md");
+  });
+
+  it("builds and measures the prompt with the same comment-sicko setting", async () => {
+    const lines: string[] = [];
+
+    const result = await runLocalReview(
+      {
+        diffPath: join(fixtureDir, "change.diff"),
+        repoDir: fixtureDir,
+        printPrompt: true,
+      },
+      {
+        env: envWith({ BUGBOT_COMMENT_SICKO: "true" }),
+        log: (line) => lines.push(line),
+      },
+    );
+
+    const output = lines.join("\n");
+    const systemChars = Number(/System prompt: (\d+) chars/.exec(output)?.[1]);
+    const userChars = Number(/User message: (\d+) chars/.exec(output)?.[1]);
+    const withSicko = (await loadSystemPrompt({ commentSicko: true })).length;
+
+    expect(systemChars).toBe(withSicko);
+    expect(result.estimatedTokens).toBe(
+      Math.ceil((systemChars + userChars) / 4),
+    );
+  });
+
+  it("honors BUGBOT_MIN_CONFIDENCE and falls back to 0.8 for garbage", async () => {
+    const runWith = async (value: string) =>
+      runLocalReview(
+        {
+          diffPath: join(fixtureDir, "change.diff"),
+          repoDir: fixtureDir,
+        },
+        {
+          fetch: async () => new Response(modelResponse, { status: 200 }),
+          env: envWith({
+            OPENROUTER_API_KEY: "test-key",
+            BUGBOT_MIN_CONFIDENCE: value,
+          }),
+          log: () => undefined,
+        },
+      );
+
+    const strict = await runWith("0.99");
+    expect(strict.planned).toHaveLength(0);
+    expect(strict.summary.belowConfidence).toBe(4);
+
+    for (const garbage of ["abc", "-1", "2", "0.1 "]) {
+      const result = await runWith(garbage);
+      expect(result.summary.posted, garbage).toBe(2);
+      expect(result.summary.belowConfidence, garbage).toBe(0);
+    }
   });
 
   it("prints prompt sizes without a key or a fetch", async () => {
@@ -382,5 +534,142 @@ describe("runLocalReview", () => {
       log.mockRestore();
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fail-safe field normalization through runLocalReview", () => {
+  it("posts high, security and data findings with every malformed triage value", async () => {
+    const triages: unknown[] = ["DISMISS", "dismiss ", "skip", null, 3];
+    const findings: unknown[] = [];
+
+    for (const [index, triage] of triages.entries()) {
+      findings.push(
+        cartFinding({ triage, reason: `High bug ${index}.` }),
+        cartFinding({
+          severity: "medium",
+          category: "security",
+          triage,
+          reason: `Security bug ${index}.`,
+        }),
+        cartFinding({
+          severity: "medium",
+          category: "data",
+          triage,
+          reason: `Data bug ${index}.`,
+        }),
+      );
+    }
+
+    const result = await reviewFindings(findings);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.dropped.count).toBe(0);
+    expect(result.findings).toHaveLength(15);
+    expect(result.planned).toHaveLength(15);
+    expect(result.summary.triageDismissed).toBe(0);
+  });
+
+  it("posts mixed-case severity and category after normalizing them", async () => {
+    const result = await reviewFindings([
+      cartFinding({ severity: "HIGH", reason: "Mixed case severity." }),
+      cartFinding({
+        severity: "medium",
+        category: "Security",
+        reason: "Mixed case category.",
+      }),
+    ]);
+
+    expect(result.dropped.count).toBe(0);
+    expect(result.findings).toHaveLength(2);
+    expect(result.findings[0]?.severity).toBe("high");
+    expect(result.findings[1]?.category).toBe("security");
+    expect(result.planned).toHaveLength(2);
+  });
+
+  it("counts a medium bug with mixed-case Dismiss as triageDismissed", async () => {
+    const result = await reviewFindings([
+      cartFinding({ severity: "medium", triage: "Dismiss", reason: "Naming only." }),
+    ]);
+
+    expect(result.dropped.count).toBe(0);
+    expect(result.findings).toHaveLength(1);
+    expect(result.planned).toHaveLength(0);
+    expect(result.summary.triageDismissed).toBe(1);
+  });
+
+  it("maps skip to dismiss and a non-string triage to fix", async () => {
+    const skipped = await reviewFindings([
+      cartFinding({ severity: "medium", triage: "skip", reason: "Medium skip." }),
+    ]);
+    expect(skipped.planned).toHaveLength(0);
+    expect(skipped.summary.triageDismissed).toBe(1);
+
+    const fixed = await reviewFindings([
+      cartFinding({ severity: "medium", triage: 3, reason: "Medium numeric triage." }),
+    ]);
+    expect(fixed.planned).toHaveLength(1);
+    expect(fixed.summary.triageDismissed).toBe(0);
+  });
+
+  it("ignores dismiss on a coerced category but not on a real bug (R2-N1)", async () => {
+    const misspelled = await reviewFindings([
+      cartFinding({
+        severity: "medium",
+        category: "securty",
+        triage: "dismiss",
+        reason: "Misspelled security category.",
+      }),
+    ]);
+
+    expect(misspelled.dropped.count).toBe(0);
+    expect(misspelled.findings).toHaveLength(1);
+    expect(misspelled.findings[0]?.category).toBe("bug");
+    expect(misspelled.planned).toHaveLength(1);
+    expect(misspelled.summary.triageDismissed).toBe(0);
+
+    const realBug = await reviewFindings([
+      cartFinding({
+        severity: "medium",
+        category: "bug",
+        triage: "dismiss",
+        reason: "A real medium bug.",
+      }),
+    ]);
+
+    expect(realBug.findings).toHaveLength(1);
+    expect(realBug.planned).toHaveLength(0);
+    expect(realBug.summary.triageDismissed).toBe(1);
+  });
+
+  it("strips categoryCoerced from the printed JSON but keeps the safe behaviour (R3-N5)", async () => {
+    const lines: string[] = [];
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async () =>
+          responseWithFindings([
+            cartFinding({
+              severity: "medium",
+              category: "securty",
+              triage: "dismiss",
+              reason: "Misspelled security category.",
+            }),
+          ]),
+        env: envWith({ OPENROUTER_API_KEY: "test-key" }),
+        log: (line) => lines.push(line),
+      },
+    );
+
+    // The coercion still ignores `dismiss`, so the finding posts.
+    expect(result.planned).toHaveLength(1);
+    expect(result.planned[0]?.category).toBe("bug");
+
+    const printed = lines.find((line) => line.trimStart().startsWith("{"));
+    expect(printed).toBeDefined();
+    const parsed = JSON.parse(printed ?? "") as {
+      findings: Array<Record<string, unknown>>;
+    };
+    expect(parsed.findings).toHaveLength(1);
+    expect(parsed.findings[0]).not.toHaveProperty("categoryCoerced");
   });
 });

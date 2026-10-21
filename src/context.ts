@@ -548,6 +548,61 @@ export function changedLinesFromDiff(diff: string): ChangedLines {
   return parseDiff(diff).changedLines;
 }
 
+export interface HunkContextRange {
+  side: DiffSide;
+  /** First line covered by the hunk on this side, inclusive. */
+  start: number;
+  /** Last line covered by the hunk on this side, inclusive. */
+  end: number;
+  /** The text after the second `@@` in the hunk header. */
+  context: string;
+}
+
+/** The trailing context text of one `@@ ... @@ <context>` header. */
+export function hunkContextText(header: string): string {
+  const match = /^@@[^@]*@@\s*(.*)$/.exec(header);
+  return (match?.[1] ?? "").trim();
+}
+
+/**
+ * Hunk line ranges and header context per file and side, used as the symbol
+ * fallback when the file content is unavailable (a dropped context file, or a
+ * LEFT finding whose pre-change content is not on disk).
+ */
+export function hunkContextsFromDiff(
+  diff: string,
+): Map<string, readonly HunkContextRange[]> {
+  const result = new Map<string, HunkContextRange[]>();
+
+  for (const file of parseDiff(diff).files) {
+    const ranges: HunkContextRange[] = [];
+
+    for (const hunk of file.hunks) {
+      const context = hunkContextText(hunk.header);
+      if (hunk.newLines > 0) {
+        ranges.push({
+          side: "RIGHT",
+          start: hunk.newStart,
+          end: hunk.newStart + hunk.newLines - 1,
+          context,
+        });
+      }
+      if (hunk.oldLines > 0) {
+        ranges.push({
+          side: "LEFT",
+          start: hunk.oldStart,
+          end: hunk.oldStart + hunk.oldLines - 1,
+          context,
+        });
+      }
+    }
+
+    result.set(file.path, ranges);
+  }
+
+  return result;
+}
+
 /** New-side line ranges covered by hunks, keyed by the file's post-change path. */
 export function hunkRangesByPath(diff: string): Map<string, LineRange[]> {
   const ranges = new Map<string, LineRange[]>();
