@@ -1,0 +1,21 @@
+{
+  "id": "gen-local-fixture",
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "object": "chat.completion",
+  "created": 1,
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"findings\":[{\"file\":\"src/cart.ts\",\"line\":48,\"side\":\"RIGHT\",\"severity\":\"high\",\"category\":\"bug\",\"confidence\":0.95,\"reason\":\"findCustomer returns undefined for an unknown customerId, and cartOwnerName dereferences customer.name without a guard, so an order with a missing customer throws.\",\"suggested_fix\":\"Guard the lookup: if (customer === undefined) return \\\"Unknown customer\\\";\",\"angle\":\"interrogate:correctness\",\"symbol\":\"cartOwnerName\"},{\"file\":\"src/cart.ts\",\"line\":48,\"side\":\"RIGHT\",\"severity\":\"critical\",\"category\":\"bug\",\"confidence\":0.9,\"reason\":\"This item is invalid because critical is not an allowed severity.\",\"angle\":\"interrogate:correctness\",\"symbol\":\"cartOwnerName\"}]}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4321,
+    "completion_tokens": 210,
+    "total_tokens": 4531
+  }
+}

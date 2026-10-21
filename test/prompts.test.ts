@@ -87,6 +87,33 @@ describe("vendored prompts", () => {
     expect(listed.sort()).toEqual([...PROMPT_FILES].sort());
   });
 
+  it("keeps the prompts/README.md hash equal to each file header hash", () => {
+    const readme = readFileSync(join(promptsDir, "README.md"), "utf8");
+    const rows = [
+      ...readme.matchAll(/^\| `(prompts\/[^`]+)` \|.*\| `([0-9a-f]{64})` \|$/gm),
+    ];
+
+    expect(rows).toHaveLength(files.length);
+
+    for (const row of rows) {
+      const path = row[1];
+      const listedHash = row[2];
+      if (path === undefined || listedHash === undefined) {
+        throw new Error("malformed prompts/README.md row");
+      }
+
+      const content = readFileSync(join(repoRoot, path), "utf8");
+      const header = HEADER.exec(content);
+      if (header === null) {
+        throw new Error(`${path} is missing the vendored header`);
+      }
+
+      expect(header[3], `${path} README hash disagrees with its header`).toBe(
+        listedHash,
+      );
+    }
+  });
+
   it("contains no secrets", () => {
     for (const path of ["prompts/README.md", ...files]) {
       const content = readFileSync(join(repoRoot, path), "utf8");
