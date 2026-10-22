@@ -184,6 +184,23 @@ choose.
 - `BUGBOT_BIG_PR_MODEL` is the fallback model for a PR over 1500 changed lines
   or a context that is over budget after truncation. Without it, those
   reviews are skipped with a reason instead of sent past the budget.
+- `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
+  (default 8000). A `length` stop with empty content retries with twice the
+  cap, up to 32000, and bounds reasoning to `low` when the stop spent tokens
+  on reasoning.
+
+## Workflow inputs
+
+The reusable workflow and the composite action accept `model`, `big_pr_model`,
+`max_tokens` (input budget, default 120000), `max_output_tokens` (model output
+cap, default 8000), `min_confidence`, `dry_run` and `comment_sicko`.
+`max_output_tokens` is passed to the CLI as `BUGBOT_MAX_OUTPUT_TOKENS`.
+
+An empty model reply logs one line with `finish_reason`,
+`native_finish_reason`, the reasoning character count, the usage numbers and
+any provider `error` code and message. It never logs the prompt or the
+reasoning text. Safe usage from those failed attempts is still counted in the
+summary's `Tokens` line.
 
 ## Development
 

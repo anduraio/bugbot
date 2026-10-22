@@ -25,6 +25,50 @@ function ok(content: string, tokensIn?: number, tokensOut?: number): Response {
   return new Response(completion(content, tokensIn, tokensOut), { status: 200 });
 }
 
+/** A 200 completion with no content, for length/error/usage tests. */
+function emptyStop(
+  options: {
+    finishReason?: string;
+    nativeFinishReason?: string;
+    content?: string;
+    reasoning?: string;
+    tokensIn?: number;
+    tokensOut?: number;
+    reasoningTokens?: number;
+  } = {},
+): Response {
+  const finishReason = options.finishReason ?? "length";
+  return new Response(
+    JSON.stringify({
+      id: "gen-test",
+      model: CALL.model,
+      choices: [
+        {
+          index: 0,
+          finish_reason: finishReason,
+          native_finish_reason:
+            options.nativeFinishReason ?? finishReason,
+          message: {
+            role: "assistant",
+            content: options.content ?? "",
+            ...(options.reasoning === undefined
+              ? {}
+              : { reasoning: options.reasoning }),
+          },
+        },
+      ],
+      usage: {
+        prompt_tokens: options.tokensIn ?? 100,
+        completion_tokens: options.tokensOut ?? 20,
+        completion_tokens_details: {
+          reasoning_tokens: options.reasoningTokens ?? 0,
+        },
+      },
+    }),
+    { status: 200 },
+  );
+}
+
 function finding(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     file: "src/cart.ts",
@@ -301,6 +345,179 @@ describe("callModel", () => {
     ).rejects.toThrow("OPENROUTER_API_KEY is not set");
 
     expect(calls).toBe(0);
+  });
+
+  it("doubles the cap and bounds reasoning after an empty length stop", async () => {
+    const bodies: Array<{
+      max_tokens: number;
+      reasoning?: { effort: string };
+    }> = [];
+    const logs: string[] = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(
+        JSON.parse(String(init?.body)) as {
+          max_tokens: number;
+          reasoning?: { effort: string };
+        },
+      );
+      if (bodies.length === 1) {
+        return emptyStop({
+          reasoning: "hidden chain of thought",
+          tokensIn: 900,
+          tokensOut: 8_000,
+          reasoningTokens: 7_900,
+        });
+      }
+      return ok('{"findings":[]}', 100, 20);
+    };
+
+    const result = await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: fakeFetch,
+      sleep: async () => undefined,
+      maxOutputTokens: 8_000,
+      log: (line) => logs.push(line),
+    });
+
+    expect(bodies.map((body) => body.max_tokens)).toEqual([8_000, 16_000]);
+    expect(bodies[0]?.reasoning).toBeUndefined();
+    expect(bodies[1]?.reasoning).toEqual({ effort: "low" });
+    // The empty attempt's usage still counts: 100 + 900 in, 20 + 8,000 out.
+    expect(result.tokensIn).toBe(1_000);
+    expect(result.tokensOut).toBe(8_020);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain(" finish_reason=length");
+    expect(logs[0]).toContain("native_finish_reason=length");
+    expect(logs[0]).toContain("reasoning_chars=23");
+    expect(logs[0]).toContain("reasoning_tokens=7900");
+    expect(logs[0]).not.toContain("hidden chain of thought");
+  });
+
+  it("names the reasoning budget when every attempt stops on length", async () => {
+    const bodies: Array<{ max_tokens: number }> = [];
+    let caught: unknown;
+    const logs: string[] = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(
+        JSON.parse(String(init?.body)) as { max_tokens: number },
+      );
+      return emptyStop({ reasoning: "reasoning", tokensIn: 900, tokensOut: 8_000 });
+    };
+
+    try {
+      await callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        sleep: async () => undefined,
+        maxOutputTokens: 8_000,
+        log: (line) => logs.push(line),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    const message = caught instanceof Error ? caught.message : String(caught);
+    expect(bodies.map((body) => body.max_tokens)).toEqual([
+      8_000, 16_000, 32_000,
+    ]);
+    expect(message).toContain("whole 32000-token output budget on reasoning");
+    expect(message).toContain('finish_reason "length"');
+    expect(message).toContain("after 3 attempts");
+    expect(caught).toBeInstanceOf(BugbotModelError);
+    expect(caught).toMatchObject({ tokensIn: 2_700, tokensOut: 24_000 });
+    expect(logs).toHaveLength(3);
+    for (const line of logs) {
+      expect(line).toContain(" finish_reason=length");
+    }
+  });
+
+  it("reports a provider error inside a 200 body and logs its code", async () => {
+    const logs: string[] = [];
+    const response = new Response(
+      JSON.stringify({
+        error: { code: 502, message: "upstream exploded" },
+        choices: [{ index: 0, message: { role: "assistant", content: "" } }],
+        usage: { prompt_tokens: 12, completion_tokens: 0 },
+      }),
+      { status: 200 },
+    );
+
+    await expect(
+      callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: async () => response,
+        retries: 0,
+        log: (line) => logs.push(line),
+      }),
+    ).rejects.toThrow(
+      "OpenRouter returned an error inside a 200 response: 502 upstream exploded",
+    );
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("error_code=502");
+    expect(logs[0]).toContain("error_message=upstream exploded");
+    expect(logs[0]).toContain(" finish_reason=none");
+  });
+
+  it("counts usage from an empty reply on the thrown error", async () => {
+    let caught: unknown;
+
+    try {
+      await callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: async () =>
+          emptyStop({ tokensIn: 4_321, tokensOut: 8_000, reasoningTokens: 7_500 }),
+        retries: 0,
+        log: () => undefined,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BugbotModelError);
+    expect(caught).toMatchObject({ tokensIn: 4_321, tokensOut: 8_000 });
+  });
+
+  it("never logs prompt or reasoning text", async () => {
+    const system = "SYSTEM-PROMPT-SECRET";
+    const user = "USER-PROMPT-SECRET";
+    const reasoning = "REASONING-TEXT-SECRET";
+    const logs: string[] = [];
+
+    await expect(
+      callModel(
+        { ...CALL, system, user },
+        {
+          apiKey: "sk-test-key",
+          fetch: async () => emptyStop({ reasoning }),
+          retries: 0,
+          log: (line) => logs.push(line),
+        },
+      ),
+    ).rejects.toBeInstanceOf(BugbotModelError);
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain(`reasoning_chars=${reasoning.length}`);
+    expect(logs[0]).not.toContain(system);
+    expect(logs[0]).not.toContain(user);
+    expect(logs[0]).not.toContain(reasoning);
+  });
+
+  it("sends an explicit reasoning effort when one is configured", async () => {
+    let body: { reasoning?: { effort: string } } = {};
+
+    await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: async (_input, init) => {
+        body = JSON.parse(String(init?.body)) as {
+          reasoning?: { effort: string };
+        };
+        return ok('{"findings":[]}');
+      },
+      reasoningEffort: "high",
+    });
+
+    expect(body.reasoning).toEqual({ effort: "high" });
   });
 });
 

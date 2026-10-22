@@ -28,6 +28,11 @@ on:
         required: false
         type: string
         default: "120000"
+      max_output_tokens:
+        description: Output cap sent as max_tokens. Doubled after an empty length stop, up to 32000.
+        required: false
+        type: string
+        default: "8000"
       min_confidence:
         description: Minimum confidence for an inline comment.
         required: false
@@ -76,6 +81,11 @@ on:
         required: false
         type: string
         default: "120000"
+      max_output_tokens:
+        description: Output cap sent as max_tokens. Doubled after an empty length stop, up to 32000.
+        required: false
+        type: string
+        default: "8000"
       min_confidence:
         description: Minimum confidence for an inline comment.
         required: false
@@ -234,6 +244,7 @@ jobs:
           model: ${{ inputs.model }}
           big_pr_model: ${{ inputs.big_pr_model }}
           max_tokens: ${{ inputs.max_tokens }}
+          max_output_tokens: ${{ inputs.max_output_tokens }}
           min_confidence: ${{ inputs.min_confidence }}
           dry_run: ${{ inputs.dry_run }}
           comment_sicko: ${{ inputs.comment_sicko }}

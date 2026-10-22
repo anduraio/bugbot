@@ -393,6 +393,8 @@ interface World {
   modelStatus: number;
   modelMessage: string;
   modelInvalidJson: boolean;
+  /** Main model calls that return an empty `length` stop before the normal one. */
+  modelEmptyLengths: number;
   recheckContent: string;
   recheckStatus: number;
   /** First comment ids whose reply POST answers 500. */
@@ -453,6 +455,7 @@ function makeWorld(overrides: Partial<World> = {}): World {
     modelStatus: 200,
     modelMessage: "model failed",
     modelInvalidJson: false,
+    modelEmptyLengths: 0,
     recheckContent: JSON.stringify({ results: [] }),
     recheckStatus: 200,
     replyFailures: [],
@@ -563,6 +566,30 @@ function recordedFetch(world: World): {
       }
       if (world.modelStatus !== 200) {
         return json({ error: { message: world.modelMessage } }, world.modelStatus);
+      }
+      if (world.modelEmptyLengths > 0) {
+        world.modelEmptyLengths -= 1;
+        return json({
+          id: "gen-test",
+          model: "deepseek/test",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "length",
+              native_finish_reason: "length",
+              message: {
+                role: "assistant",
+                content: "",
+                reasoning: "hidden reasoning text",
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 900,
+            completion_tokens: 8_000,
+            completion_tokens_details: { reasoning_tokens: 7_000 },
+          },
+        });
       }
       if (world.modelInvalidJson) {
         return completion("this is not json");
@@ -956,6 +983,17 @@ describe("runPrReview pass 1", () => {
       (call) => call.method === "POST" && call.path === "/repos/o/r/check-runs",
     );
     expect((start[0]!.body as { head_sha: string }).head_sha).toBe(HEAD);
+  });
+
+  it("passes BUGBOT_MAX_OUTPUT_TOKENS to the model request", async () => {
+    const world = makeWorld();
+    const { calls } = await runReview(world, {
+      BUGBOT_MAX_OUTPUT_TOKENS: "1234",
+    });
+
+    const requests = mainModelCalls(calls);
+    expect(requests).toHaveLength(1);
+    expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(1_234);
   });
 });
 
@@ -2561,6 +2599,26 @@ describe("runPrReview failures", () => {
       expect(summaryBody(world)).toMatch(item.reason);
     });
   }
+
+  it("counts usage from empty length replies and names the cause", async () => {
+    const world = makeWorld({ modelEmptyLengths: 3 });
+    const { result, logs } = await runReview(world);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.conclusion).toBe("neutral");
+    expect(result.error).toContain(
+      "whole 32000-token output budget on reasoning",
+    );
+
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Tokens: 2700 in / 24000 out");
+    expect(summary).toContain("Bugbot couldn't review:");
+    expect(summary).toContain("whole 32000-token output budget on reasoning");
+    expect(logs.some((line) => line.includes(" finish_reason=length"))).toBe(true);
+    expect(logs.some((line) => line.includes("hidden reasoning text"))).toBe(
+      false,
+    );
+  });
 });
 
 describe("runPrReview lost check handle", () => {

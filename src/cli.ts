@@ -156,6 +156,7 @@ export interface LocalReviewResult {
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 const DEFAULT_MAX_TOKENS = 120_000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
 
 function emptyDropped(): DroppedFindings {
   return { count: 0, reasons: [] };
@@ -497,9 +498,19 @@ export async function runLocalReview(
       throw new BugbotModelError("OPENROUTER_API_KEY is not set");
     }
 
+    const maxOutputTokens = parsePositiveEnv(
+      readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+      DEFAULT_MAX_OUTPUT_TOKENS,
+    );
+
     const result = await callModel(
       { model: selection.model, system: prompt.system, user: prompt.user },
-      { apiKey, fetch: deps.fetch },
+      {
+        apiKey,
+        fetch: deps.fetch,
+        maxOutputTokens,
+        log: (line) => log(line),
+      },
     );
     const parsed = parseJsonResponse(result.raw);
 
@@ -575,7 +586,11 @@ export async function runLocalReview(
     };
   } catch (error) {
     log(`Bugbot couldn't review: ${errorMessage(error)}`);
-    return empty;
+    return {
+      ...empty,
+      tokensIn: error instanceof BugbotModelError ? error.tokensIn : 0,
+      tokensOut: error instanceof BugbotModelError ? error.tokensOut : 0,
+    };
   }
 }
 
@@ -843,6 +858,10 @@ export async function runPrReview(
   const maxTokens = parsePositiveEnv(
     readEnv("BUGBOT_MAX_TOKENS").trim(),
     DEFAULT_MAX_TOKENS,
+  );
+  const maxOutputTokens = parsePositiveEnv(
+    readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+    DEFAULT_MAX_OUTPUT_TOKENS,
   );
   // Read raw: minConfidenceFromEnv rejects whitespace instead of trimming it.
   const rawMinConfidence =
@@ -1176,6 +1195,8 @@ export async function runPrReview(
           fetch: deps.fetch,
           sleep: deps.sleep,
           timeoutMs: deps.modelTimeoutMs,
+          maxOutputTokens,
+          log: (line) => log(line),
         },
       );
       tokensIn = result.tokensIn;
@@ -1418,6 +1439,7 @@ export async function runPrReview(
                 sleep: deps.sleep,
                 timeoutMs: deps.modelTimeoutMs,
                 maxOutputTokens: 2_000,
+                log: (line) => log(line),
               },
             );
             tokensIn += recheck.tokensIn;
@@ -1451,6 +1473,10 @@ export async function runPrReview(
       }
     } catch (caught) {
       error = reasonOf(caught);
+      if (caught instanceof BugbotModelError) {
+        tokensIn = caught.tokensIn;
+        tokensOut = caught.tokensOut;
+      }
       log(`Bugbot couldn't review: ${error}`);
     }
   }

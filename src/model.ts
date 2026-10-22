@@ -23,8 +23,22 @@ export type Sleep = (milliseconds: number) => Promise<void>;
 export interface ModelOptions {
   /** OPENROUTER_API_KEY. Read from the shell environment by the CLI. */
   apiKey?: string;
-  /** Output token cap sent as `max_tokens`. Default 8000. */
+  /**
+   * Output token cap sent as `max_tokens`. Default 8000. A `length` stop
+   * with empty content doubles it, up to `maxOutputTokensCeiling`.
+   */
   maxOutputTokens?: number;
+  /**
+   * Highest `max_tokens` a retry after a `length` stop may grow to.
+   * Default 32000; never below `maxOutputTokens`.
+   */
+  maxOutputTokensCeiling?: number;
+  /**
+   * Optional OpenRouter `reasoning.effort`. Omitted by default. After a
+   * `length` stop that produced reasoning, the retry uses `low` unless this
+   * is set, so reasoning cannot eat the whole bigger cap again.
+   */
+  reasoningEffort?: "low" | "medium" | "high";
   /** Retries after the first attempt. Default: 2. */
   retries?: number;
   /** Injectable fetch, so tests make no network call. */
@@ -33,12 +47,15 @@ export interface ModelOptions {
   sleep?: Sleep;
   /** Per-attempt timeout. Default 120 seconds. */
   timeoutMs?: number;
+  /** One-line diagnostic sink for an empty completion. Default console.warn. */
+  log?: (line: string) => void;
 }
 
 export interface ModelResult {
   /** Raw JSON text returned by the model. Validated by FindingSchema. */
   raw: string;
   model: string;
+  /** Usage summed over every 200 reply, including retried empty ones. */
   tokensIn: number;
   tokensOut: number;
 }
@@ -56,14 +73,24 @@ export interface ParsedFindings {
 
 /** A safe model failure: no key, no headers and no request body. */
 export class BugbotModelError extends Error {
-  constructor(message: string) {
+  /** Tokens the provider reported, summed over every 200 reply. */
+  readonly tokensIn: number;
+  readonly tokensOut: number;
+
+  constructor(
+    message: string,
+    usage: { tokensIn?: number; tokensOut?: number } = {},
+  ) {
     super(message);
     this.name = "BugbotModelError";
+    this.tokensIn = usage.tokensIn ?? 0;
+    this.tokensOut = usage.tokensOut ?? 0;
   }
 }
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
+const DEFAULT_MAX_OUTPUT_TOKENS_CEILING = 32_000;
 const DEFAULT_RETRIES = 2;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -119,28 +146,151 @@ function isAbort(error: unknown): boolean {
   );
 }
 
-function messageContent(payload: unknown): string | null {
-  if (typeof payload !== "object" || payload === null) {
-    return null;
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function errorFields(
+  record: Record<string, unknown> | null,
+  apiKey: string,
+): { code: string | null; message: string | null } {
+  const error = recordOf(record?.error);
+  if (error === null) {
+    return { code: null, message: null };
   }
 
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices)) {
-    return null;
+  const rawCode = error.code;
+  const code =
+    typeof rawCode === "number" && Number.isFinite(rawCode)
+      ? String(rawCode)
+      : typeof rawCode === "string" && rawCode.trim() !== ""
+        ? rawCode.trim().slice(0, 60)
+        : null;
+  const message =
+    typeof error.message === "string"
+      ? safeText(error.message, apiKey).replace(/\s+/g, " ").trim()
+      : null;
+
+  return { code, message };
+}
+
+/**
+ * The parts of a completion that decide what happened, without any prompt or
+ * reasoning text. `content` is the only field that leaves this module.
+ */
+interface CompletionDetails {
+  content: string | null;
+  finishReason: string | null;
+  nativeFinishReason: string | null;
+  /** Character count only: the reasoning text itself is never kept. */
+  reasoningChars: number;
+  reasoningDetails: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+function completionDetails(
+  payload: unknown,
+  apiKey: string,
+): CompletionDetails {
+  const record = recordOf(payload);
+  const choices = record?.choices;
+  const first = Array.isArray(choices) ? recordOf(choices[0]) : null;
+  const message = recordOf(first?.message);
+  const contentValue = message?.content;
+  const content =
+    typeof contentValue === "string" && contentValue.trim() !== ""
+      ? contentValue
+      : null;
+  const reasoning =
+    stringField(message?.reasoning) ?? stringField(message?.reasoning_content);
+  const reasoningDetails = Array.isArray(message?.reasoning_details)
+    ? message.reasoning_details.length
+    : 0;
+  const usage = recordOf(record?.usage);
+  const usageDetails = recordOf(usage?.completion_tokens_details);
+  const topError = errorFields(record, apiKey);
+  const choiceError = errorFields(first, apiKey);
+
+  return {
+    content,
+    finishReason: stringField(first?.finish_reason),
+    nativeFinishReason: stringField(first?.native_finish_reason),
+    reasoningChars: reasoning?.length ?? 0,
+    reasoningDetails,
+    promptTokens: numberOrZero(usage?.prompt_tokens),
+    completionTokens: numberOrZero(usage?.completion_tokens),
+    reasoningTokens:
+      numberOrZero(usageDetails?.reasoning_tokens) ||
+      numberOrZero(usage?.reasoning_tokens),
+    errorCode: topError.code ?? choiceError.code,
+    errorMessage: topError.message ?? choiceError.message,
+  };
+}
+
+/** One safe line per empty completion: no prompt, reasoning or key text. */
+function diagnosticLine(details: CompletionDetails, cap: number): string {
+  const parts = [
+    `finish_reason=${details.finishReason ?? "none"}`,
+    `native_finish_reason=${details.nativeFinishReason ?? "none"}`,
+    `reasoning_chars=${details.reasoningChars}`,
+    `reasoning_details=${details.reasoningDetails}`,
+    `prompt_tokens=${details.promptTokens}`,
+    `completion_tokens=${details.completionTokens}`,
+    `reasoning_tokens=${details.reasoningTokens}`,
+  ];
+
+  if (details.errorCode !== null || details.errorMessage !== null) {
+    parts.push(`error_code=${details.errorCode ?? "none"}`);
+    if (details.errorMessage !== null) {
+      parts.push(`error_message=${details.errorMessage}`);
+    }
   }
 
-  const first = choices[0];
-  if (typeof first !== "object" || first === null) {
-    return null;
+  return `OpenRouter empty completion (max_tokens ${cap}): ${parts.join(" ")}`;
+}
+
+/** Plain words for the final neutral line, never provider content. */
+function emptyContentCause(details: CompletionDetails, cap: number): string {
+  if (details.errorCode !== null || details.errorMessage !== null) {
+    const detail = [details.errorCode, details.errorMessage]
+      .filter((part): part is string => part !== null)
+      .join(" ");
+    return `OpenRouter returned an error inside a 200 response: ${detail}`;
   }
 
-  const message = (first as { message?: unknown }).message;
-  if (typeof message !== "object" || message === null) {
-    return null;
+  if (details.finishReason === "length") {
+    const reasoningSpent =
+      details.reasoningChars > 0 ||
+      details.reasoningDetails > 0 ||
+      details.reasoningTokens > 0;
+    return `the model used its whole ${cap}-token output budget${
+      reasoningSpent ? " on reasoning" : ""
+    } and returned no answer (finish_reason "length")`;
   }
 
-  const content = (message as { content?: unknown }).content;
-  return typeof content === "string" && content.trim() !== "" ? content : null;
+  if (details.finishReason === "content_filter") {
+    return 'the model stopped on a content filter and returned no answer (finish_reason "content_filter")';
+  }
+
+  if (details.finishReason === "error") {
+    return 'the model returned finish_reason "error" and no answer';
+  }
+
+  if (details.finishReason === null) {
+    return "OpenRouter returned no message content";
+  }
+
+  return `OpenRouter returned no message content (finish_reason "${details.finishReason}")`;
 }
 
 /**
@@ -165,27 +315,40 @@ export async function callModel(
       ? options.timeoutMs
       : DEFAULT_TIMEOUT_MS;
   const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const ceiling = Math.max(
+    maxOutputTokens,
+    options.maxOutputTokensCeiling ?? DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
+  );
   const retries = Math.max(0, options.retries ?? DEFAULT_RETRIES);
   const attempts = 1 + retries;
-
-  const body = JSON.stringify({
-    model: call.model,
-    messages: [
-      { role: "system", content: call.system },
-      { role: "user", content: call.user },
-    ],
-    temperature: 0,
-    response_format: { type: "json_object" },
-    max_tokens: maxOutputTokens,
-  });
+  const log = options.log ?? ((line: string) => console.warn(line));
+  let cap = maxOutputTokens;
+  let reasoningEffort = options.reasoningEffort;
 
   let lastMessage = "OpenRouter request failed";
   let lastStatus: number | null = null;
+  let tokensIn = 0;
+  let tokensOut = 0;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let retryable = false;
+    let growCap = false;
+
+    const body = JSON.stringify({
+      model: call.model,
+      messages: [
+        { role: "system", content: call.system },
+        { role: "user", content: call.user },
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" },
+      max_tokens: cap,
+      ...(reasoningEffort === undefined
+        ? {}
+        : { reasoning: { effort: reasoningEffort } }),
+    });
 
     try {
       const response = await fetchFn(ENDPOINT, {
@@ -208,7 +371,7 @@ export async function callModel(
         )}`;
 
         if (!isRetryableStatus(response.status)) {
-          throw new BugbotModelError(message);
+          throw new BugbotModelError(message, { tokensIn, tokensOut });
         }
 
         lastMessage = message;
@@ -226,14 +389,35 @@ export async function callModel(
         }
 
         if (payload !== undefined) {
-          const content = messageContent(payload);
-          if (content === null) {
-            lastMessage = "OpenRouter returned no message content";
+          const details = completionDetails(payload, apiKey);
+          // A failed attempt still costs tokens. Keep them for the summary.
+          tokensIn += details.promptTokens;
+          tokensOut += details.completionTokens;
+
+          if (details.content === null) {
+            log(diagnosticLine(details, cap));
+            lastMessage = emptyContentCause(details, cap);
             lastStatus = response.status;
             retryable = true;
+            growCap =
+              details.finishReason === "length" &&
+              details.errorCode === null &&
+              details.errorMessage === null;
+
+            // A reasoning model can spend the whole cap on hidden reasoning.
+            // Bound it on the retry so the bigger cap can reach an answer.
+            if (
+              growCap &&
+              reasoningEffort === undefined &&
+              (details.reasoningChars > 0 ||
+                details.reasoningDetails > 0 ||
+                details.reasoningTokens > 0)
+            ) {
+              reasoningEffort = "low";
+            }
           } else {
             try {
-              JSON.parse(content);
+              JSON.parse(details.content);
             } catch {
               lastMessage = "model response content was not JSON";
               lastStatus = response.status;
@@ -241,30 +425,14 @@ export async function callModel(
             }
 
             if (!retryable) {
-              const usage =
-                typeof payload === "object" && payload !== null
-                  ? (payload as { usage?: unknown }).usage
-                  : undefined;
-              const model =
-                typeof payload === "object" &&
-                payload !== null &&
-                typeof (payload as { model?: unknown }).model === "string"
-                  ? ((payload as { model: string }).model)
-                  : call.model;
+              const record = recordOf(payload);
+              const model = stringField(record?.model) ?? call.model;
 
               return {
-                raw: content,
+                raw: details.content,
                 model,
-                tokensIn:
-                  typeof usage === "object" && usage !== null
-                    ? numberOrZero((usage as { prompt_tokens?: unknown }).prompt_tokens)
-                    : 0,
-                tokensOut:
-                  typeof usage === "object" && usage !== null
-                    ? numberOrZero(
-                        (usage as { completion_tokens?: unknown }).completion_tokens,
-                      )
-                    : 0,
+                tokensIn,
+                tokensOut,
               };
             }
           }
@@ -292,6 +460,10 @@ export async function callModel(
       break;
     }
 
+    if (growCap) {
+      cap = Math.min(cap * 2, ceiling);
+    }
+
     const backoff = 500 * 2 ** attempt + Math.floor(Math.random() * 250);
     await sleep(backoff);
   }
@@ -301,6 +473,7 @@ export async function callModel(
     `${lastMessage}${statusSuffix} after ${attempts} attempt${
       attempts === 1 ? "" : "s"
     }`,
+    { tokensIn, tokensOut },
   );
 }
 

@@ -37,3 +37,24 @@ describe("lineTextFor wiring", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("max_output_tokens wiring", () => {
+  const root = fileURLToPath(new URL("../", import.meta.url));
+
+  it("declares the input and forwards it as BUGBOT_MAX_OUTPUT_TOKENS", () => {
+    const action = readFileSync(join(root, "action.yml"), "utf8");
+    expect(action).toContain("max_output_tokens:");
+    expect(action).toContain(
+      "BUGBOT_MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}",
+    );
+
+    const workflow = readFileSync(
+      join(root, ".github/workflows/review.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/^      max_output_tokens:/gm)).toHaveLength(2);
+    expect(workflow).toContain(
+      "max_output_tokens: ${{ inputs.max_output_tokens }}",
+    );
+  });
+});
