@@ -105,8 +105,10 @@ completed check on the same SHA: right after `review` of a commit that was
 reviewed before, `status` reports `running` for the new pass instead of `done`
 for the previous one.
 
-Fork PRs are never dispatched, because `review` refuses them. `status` on a
-fork PR can say `3` until the neutral skipped `bugbot` check is posted.
+Fork PRs are never dispatched, because `review` refuses them. On the
+`pull_request` path a fork PR, and a draft that lacks the draft label, are
+skipped before the CLI runs, so no `bugbot` check is ever posted: `status` says
+`3` and stays `3`. That is expected, not a missing caller.
 
 Exit codes:
 

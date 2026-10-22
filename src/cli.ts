@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { appendFileSync } from "node:fs";
 import { readFile as readTextFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   compareCommitStatus,
   fetchCompareDiff,
@@ -1715,7 +1715,44 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 }
 
+/**
+ * True when this module is the script Node was asked to run. Comparing real
+ * paths makes a symlink chain to dist/cli.js match: `npm link`, `npm i -g` and
+ * `npx` all run the CLI through one or more links, and a plain URL comparison
+ * misses them, so the process would print nothing and exit 0.
+ */
+async function isEntryPoint(invokedPath: string | undefined): Promise<boolean> {
+  if (invokedPath === undefined) {
+    return false;
+  }
+  try {
+    const [invokedReal, selfReal] = await Promise.all([
+      realpath(invokedPath),
+      realpath(fileURLToPath(import.meta.url)),
+    ]);
+    return invokedReal === selfReal;
+  } catch {
+    // A path that cannot be resolved still gets the plain comparison; if that
+    // also misses, the bin guard below reports it instead of exiting 0.
+    return pathToFileURL(invokedPath).href === import.meta.url;
+  }
+}
+
 const invokedPath = process.argv[1];
-if (invokedPath !== undefined && pathToFileURL(invokedPath).href === import.meta.url) {
+
+if (await isEntryPoint(invokedPath)) {
   process.exitCode = await main(process.argv.slice(2));
+} else if (
+  invokedPath !== undefined &&
+  (basename(invokedPath) === "bugbot" ||
+    basename(invokedPath) === basename(fileURLToPath(import.meta.url)))
+) {
+  // Defence in depth: if a loader or an exotic link defeats the real-path
+  // check, a bin invocation must not look like a successful no-op. Ordinary
+  // imports (tests, libraries) have a different argv[1] and never get here.
+  console.error(
+    "bugbot: loaded as the bin but the entry point was not detected; " +
+      "refusing to exit 0 without running a command",
+  );
+  process.exitCode = 1;
 }

@@ -26,6 +26,11 @@ After you push a pull request and want it reviewed.
    with `--repo <owner>/<repo>`. Fork pull requests are refused: Bugbot
    skips forks. The caller workflow must be on the PR's head branch.
 
+   A hand-started run's Actions job is not on the PR's check list, and
+   Bugbot's own `bugbot` check appears about 15 seconds after the dispatch.
+   Wait with `bugbot status` until it exits 0 before trusting any other PR
+   watcher.
+
 2. Poll until the review is done:
 
    ```sh
