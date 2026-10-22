@@ -45,7 +45,10 @@ export interface ModelOptions {
   fetch?: FetchLike;
   /** Injectable sleep, so tests do not wait for backoff. */
   sleep?: Sleep;
-  /** Per-attempt timeout. Default 120 seconds. */
+  /**
+   * Per-attempt timeout for the first cap. Default 120 seconds. A retry with
+   * a bigger output cap gets proportionally more time, up to 300 seconds.
+   */
   timeoutMs?: number;
   /** One-line diagnostic sink for an empty completion. Default console.warn. */
   log?: (line: string) => void;
@@ -93,14 +96,35 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
 const DEFAULT_MAX_OUTPUT_TOKENS_CEILING = 32_000;
 const DEFAULT_RETRIES = 2;
 const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_ATTEMPT_TIMEOUT_MS = 300_000;
 
 const defaultSleep: Sleep = (milliseconds) =>
   new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 
+/** Provider usage is untrusted: only non-negative safe integers survive. */
 function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.min(Math.floor(value), Number.MAX_SAFE_INTEGER)
+    : 0;
+}
+
+/**
+ * A bigger `max_tokens` gives the model more to write, so a retried attempt
+ * gets more time: the first attempt keeps `timeoutMs`, each bigger cap scales
+ * it, and one hung request is still bounded by `MAX_ATTEMPT_TIMEOUT_MS`.
+ */
+export function scaledAttemptTimeout(
+  timeoutMs: number,
+  cap: number,
+  baseCap: number,
+): number {
+  const base = baseCap > 0 ? baseCap : 1;
+  return Math.min(
+    MAX_ATTEMPT_TIMEOUT_MS,
+    Math.max(timeoutMs, Math.round((timeoutMs * cap) / base)),
+  );
 }
 
 /** Removes the key from any provider-controlled text, then caps the length. */
@@ -275,7 +299,7 @@ function emptyContentCause(details: CompletionDetails, cap: number): string {
       details.reasoningTokens > 0;
     return `the model used its whole ${cap}-token output budget${
       reasoningSpent ? " on reasoning" : ""
-    } and returned no answer (finish_reason "length")`;
+    } and returned no answer (finish_reason "length"); try a model that reasons less or raise \`max_output_tokens\``;
   }
 
   if (details.finishReason === "content_filter") {
@@ -315,6 +339,7 @@ export async function callModel(
       ? options.timeoutMs
       : DEFAULT_TIMEOUT_MS;
   const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const baseCap = maxOutputTokens > 0 ? maxOutputTokens : DEFAULT_MAX_OUTPUT_TOKENS;
   const ceiling = Math.max(
     maxOutputTokens,
     options.maxOutputTokensCeiling ?? DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
@@ -326,13 +351,16 @@ export async function callModel(
   let reasoningEffort = options.reasoningEffort;
 
   let lastMessage = "OpenRouter request failed";
+  /** The last empty-reply cause, kept when a later attempt times out. */
+  let lastDiagnosis: string | null = null;
   let lastStatus: number | null = null;
   let tokensIn = 0;
   let tokensOut = 0;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const attemptTimeoutMs = scaledAttemptTimeout(timeoutMs, cap, baseCap);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
     let retryable = false;
     let growCap = false;
 
@@ -396,7 +424,8 @@ export async function callModel(
 
           if (details.content === null) {
             log(diagnosticLine(details, cap));
-            lastMessage = emptyContentCause(details, cap);
+            lastDiagnosis = emptyContentCause(details, cap);
+            lastMessage = lastDiagnosis;
             lastStatus = response.status;
             retryable = true;
             growCap =
@@ -444,7 +473,10 @@ export async function callModel(
       }
 
       if (isAbort(error) || controller.signal.aborted) {
-        lastMessage = `OpenRouter request timed out after ${timeoutMs} ms`;
+        lastMessage = `OpenRouter request timed out after ${attemptTimeoutMs} ms`;
+        if (lastDiagnosis !== null) {
+          lastMessage += `; earlier attempt: ${lastDiagnosis}`;
+        }
         lastStatus = null;
       } else {
         const reason = error instanceof Error ? error.message : String(error);

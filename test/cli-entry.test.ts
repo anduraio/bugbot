@@ -84,8 +84,25 @@ describe("CLI entry point detection", () => {
   it("rejects an unknown command through a symlink chain", () => {
     const result = run(link3, ["definitely-not-a-command"]);
 
-    expect(result.status).toBe(2);
+    // 1, not 2: 2 is only `status` reporting a queued or in-progress run.
+    expect(result.status).toBe(1);
     expect(result.stderr).toContain("usage: bugbot review");
+  });
+
+  it("fails loudly when node runs the extensionless main entry", () => {
+    // Node resolves `dist/cli` to dist/cli.js and runs the module, but
+    // realpath of the extensionless path fails; the bin guard must not let
+    // that become a silent exit 0 (F23-RV1-N2).
+    const result = run(process.execPath, [
+      join(repoRoot, "dist", "cli"),
+      "status",
+      "1",
+      "--repo",
+      "-x/y",
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("entry point was not detected");
   });
 
   it("does not run main when the module is imported", () => {

@@ -397,6 +397,8 @@ interface World {
   modelEmptyLengths: number;
   recheckContent: string;
   recheckStatus: number;
+  /** A re-check reply whose 200 content is not JSON (three failed attempts). */
+  recheckInvalidJson: boolean;
   /** First comment ids whose reply POST answers 500. */
   replyFailures: number[];
   startCheckHangs: boolean;
@@ -458,6 +460,7 @@ function makeWorld(overrides: Partial<World> = {}): World {
     modelEmptyLengths: 0,
     recheckContent: JSON.stringify({ results: [] }),
     recheckStatus: 200,
+    recheckInvalidJson: false,
     replyFailures: [],
     startCheckHangs: false,
     startCheckStatus: 200,
@@ -559,6 +562,9 @@ function recordedFetch(world: World): {
     if (url.host === "openrouter.ai") {
       const messages = (body as { messages: Array<{ content: string }> }).messages;
       if (messages[0]!.content.includes("re-check")) {
+        if (world.recheckInvalidJson) {
+          return completion("this is not json");
+        }
         if (world.recheckStatus !== 200) {
           return json({ error: { message: "recheck upstream failed" } }, world.recheckStatus);
         }
@@ -995,6 +1001,70 @@ describe("runPrReview pass 1", () => {
     expect(requests).toHaveLength(1);
     expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(1_234);
   });
+
+  it("keeps a successful call's usage when the reply fails to parse (F23-RV1-B1)", async () => {
+    const world = makeWorld({ reviewContent: JSON.stringify({ nope: 1 }) });
+    const { result, logs } = await runReview(world);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.conclusion).toBe("neutral");
+    expect(result.error).toContain(
+      'model response must be {"findings":[...]} or a JSON array',
+    );
+    expect(logs.some((line) => line.includes("Tokens: 0 in / 0 out"))).toBe(
+      false,
+    );
+    expect(summaryBody(world)).toContain("- Tokens: 123 in / 45 out");
+  });
+});
+
+describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4)", () => {
+  const invalid = [
+    "abc",
+    "0",
+    "-5",
+    "8000.5",
+    "999",
+    "64001",
+    "99999999999999999999",
+    "8e3",
+  ];
+
+  for (const value of invalid) {
+    it(`rejects ${JSON.stringify(value)} before any request`, async () => {
+      const world = makeWorld();
+      const { result, calls, logs } = await runReview(world, {
+        BUGBOT_MAX_OUTPUT_TOKENS: value,
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, conclusion: "none" });
+      expect(result.error).toContain(
+        "BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 64000",
+      );
+      // No GitHub request and no model call: the pass fails before both.
+      expect(calls).toHaveLength(0);
+      expect(
+        logs.some((line) =>
+          line.includes("BUGBOT_MAX_OUTPUT_TOKENS must be a whole number"),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  for (const value of ["1000", "64000"]) {
+    it(`accepts the boundary value ${value}`, async () => {
+      const world = makeWorld();
+      const { calls } = await runReview(world, {
+        BUGBOT_MAX_OUTPUT_TOKENS: value,
+      });
+
+      const requests = mainModelCalls(calls);
+      expect(requests).toHaveLength(1);
+      expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(
+        Number(value),
+      );
+    });
+  }
 });
 
 describe("runPrReview post failures (S6B-B1)", () => {
@@ -1795,6 +1865,23 @@ describe("runPrReview re-check and replies", () => {
       (call) => call.method === "PATCH" && call.path === "/repos/o/r/check-runs/77",
     );
     expect((finish[0]!.body as { conclusion: string }).conclusion).toBe("success");
+  });
+
+  it("counts usage from a failed re-check call (F23-RV1-N6)", async () => {
+    const world = await fixedWorld(0.9);
+    world.recheckInvalidJson = true;
+    const { result, calls, logs } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(3);
+    expect(
+      logs.some((line) =>
+        line.includes("re-check failed, leaving threads open"),
+      ),
+    ).toBe(true);
+    expect(replyCalls(calls)).toHaveLength(0);
+    // Main 123/45 plus three failed re-check replies at 123/45 each.
+    expect(summaryBody(world)).toContain("- Tokens: 492 in / 180 out");
   });
 
   it("does not reply at 0.7 confidence", async () => {

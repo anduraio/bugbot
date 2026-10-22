@@ -70,7 +70,9 @@ All three accept the same pull request argument:
 - a bare number with `--repo <owner>/<repo>`, or a bare number in a checkout
   (the repo is resolved with `gh repo view --json nameWithOwner`)
 
-Anything else is rejected before `gh` runs.
+Anything else is rejected before `gh` runs. An unknown command or any other
+usage error exits `1`; `2` is reserved for `status` reporting that a run is
+still queued or in progress, so a typo can never look like "keep polling".
 
 ### `bugbot review <pr>`
 
@@ -185,9 +187,12 @@ choose.
   or a context that is over budget after truncation. Without it, those
   reviews are skipped with a reason instead of sent past the budget.
 - `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
-  (default 8000). A `length` stop with empty content retries with twice the
-  cap, up to 32000, and bounds reasoning to `low` when the stop spent tokens
-  on reasoning.
+  (default 8000). A set value must be a whole number from 1000 to 64000;
+  anything else ends the pass with a clear message before any model request.
+  A `length` stop with empty content retries with twice the cap, up to 32000,
+  and bounds reasoning to `low` when the stop spent tokens on reasoning. Each
+  attempt's timeout (120 s by default) grows with the cap it sends, bounded at
+  300 s, so the biggest retry has time to finish.
 
 ## Workflow inputs
 

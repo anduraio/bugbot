@@ -284,6 +284,8 @@ status exit codes:
   3  nothing has run for this head SHA
   1  usage or gh error
 
+Any other command or usage error exits 1; 2 is only status "running".
+
 Review is comment-only: it never approves, blocks or merges.`;
 
 interface ReviewOptions {

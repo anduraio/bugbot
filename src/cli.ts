@@ -55,6 +55,7 @@ import {
   parseJsonResponse,
   type DroppedFindings,
   type FetchLike,
+  type ModelResult,
   type Sleep,
 } from "./model.js";
 import {
@@ -426,7 +427,13 @@ export async function runLocalReview(
     overBudget: false,
   };
 
+  let tokensIn = 0;
+  let tokensOut = 0;
+
   try {
+    const maxOutputTokens = maxOutputTokensFromEnv(
+      readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+    );
     const readDiff =
       deps.readDiff ?? ((path: string) => readTextFile(path, "utf8"));
     const diff = await readDiff(options.diffPath);
@@ -498,11 +505,6 @@ export async function runLocalReview(
       throw new BugbotModelError("OPENROUTER_API_KEY is not set");
     }
 
-    const maxOutputTokens = parsePositiveEnv(
-      readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
-      DEFAULT_MAX_OUTPUT_TOKENS,
-    );
-
     const result = await callModel(
       { model: selection.model, system: prompt.system, user: prompt.user },
       {
@@ -512,6 +514,8 @@ export async function runLocalReview(
         log: (line) => log(line),
       },
     );
+    tokensIn = result.tokensIn;
+    tokensOut = result.tokensOut;
     const parsed = parseJsonResponse(result.raw);
 
     log(
@@ -519,8 +523,8 @@ export async function runLocalReview(
         {
           findings: findingsForPrint(parsed.findings),
           dropped: parsed.dropped.count,
-          tokens_in: result.tokensIn,
-          tokens_out: result.tokensOut,
+          tokens_in: tokensIn,
+          tokens_out: tokensOut,
         },
         null,
         2,
@@ -577,8 +581,8 @@ export async function runLocalReview(
       planned: classified.post,
       summary: classified.summary,
       existing,
-      tokensIn: result.tokensIn,
-      tokensOut: result.tokensOut,
+      tokensIn,
+      tokensOut,
       estimatedTokens: prompt.estimatedTokens,
       skipped: context.skipped,
       truncated: context.truncated,
@@ -586,10 +590,18 @@ export async function runLocalReview(
     };
   } catch (error) {
     log(`Bugbot couldn't review: ${errorMessage(error)}`);
+    // A successful call whose reply failed to parse has real usage and its
+    // parse error carries none, so only fall back to the error's numbers when
+    // no successful reply was counted.
+    const modelError = error instanceof BugbotModelError ? error : null;
     return {
       ...empty,
-      tokensIn: error instanceof BugbotModelError ? error.tokensIn : 0,
-      tokensOut: error instanceof BugbotModelError ? error.tokensOut : 0,
+      tokensIn:
+        tokensIn === 0 && tokensOut === 0 ? (modelError?.tokensIn ?? 0) : tokensIn,
+      tokensOut:
+        tokensIn === 0 && tokensOut === 0
+          ? (modelError?.tokensOut ?? 0)
+          : tokensOut,
     };
   }
 }
@@ -641,6 +653,33 @@ function capReason(text: string, secrets: readonly string[]): string {
 
 function parsePositiveEnv(raw: string, fallback: number): number {
   return /^[1-9][0-9]*$/.test(raw) ? Number.parseInt(raw, 10) : fallback;
+}
+
+const MIN_MAX_OUTPUT_TOKENS = 1_000;
+const MAX_MAX_OUTPUT_TOKENS = 64_000;
+
+/**
+ * `max_output_tokens` becomes a real provider parameter, so a value that is
+ * set is validated instead of silently replaced. The range keeps the retry
+ * ladder usable and the request inside a sane limit; empty means the default.
+ */
+function maxOutputTokensFromEnv(raw: string): number {
+  if (raw === "") {
+    return DEFAULT_MAX_OUTPUT_TOKENS;
+  }
+
+  const value = /^[0-9]+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MIN_MAX_OUTPUT_TOKENS ||
+    value > MAX_MAX_OUTPUT_TOKENS
+  ) {
+    throw new Error(
+      `BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from ${MIN_MAX_OUTPUT_TOKENS} to ${MAX_MAX_OUTPUT_TOKENS} (got ${JSON.stringify(raw.slice(0, 40))})`,
+    );
+  }
+
+  return value;
 }
 
 /** Digits-only run ids, deduplicated, oldest first. */
@@ -859,10 +898,17 @@ export async function runPrReview(
     readEnv("BUGBOT_MAX_TOKENS").trim(),
     DEFAULT_MAX_TOKENS,
   );
-  const maxOutputTokens = parsePositiveEnv(
-    readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
-    DEFAULT_MAX_OUTPUT_TOKENS,
-  );
+  let maxOutputTokens: number;
+  try {
+    maxOutputTokens = maxOutputTokensFromEnv(
+      readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+    );
+  } catch (error) {
+    // A bad model parameter fails before any GitHub or model request.
+    const line = reasonOf(error);
+    log(`Bugbot couldn't review: ${line}`);
+    return { exitCode: 0, conclusion: "none", error: line };
+  }
   // Read raw: minConfidenceFromEnv rejects whitespace instead of trimming it.
   const rawMinConfidence =
     deps.env === undefined
@@ -1431,17 +1477,29 @@ export async function runPrReview(
           const known = new Set(selected.map((thread) => thread.threadId));
 
           if (selected.length > 0) {
-            const recheck = await callModel(
-              { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
-              {
-                apiKey,
-                fetch: deps.fetch,
-                sleep: deps.sleep,
-                timeoutMs: deps.modelTimeoutMs,
-                maxOutputTokens: 2_000,
-                log: (line) => log(line),
-              },
-            );
+            let recheck: ModelResult;
+            try {
+              recheck = await callModel(
+                { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
+                {
+                  apiKey,
+                  fetch: deps.fetch,
+                  sleep: deps.sleep,
+                  timeoutMs: deps.modelTimeoutMs,
+                  maxOutputTokens: 2_000,
+                  log: (line) => log(line),
+                },
+              );
+            } catch (caught) {
+              // A failed re-check still cost tokens (F23-RV1-N6). callModel
+              // attaches the usage to its error; a parse failure carries none,
+              // so this cannot double-count the success path below.
+              if (caught instanceof BugbotModelError) {
+                tokensIn += caught.tokensIn;
+                tokensOut += caught.tokensOut;
+              }
+              throw caught;
+            }
             tokensIn += recheck.tokensIn;
             tokensOut += recheck.tokensOut;
 
@@ -1473,7 +1531,15 @@ export async function runPrReview(
       }
     } catch (caught) {
       error = reasonOf(caught);
-      if (caught instanceof BugbotModelError) {
+      // The main call can succeed and then fail in parseJsonResponse, whose
+      // error carries no usage: keep the real counts instead of zeroing them
+      // (F23-RV1-B1). Only a failure before any successful reply falls back to
+      // the usage callModel attached to its error.
+      if (
+        caught instanceof BugbotModelError &&
+        tokensIn === 0 &&
+        tokensOut === 0
+      ) {
         tokensIn = caught.tokensIn;
         tokensOut = caught.tokensOut;
       }
@@ -1737,7 +1803,7 @@ export async function main(argv: readonly string[]): Promise<number> {
           "bugbot status <pr-url|number> | " +
           "bugbot install-skill --harness <name>",
       );
-      return 2;
+      return 1;
   }
 }
 
@@ -1765,17 +1831,25 @@ async function isEntryPoint(invokedPath: string | undefined): Promise<boolean> {
 }
 
 const invokedPath = process.argv[1];
+const selfPath = fileURLToPath(import.meta.url);
+
+/** `cli.js`, `cli` and `bugbot` all name a bin-like entry point. */
+function binLikeName(path: string): string {
+  return basename(path).replace(/\.[cm]?js$/i, "");
+}
 
 if (await isEntryPoint(invokedPath)) {
   process.exitCode = await main(process.argv.slice(2));
 } else if (
   invokedPath !== undefined &&
-  (basename(invokedPath) === "bugbot" ||
-    basename(invokedPath) === basename(fileURLToPath(import.meta.url)))
+  (binLikeName(invokedPath) === "bugbot" ||
+    binLikeName(invokedPath) === binLikeName(selfPath))
 ) {
   // Defence in depth: if a loader or an exotic link defeats the real-path
   // check, a bin invocation must not look like a successful no-op. Ordinary
   // imports (tests, libraries) have a different argv[1] and never get here.
+  // The extension is stripped on both sides: `node dist/cli` runs the same
+  // module, but realpath of the extensionless path fails (F23-RV1-N2).
   console.error(
     "bugbot: loaded as the bin but the entry point was not detected; " +
       "refusing to exit 0 without running a command",

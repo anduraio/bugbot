@@ -3,6 +3,7 @@ import {
   BugbotModelError,
   callModel,
   parseJsonResponse,
+  scaledAttemptTimeout,
   type FetchLike,
 } from "../src/model.js";
 
@@ -238,8 +239,7 @@ describe("callModel", () => {
     expect(calls).toBe(3);
   });
 
-  it("retries a timeout", async () => {
-    let calls = 0;
+  it("retries a timeout", async () => {    let calls = 0;
     const fakeFetch: FetchLike = async () => {
       calls += 1;
       if (calls === 1) {
@@ -293,6 +293,204 @@ describe("callModel", () => {
 
     expect(calls).toBe(3);
     expect(aborts).toBe(3);
+  });
+
+  it("scales the attempt timeout with the cap and bounds it at 300 s (F23-RV1-N3)", () => {
+    expect(scaledAttemptTimeout(120_000, 8_000, 8_000)).toBe(120_000);
+    expect(scaledAttemptTimeout(120_000, 16_000, 8_000)).toBe(240_000);
+    expect(scaledAttemptTimeout(120_000, 32_000, 8_000)).toBe(300_000);
+    expect(scaledAttemptTimeout(10, 2_000, 2_000)).toBe(10);
+  });
+
+  it("gives the 32000 rung more time and keeps the earlier length diagnosis", async () => {
+    const bodies: Array<{ max_tokens: number }> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as { max_tokens: number });
+      if (bodies.length <= 2) {
+        return emptyStop({
+          reasoning: "hidden reasoning",
+          tokensIn: 900,
+          tokensOut: 8_000,
+        });
+      }
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    };
+
+    let caught: unknown;
+    try {
+      await callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        sleep: async () => undefined,
+        maxOutputTokens: 8_000,
+        timeoutMs: 10,
+        log: () => undefined,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    const message = caught instanceof Error ? caught.message : String(caught);
+    expect(bodies.map((body) => body.max_tokens)).toEqual([
+      8_000, 16_000, 32_000,
+    ]);
+    // 10 ms at 8000 becomes 40 ms at 32000.
+    expect(message).toContain("timed out after 40 ms");
+    expect(message).toContain(
+      "whole 16000-token output budget on reasoning",
+    );
+    expect(caught).toMatchObject({ tokensIn: 1_800, tokensOut: 16_000 });
+  });
+
+  it("clamps provider usage to non-negative safe integers (F23-RV1-N7)", async () => {
+    const response = new Response(
+      JSON.stringify({
+        choices: [
+          {
+            index: 0,
+            finish_reason: "length",
+            message: { role: "assistant", content: "" },
+          },
+        ],
+        usage: { prompt_tokens: -5, completion_tokens: 1e300 },
+      }),
+      { status: 200 },
+    );
+
+    let caught: unknown;
+    try {
+      await callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: async () => response,
+        retries: 0,
+        log: () => undefined,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      tokensIn: 0,
+      tokensOut: Number.MAX_SAFE_INTEGER,
+    });
+  });
+
+  it("redacts and caps the provider error message in the log and the error (M8)", async () => {
+    const key = "sk-test-provider-secret";
+    const logs: string[] = [];
+    const response = new Response(
+      JSON.stringify({
+        error: { code: 502, message: `bad key ${key} ${"x".repeat(5_000)}` },
+        choices: [{ index: 0, message: { role: "assistant", content: "" } }],
+        usage: { prompt_tokens: 1, completion_tokens: 0 },
+      }),
+      { status: 200 },
+    );
+
+    let message = "";
+    try {
+      await callModel(CALL, {
+        apiKey: key,
+        fetch: async () => response,
+        retries: 0,
+        log: (line) => logs.push(line),
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).not.toContain(key);
+    expect(message).toContain("bad key [redacted]");
+    expect(message.length).toBeLessThan(500);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).not.toContain(key);
+    expect(logs[0]).toContain("error_message=bad key [redacted]");
+    expect((logs[0] ?? "").length).toBeLessThan(500);
+  });
+
+  it("does not grow the cap after a provider error inside a 200 body (M3)", async () => {
+    const caps: number[] = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      caps.push(
+        (JSON.parse(String(init?.body)) as { max_tokens: number }).max_tokens,
+      );
+      if (caps.length === 1) {
+        return new Response(
+          JSON.stringify({
+            error: { code: 502, message: "upstream" },
+            choices: [
+              {
+                index: 0,
+                finish_reason: "length",
+                message: { role: "assistant", content: "" },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return ok('{"findings":[]}');
+    };
+
+    await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: fakeFetch,
+      retries: 1,
+      maxOutputTokens: 8_000,
+      sleep: async () => undefined,
+      log: () => undefined,
+    });
+
+    expect(caps).toEqual([8_000, 8_000]);
+  });
+
+  it("sends no reasoning field when no reasoning was seen (M4)", async () => {
+    const bodies: Array<{ max_tokens: number; reasoning?: unknown }> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(
+        JSON.parse(String(init?.body)) as {
+          max_tokens: number;
+          reasoning?: unknown;
+        },
+      );
+      return bodies.length === 1 ? emptyStop() : ok('{"findings":[]}');
+    };
+
+    await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: fakeFetch,
+      maxOutputTokens: 8_000,
+      sleep: async () => undefined,
+      log: () => undefined,
+    });
+
+    expect(bodies.map((body) => body.max_tokens)).toEqual([8_000, 16_000]);
+    expect(bodies[1]?.reasoning).toBeUndefined();
+  });
+
+  it("never grows the cap past the ceiling (M6)", async () => {
+    const caps: number[] = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      caps.push(
+        (JSON.parse(String(init?.body)) as { max_tokens: number }).max_tokens,
+      );
+      return emptyStop();
+    };
+
+    await expect(
+      callModel(CALL, {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        maxOutputTokens: 8_000,
+        maxOutputTokensCeiling: 10_000,
+        sleep: async () => undefined,
+        log: () => undefined,
+      }),
+    ).rejects.toBeInstanceOf(BugbotModelError);
+
+    expect(caps).toEqual([8_000, 10_000, 10_000]);
   });
 
   it("never puts the key in an error message or a logged line", async () => {
@@ -422,6 +620,7 @@ describe("callModel", () => {
     ]);
     expect(message).toContain("whole 32000-token output budget on reasoning");
     expect(message).toContain('finish_reason "length"');
+    expect(message).toContain("raise `max_output_tokens`");
     expect(message).toContain("after 3 attempts");
     expect(caught).toBeInstanceOf(BugbotModelError);
     expect(caught).toMatchObject({ tokensIn: 2_700, tokensOut: 24_000 });

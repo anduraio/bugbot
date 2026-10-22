@@ -303,6 +303,70 @@ describe("runLocalReview", () => {
     );
   });
 
+  it("keeps a successful call's usage when the reply fails to parse (F23-RV1-B1)", async () => {
+    const result = await runLocalReview(
+      {
+        diffPath: join(fixtureDir, "change.diff"),
+        repoDir: fixtureDir,
+      },
+      {
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    role: "assistant",
+                    content: JSON.stringify({ nope: 1 }),
+                  },
+                },
+              ],
+              usage: { prompt_tokens: 123, completion_tokens: 45 },
+            }),
+            { status: 200 },
+          ),
+        env: envWith({ OPENROUTER_API_KEY: "test-key" }),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.findings).toHaveLength(0);
+    // The parse error carries no usage; the successful call's usage stays.
+    expect(result.tokensIn).toBe(123);
+    expect(result.tokensOut).toBe(45);
+  });
+
+  it("rejects an out-of-range max_output_tokens before any model call (F23-RV1-N4)", async () => {
+    let calls = 0;
+    const lines: string[] = [];
+
+    const result = await runLocalReview(
+      {
+        diffPath: join(fixtureDir, "change.diff"),
+        repoDir: fixtureDir,
+      },
+      {
+        fetch: async () => {
+          calls += 1;
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({
+          OPENROUTER_API_KEY: "test-key",
+          BUGBOT_MAX_OUTPUT_TOKENS: "0",
+        }),
+        log: (line) => lines.push(line),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(calls).toBe(0);
+    expect(result.tokensIn).toBe(0);
+    expect(lines.join("\n")).toContain(
+      "Bugbot couldn't review: BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 64000",
+    );
+  });
+
   it("refuses paths that try to leave the repo dir", async () => {
     const root = await mkdtemp(join(tmpdir(), "bugbot-local-"));
     const lines: string[] = [];
