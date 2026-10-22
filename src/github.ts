@@ -70,7 +70,7 @@ const REVIEW_THREADS_QUERY = `query BugbotReviewThreads($owner: String!, $name: 
           diffSide
           comments(first: 100) {
             pageInfo { hasNextPage }
-            nodes { databaseId author { login __typename } body }
+            nodes { databaseId author { login __typename } body diffHunk }
           }
         }
       }
@@ -729,6 +729,11 @@ export interface BugbotThread {
   state: "open" | "resolved" | "skipped";
   /** True when a bot reply already starts "Fixed in " (S6A-N9). */
   hasFixedReply?: boolean;
+  /**
+   * The first comment's original diff hunk, when GitHub returned one. Optional
+   * so older recorded data and responses without the field still work (S8D-B3).
+   */
+  diffHunk?: string | null;
 }
 
 export interface ParsedThreadBody {
@@ -2085,6 +2090,7 @@ function parseThreadNode(value: unknown, botLogin: string): BugbotThread | null 
     reason: parsed.reason,
     state: isResolved ? "resolved" : skipped ? "skipped" : "open",
     hasFixedReply,
+    diffHunk: asString(first.diffHunk),
   };
 }
 

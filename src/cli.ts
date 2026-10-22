@@ -54,6 +54,7 @@ import {
   buildRecheckUser,
   fixedThreadIds,
   parseRecheckResponse,
+  selectRecheckThreads,
 } from "./recheck.js";
 import {
   classifyFindings,
@@ -1286,11 +1287,15 @@ export async function runPrReview(
 
       const reReportedHashes = new Set<string>();
       for (const thread of threads) {
+        // An outdated thread (line null, originalLine set) still counts here:
+        // classifyFindings falls back to originalLine, so a re-report of the
+        // same bug keeps it open. Only a thread with neither line can never be
+        // matched by location and is skipped.
         if (
           thread.state !== "open" ||
           !changedPaths.has(thread.path) ||
           thread.marker.sha === github.headSha ||
-          thread.line === null
+          (thread.line === null && thread.originalLine === null)
         ) {
           continue;
         }
@@ -1332,16 +1337,18 @@ export async function runPrReview(
       }
 
       // Re-check open threads touched by this diff whose marker is from an
-      // older commit. At most 15, oldest first by first comment id. A thread
-      // with no current line is outdated and left for a later pass, and a
-      // thread the main call just re-reported must stay open (S6B-N5).
+      // older commit. At most 15, oldest first by first comment id. Outdated
+      // threads (line null, originalLine set) are included and anchored on
+      // originalLine; a thread with neither line cannot be located and stays
+      // skipped, and a thread the main call just re-reported must stay open
+      // (S6B-N5, S8D-B1).
       const targets = threads
         .filter(
           (thread) =>
             thread.state === "open" &&
             changedPaths.has(thread.path) &&
             thread.marker.sha !== github.headSha &&
-            thread.line !== null &&
+            (thread.line !== null || thread.originalLine !== null) &&
             !reReportedHashes.has(thread.marker.hash),
         )
         // Review thread ids increase with creation time; sorting by the first
@@ -1351,56 +1358,74 @@ export async function runPrReview(
 
       if (targets.length > 0) {
         try {
-          const known = new Set(targets.map((thread) => thread.threadId));
-          const user = buildRecheckUser(
-            targets.map((thread) => {
-              const content = headContents.get(thread.path) ?? null;
-              const deleted = fileStatus.get(thread.path) === "deleted";
-              return {
-                threadId: thread.threadId,
-                path: thread.path,
-                line: thread.line ?? 1,
-                reason: thread.reason,
-                status: deleted
-                  ? ("deleted" as const)
-                  : content === null
-                    ? ("unavailable" as const)
-                    : ("present" as const),
-                content,
-              };
-            }),
-            github.headSha,
-          );
-
-          const recheck = await callModel(
-            { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
-            {
-              apiKey,
-              fetch: deps.fetch,
-              sleep: deps.sleep,
-              timeoutMs: deps.modelTimeoutMs,
-              maxOutputTokens: 2_000,
-            },
-          );
-          tokensIn += recheck.tokensIn;
-          tokensOut += recheck.tokensOut;
-
-          const fixed = fixedThreadIds(
-            parseRecheckResponse(recheck.raw, known),
-          );
-          const fixedThreads = targets.filter((thread) =>
-            fixed.has(thread.threadId),
-          );
-          if (fixedThreads.length > 0) {
-            const resolvedResult = await resolveFixedThreads(
-              github,
-              fixedThreads,
-              github.headSha,
+          const candidates = targets.map((thread) => {
+            const content = headContents.get(thread.path) ?? null;
+            const deleted = fileStatus.get(thread.path) === "deleted";
+            const outdated = thread.line === null;
+            return {
+              threadId: thread.threadId,
+              path: thread.path,
+              // An outdated thread has no current line; its originalLine is
+              // the only anchor left. A small head file is shown whole, a
+              // bigger one gets a window around this line (S8D-B1).
+              line: thread.line ?? thread.originalLine ?? 1,
+              reason: thread.reason,
+              outdated,
+              diffHunk: thread.diffHunk ?? null,
+              status: deleted
+                ? ("deleted" as const)
+                : content === null
+                  ? ("unavailable" as const)
+                  : ("present" as const),
+              content,
+            };
+          });
+          // Oldest first (targets are sorted) within a bounded request; a
+          // thread that does not fit stays open for a later pass
+          // (S8D-RV1-N2).
+          const selected = selectRecheckThreads(candidates, github.headSha);
+          if (selected.length < candidates.length) {
+            log(
+              `Bugbot: re-check budget leaves ${candidates.length - selected.length} thread${
+                candidates.length - selected.length === 1 ? "" : "s"
+              } open`,
             );
-            resolved = resolvedResult.resolved;
-            if (dryRun) {
-              for (const plan of resolvedResult.planned) {
-                log(planLine(plan));
+          }
+
+          const user = buildRecheckUser(selected, github.headSha);
+          const known = new Set(selected.map((thread) => thread.threadId));
+
+          if (selected.length > 0) {
+            const recheck = await callModel(
+              { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
+              {
+                apiKey,
+                fetch: deps.fetch,
+                sleep: deps.sleep,
+                timeoutMs: deps.modelTimeoutMs,
+                maxOutputTokens: 2_000,
+              },
+            );
+            tokensIn += recheck.tokensIn;
+            tokensOut += recheck.tokensOut;
+
+            const fixed = fixedThreadIds(
+              parseRecheckResponse(recheck.raw, known),
+            );
+            const fixedThreads = targets.filter((thread) =>
+              fixed.has(thread.threadId),
+            );
+            if (fixedThreads.length > 0) {
+              const resolvedResult = await resolveFixedThreads(
+                github,
+                fixedThreads,
+                github.headSha,
+              );
+              resolved = resolvedResult.resolved;
+              if (dryRun) {
+                for (const plan of resolvedResult.planned) {
+                  log(planLine(plan));
+                }
               }
             }
           }

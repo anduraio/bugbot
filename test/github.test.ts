@@ -753,6 +753,25 @@ describe("listBugbotThreads", () => {
     );
   });
 
+  it("reads the first comment's diffHunk and treats it as optional", async () => {
+    const hunk = "@@ -7,2 +7,2 @@\n-  return items.slice(start, pageSize);\n+  return items.slice(start, end);";
+    const { fetchFn, calls } = recording(() =>
+      threadsResponse([
+        threadNode([
+          { ...botComment(), diffHunk: hunk },
+          comment("a-human", "reply"),
+        ]),
+        threadNode([botComment()], { id: "PRRT_2", path: "src/b.ts" }),
+      ]),
+    );
+
+    const threads = await listBugbotThreads(options({ fetch: fetchFn }));
+
+    expect(threads[0]?.diffHunk).toBe(hunk);
+    expect(threads[1]?.diffHunk).toBeNull();
+    expect((calls[0]?.body as { query: string }).query).toContain("diffHunk");
+  });
+
   it("tolerates null line and originalLine", async () => {
     const { fetchFn } = recording(() =>
       threadsResponse([

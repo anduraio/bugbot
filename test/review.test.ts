@@ -246,6 +246,98 @@ const LIVE_BASE = LIVE_HEAD.replace(
   "return discounted;",
 );
 
+/**
+ * The live step 8d replay: the first pass commented on old line 7. A later push
+ * fixed the slice bound on the line above, so GitHub calls the thread outdated
+ * (`line` null, `originalLine` 7) while the head still has the fixed code.
+ */
+const PAGINATION_OLD = [
+  "export function page<T>(items: T[], start: number, pageSize: number): T[] {",
+  "  const safeStart = start;",
+  "  if (start < 0) {",
+  "    start = 0;",
+  "  }",
+  "  if (pageSize <= 0) return [];",
+  "  return items.slice(safeStart, pageSize);",
+  "}",
+  "",
+].join("\n");
+
+const PAGINATION_HEAD = [
+  "export function page<T>(items: T[], start: number, pageSize: number): T[] {",
+  "  const safeStart = start;",
+  "  if (start < 0) {",
+  "    start = 0;",
+  "  }",
+  "  if (pageSize <= 0) return [];",
+  "  const end = start + pageSize;",
+  "  return items.slice(safeStart, end);",
+  "}",
+  "",
+].join("\n");
+
+const PAGINATION_DIFF = [
+  "diff --git a/src/pagination.ts b/src/pagination.ts",
+  "--- a/src/pagination.ts",
+  "+++ b/src/pagination.ts",
+  "@@ -1,8 +1,9 @@",
+  " export function page<T>(items: T[], start: number, pageSize: number): T[] {",
+  "   const safeStart = start;",
+  "   if (start < 0) {",
+  "     start = 0;",
+  "   }",
+  "   if (pageSize <= 0) return [];",
+  "-  return items.slice(safeStart, pageSize);",
+  "+  const end = start + pageSize;",
+  "+  return items.slice(safeStart, end);",
+  " }",
+  "",
+].join("\n");
+
+/** A deleted file whose last line carried an outdated thread. */
+const DELETED_DIFF = [
+  "diff --git a/src/legacy.ts b/src/legacy.ts",
+  "deleted file mode 100644",
+  "--- a/src/legacy.ts",
+  "+++ /dev/null",
+  "@@ -1,2 +0,0 @@",
+  "-export const legacy = 1;",
+  "-export const old = 2;",
+  "",
+].join("\n");
+
+/** A one-line change that puts a long head file in the diff. */
+const LONG_DIFF = [
+  "diff --git a/src/long.ts b/src/long.ts",
+  "--- a/src/long.ts",
+  "+++ b/src/long.ts",
+  "@@ -1,1 +1,1 @@",
+  "-const line1 = 0;",
+  "+const line1 = 1;",
+  "",
+].join("\n");
+
+const LONG_HEAD = `${Array.from(
+  { length: 420 },
+  (_, index) => `const line${index + 1} = ${index + 1};`,
+).join("\n")}\n`;
+
+/** A one-line change that puts a very large head file in the diff. */
+const BIG_DIFF = [
+  "diff --git a/src/big.ts b/src/big.ts",
+  "--- a/src/big.ts",
+  "+++ b/src/big.ts",
+  "@@ -1,1 +1,1 @@",
+  "-const line1 = 0;",
+  "+const line1 = 1;",
+  "",
+].join("\n");
+
+const SHORT_HEAD = `${Array.from(
+  { length: 100 },
+  (_, index) => `const line${index + 1} = ${index + 1};`,
+).join("\n")}\n`;
+
 /** The increments of a synchronize pass: only the doc line changed. */
 const SYNC_DIFF = [
   "diff --git a/src/discount.ts b/src/discount.ts",
@@ -1733,19 +1825,389 @@ describe("runPrReview re-check and resolve", () => {
     expect(resolveCalls(calls)).toHaveLength(1);
   });
 
-  it("leaves an outdated thread (line null) out of the re-check (S6B-N5a)", async () => {
-    const world = await fixedWorld(0.9);
-    world.threads = world.threads.map((node) => {
-      const record = node as Record<string, unknown>;
-      return { ...record, line: null, originalLine: 3 };
+  it("re-checks an outdated thread at originalLine and resolves it (S8D-B1)", async () => {
+    const world = makeWorld({
+      diff: PAGINATION_DIFF,
+      files: { "src/pagination.ts": PAGINATION_HEAD },
+      baseFiles: { "src/pagination.ts": PAGINATION_OLD },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: page end**\n\n\`slice\` receives \`start\` and \`pageSize\`; the \`end\` bound is missing.\n\n${marker("d".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_OUTDATED",
+            path: "src/pagination.ts",
+            line: null,
+            originalLine: 7,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_OUTDATED", fixed: true, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result).toMatchObject({ exitCode: 0, conclusion: "success" });
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked).toContain('id="PRRT_OUTDATED"');
+    expect(asked).toContain("const end = start + pageSize;");
+    expect(asked).toContain("outdated");
+    expect(asked).toContain("commit it was posted on");
+    expect(replyCalls(calls)).toHaveLength(1);
+    expect((replyCalls(calls)[0]!.body as { body: string }).body).toBe(
+      `Fixed in ${HEAD.slice(0, 7)}.`,
+    );
+    expect(resolveCalls(calls)).toHaveLength(1);
+  });
+
+  it("keeps an outdated thread open when the re-check says not fixed", async () => {
+    const world = makeWorld({
+      diff: PAGINATION_DIFF,
+      files: { "src/pagination.ts": PAGINATION_HEAD },
+      baseFiles: { "src/pagination.ts": PAGINATION_OLD },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: page end**\n\n\`slice\` receives \`start\` and \`pageSize\`; the \`end\` bound is missing.\n\n${marker("d".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_OUTDATED",
+            path: "src/pagination.ts",
+            line: null,
+            originalLine: 7,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_OUTDATED", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    expect(replyCalls(calls)).toHaveLength(0);
+    expect(resolveCalls(calls)).toHaveLength(0);
+  });
+
+  it("never re-checks an outdated thread the main call re-reported", async () => {
+    const world = makeWorld({
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: cart total**\n\nfindCustomer returns undefined and reading customer.name throws.\n\n${marker("e".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          { line: null, originalLine: 3 },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_1", fixed: true, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(reviewCalls(calls)).toHaveLength(0);
+    expect(recheckModelCalls(calls)).toHaveLength(0);
+    expect(replyCalls(calls)).toHaveLength(0);
+    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Skipped: 1 duplicate");
+  });
+
+  it("re-checks a deleted file's outdated thread with status deleted", async () => {
+    const world = makeWorld({
+      diff: DELETED_DIFF,
+      files: {},
+      baseFiles: {
+        "src/legacy.ts": "export const legacy = 1;\nexport const old = 2;\n",
+      },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: legacy export**\n\nThe export is read after the module is gone.\n\n${marker("f".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_DELETED",
+            path: "src/legacy.ts",
+            line: null,
+            originalLine: 2,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_DELETED", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked).toContain('id="PRRT_DELETED"');
+    expect(asked).toContain("file deleted at head");
+    expect(asked).toContain("outdated");
+  });
+
+  it("skips a thread with neither line nor originalLine", async () => {
+    const world = makeWorld({
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: nowhere**\n\nNo line at all.\n\n${marker("1".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          { line: null, originalLine: null },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_1", fixed: true, confidence: 0.9 }],
+      }),
     });
 
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
     expect(recheckModelCalls(calls)).toHaveLength(0);
-    expect(replyCalls(calls)).toHaveLength(0);
     expect(resolveCalls(calls)).toHaveLength(0);
+  });
+
+  it("gives a long outdated file a window around originalLine, a short one the whole file", async () => {
+    const longWorld = makeWorld({
+      diff: LONG_DIFF,
+      files: { "src/long.ts": LONG_HEAD },
+      baseFiles: { "src/long.ts": "const line1 = 0;\n" },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: long file**\n\nSomething on line 210.\n\n${marker("2".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_LONG",
+            path: "src/long.ts",
+            line: null,
+            originalLine: 210,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_LONG", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const long = await runReview(longWorld, {}, {}, "333");
+    const askedLong = messageContent(recheckModelCalls(long.calls)[0]!, 1);
+    expect(askedLong).toContain("lines 130-290 of 420:");
+    expect(askedLong).not.toContain("lines 1-420 of 420:");
+
+    const shortWorld = makeWorld({
+      diff: LONG_DIFF,
+      files: { "src/long.ts": SHORT_HEAD },
+      baseFiles: { "src/long.ts": "const line1 = 0;\n" },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: short file**\n\nSomething on line 50.\n\n${marker("3".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_SHORT",
+            path: "src/long.ts",
+            line: null,
+            originalLine: 50,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_SHORT", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const short = await runReview(shortWorld, {}, {}, "333");
+    const askedShort = messageContent(recheckModelCalls(short.calls)[0]!, 1);
+    expect(askedShort).toContain("lines 1-100 of 100:");
+    expect(askedShort).toContain("const line1 = 1;");
+    expect(askedShort).toContain("const line100 = 100;");
+  });
+
+  it("anchors a current thread on line, not originalLine, with a 40-line window (M3, M12)", async () => {
+    const world = makeWorld({
+      diff: LONG_DIFF,
+      files: { "src/long.ts": LONG_HEAD },
+      baseFiles: { "src/long.ts": "const line1 = 0;\n" },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `**High bug: shifted line**\n\nSomething on the current line.\n\n${marker("4".repeat(40), "7", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_SHIFTED",
+            path: "src/long.ts",
+            line: 250,
+            originalLine: 7,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_SHIFTED", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked).toContain("<line>250</line>");
+    expect(asked).not.toContain("<outdated>");
+    // A current thread keeps the 40-line window around its current line; it is
+    // not anchored on the old originalLine and not shown the whole file.
+    expect(asked).toContain("lines 210-290 of 420:");
+    expect(asked).not.toContain("lines 1-420 of 420:");
+  });
+
+  it("forwards the first comment's diffHunk into the re-check prompt (M8)", async () => {
+    const hunk = [
+      "@@ -1,3 +1,4 @@",
+      "   if (pageSize <= 0) return [];",
+      "-  return items.slice(safeStart, pageSize);",
+      "+  const end = start + pageSize;",
+      "+  return items.slice(safeStart, end);",
+      " // UNIQUE-HUNK-MARKER",
+    ].join("\n");
+    const world = makeWorld({
+      diff: PAGINATION_DIFF,
+      files: { "src/pagination.ts": PAGINATION_HEAD },
+      baseFiles: { "src/pagination.ts": PAGINATION_OLD },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            {
+              ...botComment(
+                1001,
+                `**High bug: page end**\n\nThe \`end\` bound is missing.\n\n${marker("5".repeat(40), "7", OLD)}`,
+              ),
+              diffHunk: hunk,
+            },
+          ],
+          {
+            id: "PRRT_HUNK",
+            path: "src/pagination.ts",
+            line: null,
+            originalLine: 7,
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_HUNK", fixed: false, confidence: 0.9 }],
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked).toContain("<diff_hunk>");
+    expect(asked).toContain("UNIQUE-HUNK-MARKER");
+  });
+
+  it("bounds the re-check on 15 outdated threads on one large file (S8D-RV1-N2)", async () => {
+    const content = `${Array.from(
+      { length: 400 },
+      (_, index) => `const line${index + 1} = "${"x".repeat(360)}";`,
+    ).join("\n")}\n`;
+    const world = makeWorld({
+      diff: BIG_DIFF,
+      files: { "src/big.ts": content },
+      baseFiles: { "src/big.ts": "const line1 = 0;\n" },
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: Array.from({ length: 15 }, (_, index) =>
+        threadNode(
+          [
+            botComment(
+              1000 + index,
+              `**High bug: old issue ${index}**\n\nold reason ${index} ${"r".repeat(4_000)}\n\n${marker(
+                `${String(index).padStart(2, "0")}${"a".repeat(38)}`,
+                "7",
+                OLD,
+              )}`,
+            ),
+          ],
+          {
+            id: `PRRT_${index}`,
+            path: "src/big.ts",
+            line: null,
+            originalLine: 210,
+          },
+        ),
+      ),
+      recheckContent: JSON.stringify({
+        results: Array.from({ length: 15 }, (_, index) => ({
+          thread: `PRRT_${index}`,
+          fixed: true,
+          confidence: 0.9,
+        })),
+      }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result).toMatchObject({ exitCode: 0, conclusion: "success" });
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked.length).toBeLessThanOrEqual(200_000);
+    // One file block for the path, not one copy per thread.
+    expect(asked.match(/const line1 = "/g) ?? []).toHaveLength(1);
+    const ids = [...asked.matchAll(/<thread id="(PRRT_\d+)"/g)].map(
+      (match) => match[1],
+    );
+    // Oldest first, and the threads that do not fit stay out of this pass.
+    expect(ids.length).toBeGreaterThan(0);
+    expect(ids.length).toBeLessThan(15);
+    expect(ids).toEqual(
+      Array.from({ length: ids.length }, (_, index) => `PRRT_${index}`),
+    );
+    expect(asked).not.toContain(`id="PRRT_${ids.length}"`);
+    // Only the threads in the request resolve; the rest stay open.
+    expect(replyCalls(calls)).toHaveLength(ids.length);
+    expect(resolveCalls(calls)).toHaveLength(ids.length);
   });
 
   it("asks about open threads only and ignores an unknown thread id (M07, M18)", async () => {
