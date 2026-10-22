@@ -23,7 +23,8 @@ After you push a pull request and want it reviewed.
    ```
 
    `<pr>` is a pull request URL, `<owner>/<repo>#<n>`, or a number together
-   with `--repo <owner>/<repo>`.
+   with `--repo <owner>/<repo>`. Fork pull requests are refused: Bugbot
+   skips forks. The caller workflow must be on the PR's head branch.
 
 2. Poll until the review is done:
 
@@ -35,9 +36,12 @@ After you push a pull request and want it reviewed.
      summary counts and the inline comments.
    - Exit 2: the check or the caller workflow run is queued or in progress.
      Wait about a minute, then poll again.
-   - Exit 3: nothing ran for this head commit. Check that the repository has a
-     caller workflow with a `workflow_dispatch` trigger and a `pr` input (see
-     `examples/caller.yml` in the Bugbot package), then start the review again.
+   - Exit 3: nothing ran for this head commit. If this is within a minute or
+     two of `review`, the run may not be visible yet: wait and poll again.
+     Only if it stays 3, check that the repository has a caller workflow with
+     a `workflow_dispatch` trigger and a `pr` input on the PR's head branch
+     (see `examples/caller.yml` in the Bugbot package), then start the review
+     again. Re-dispatching cancels the caller's in-progress run.
    - Exit 1: usage or `gh` error. Fix it before polling again.
 
 3. Triage the comments with the pstack poteto-mode babysit playbook at

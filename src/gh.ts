@@ -52,7 +52,10 @@ export const execFileGh: GhRunner = (args) =>
         if (error !== null) {
           const raw = (error as { code?: unknown }).code;
           const code = typeof raw === "number" ? raw : 1;
-          reject(new GhError(args, stdout, stderr, code));
+          // spawn reports ENOENT with an empty stderr; keep the real cause.
+          const reason =
+            raw === "ENOENT" ? "gh was not found on PATH" : stderr;
+          reject(new GhError(args, stdout, reason, code));
           return;
         }
         resolve({ stdout, stderr });
@@ -98,6 +101,15 @@ const PR_URL_RE =
 const OWNER_REPO_HASH_RE =
   /^([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})#([1-9][0-9]*)$/;
 const NUMBER_RE = /^[1-9][0-9]*$/;
+
+/** Every PR form must produce a safe integer, not a rounded one (N3). */
+function safeNumber(text: string, input: string): number {
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    throw invalidPull(input);
+  }
+  return value;
+}
 
 function validOwner(owner: string): boolean {
   return OWNER_RE.test(owner) && !owner.includes("..");
@@ -147,7 +159,7 @@ export function parsePullSpec(
     if (repoOption !== undefined && repoOption !== null) {
       throw new Error("--repo is only for a bare pull request number");
     }
-    return { owner, repo, number: Number(number) };
+    return { owner, repo, number: safeNumber(number, input) };
   }
 
   const shorthand = OWNER_REPO_HASH_RE.exec(input);
@@ -165,7 +177,7 @@ export function parsePullSpec(
     if (repoOption !== undefined && repoOption !== null) {
       throw new Error("--repo is only for a bare pull request number");
     }
-    return { owner, repo, number: Number(number) };
+    return { owner, repo, number: safeNumber(number, input) };
   }
 
   if (NUMBER_RE.test(input)) {
@@ -235,14 +247,16 @@ export const REVIEW_HELP = `usage: bugbot review <pr> [--repo <owner>/<repo>] [-
        bugbot review --local --diff <file> [options]
 
 With a pull request, starts the repository's Bugbot caller workflow:
-  gh workflow run bugbot.yml -R <owner>/<repo> -f pr=<n>
+  gh workflow run bugbot.yml -R <owner>/<repo> --ref <head-branch> -f pr=<n>
 The caller needs a workflow_dispatch trigger with a pr input (see
-examples/caller.yml). The workflow file defaults to bugbot.yml.
+examples/caller.yml), and it must exist on the PR's head branch. Fork pull
+requests are refused: Bugbot skips forks. The workflow file defaults to
+bugbot.yml.
 
   <pr>  https://github.com/<owner>/<repo>/pull/<n>, <owner>/<repo>#<n>,
         or a number with --repo <owner>/<repo>.
 
-Exit codes: 0 review requested, 1 usage or gh error.
+Exit codes: 0 review requested, 1 usage, gh error or a fork PR.
 
 --local reviews a diff file on this machine and posts nothing. Its options
 are documented in the README.`;
@@ -251,6 +265,7 @@ export const MAIN_HELP = `usage: bugbot <command> [options]
 
 Commands:
   review <pr>          Start a review on GitHub through the caller workflow.
+                       (Same-repo PRs only; fork PRs are refused.)
   review --local       Review a local diff file; nothing is posted.
   status <pr>          Show the Bugbot check and summary for a PR.
   install-skill        Install the /bugbot skill for a harness.
@@ -264,7 +279,8 @@ Pull request argument:
 
 status exit codes:
   0  a bugbot check on the PR's head SHA is completed
-  2  the check or a bugbot workflow run is queued or in progress
+  2  the check or a bugbot workflow run is queued or in progress (a newer run
+     wins over an older completed check)
   3  nothing has run for this head SHA
   1  usage or gh error
 
@@ -275,7 +291,24 @@ interface ReviewOptions {
   readonly workflow: string;
 }
 
-const WORKFLOW_RE = /^[A-Za-z0-9._-]+\.ya?ml$/;
+const WORKFLOW_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/;
+
+/**
+ * A branch name from `gh pr view` becomes the value of `--ref`. Reject
+ * anything git would not accept, and never a leading `-` that `gh` could
+ * read as a flag.
+ */
+function validBranchName(name: string): boolean {
+  return (
+    name !== "" &&
+    !name.startsWith("-") &&
+    !name.startsWith("/") &&
+    !name.endsWith("/") &&
+    !name.endsWith(".") &&
+    !name.includes("..") &&
+    !/[\s\x00-\x1f\x7f~^:?*[\\]/.test(name)
+  );
+}
 
 function parseReviewArgs(args: readonly string[]): ReviewOptions {
   let prArg: string | null = null;
@@ -335,6 +368,35 @@ export function isMissingDispatch(error: unknown): boolean {
   );
 }
 
+/** The two PR facts `review` needs before it dispatches. */
+interface PullView {
+  readonly headRefName: string;
+  readonly fork: boolean;
+}
+
+function parsePullView(stdout: string): PullView {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error("gh pr view returned invalid JSON");
+  }
+  const record = asRecord(parsed);
+  const headRefName = record?.["headRefName"];
+  const crossRepository = record?.["isCrossRepository"];
+  if (typeof headRefName !== "string" || !validBranchName(headRefName)) {
+    throw new Error(
+      "gh pr view returned no usable head branch for this pull request",
+    );
+  }
+  if (typeof crossRepository !== "boolean") {
+    throw new Error(
+      "gh pr view returned no fork information for this pull request",
+    );
+  }
+  return { headRefName, fork: crossRepository };
+}
+
 export async function runRemoteReview(
   args: readonly string[],
   deps: CommandDeps = {},
@@ -351,26 +413,56 @@ export async function runRemoteReview(
     return 1;
   }
 
+  let branch: string | null = null;
   try {
     const pull = await resolvePull(options.pr, gh);
+    const repository = `${pull.owner}/${pull.repo}`;
+    const target = `${repository}#${pull.number}`;
+
+    const view = await gh([
+      "pr",
+      "view",
+      String(pull.number),
+      "-R",
+      repository,
+      "--json",
+      "headRefName,isCrossRepository",
+    ]);
+    const pullView = parsePullView(view.stdout);
+    branch = pullView.headRefName;
+
+    if (pullView.fork) {
+      fail(
+        `Bugbot: refuses to review ${target}: Bugbot skips fork pull requests, ` +
+          "and a fork's head branch cannot be dispatched in the base repository. " +
+          "Nothing was started.",
+      );
+      return 1;
+    }
+
     await gh([
       "workflow",
       "run",
       options.workflow,
       "-R",
-      `${pull.owner}/${pull.repo}`,
+      repository,
+      "--ref",
+      pullView.headRefName,
       "-f",
       `pr=${pull.number}`,
     ]);
-    const target = `${pull.owner}/${pull.repo}#${pull.number}`;
-    log(`Bugbot: requested a review for ${target} (${options.workflow}).`);
+    log(
+      `Bugbot: requested a review for ${target} ` +
+        `(${options.workflow} on ${pullView.headRefName}).`,
+    );
     log(`Bugbot: check progress with \`bugbot status ${target}\`.`);
     return 0;
   } catch (error) {
     if (isMissingDispatch(error)) {
       fail(
-        `Bugbot: ${oneLine(errorMessage(error))} Add a workflow_dispatch trigger ` +
-          "with a pr input to the caller workflow (see examples/caller.yml).",
+        `Bugbot: ${oneLine(errorMessage(error))} The caller must be on ` +
+          `${branch ?? "the pull request's head branch"} with a ` +
+          "workflow_dispatch trigger and a pr input (see examples/caller.yml).",
       );
       return 1;
     }
@@ -391,7 +483,7 @@ It never writes anything and needs no token of its own: gh supplies auth.
 Exit codes:
   0  a bugbot check on the head SHA is completed
   2  the check, or a bugbot workflow run for the head SHA, is queued or
-     in progress
+     in progress (a new run wins over an older completed check)
   3  nothing has run for this head SHA (never ran or caller missing)
   1  usage or gh error`;
 
@@ -627,11 +719,15 @@ function pickCheck(value: unknown): CheckSummary | null {
   }
 
   // The API returns newest first; timestamps make that explicit when present.
+  // A queued re-run has `started_at: null` and is newer than any completed
+  // check on the same SHA, so a missing timestamp sorts first (N1).
+  const startedAt = (run: Record<string, unknown>): string => {
+    const value = run["started_at"];
+    return typeof value === "string" && value !== "" ? value : "\uffff";
+  };
   matches.sort((a, b) => {
-    const left =
-      typeof a["started_at"] === "string" ? a["started_at"] : "";
-    const right =
-      typeof b["started_at"] === "string" ? b["started_at"] : "";
+    const left = startedAt(a);
+    const right = startedAt(b);
     if (left !== right) {
       return left < right ? 1 : -1;
     }
@@ -747,9 +843,12 @@ export async function runStatus(
     const url =
       typeof viewJson["url"] === "string" ? viewJson["url"] : null;
 
+    // Filter by name and take a full page: the bugbot check is created after
+    // the CI checks, so it can fall off the default page on a busy SHA (B2).
     const checksResult = await gh([
       "api",
-      `repos/${repository}/commits/${headSha}/check-runs`,
+      `repos/${repository}/commits/${headSha}/check-runs` +
+        "?check_name=bugbot&filter=all&per_page=100",
     ]);
     let checksJson: unknown;
     try {
@@ -759,20 +858,12 @@ export async function runStatus(
     }
     const check = pickCheck(checksJson);
 
-    let exitCode: 0 | 2 | 3;
-    let state: "done" | "running" | "none";
-    let conclusion: string | null = null;
-
-    if (check !== null) {
-      if (check.status === "completed") {
-        exitCode = 0;
-        state = "done";
-        conclusion = check.conclusion;
-      } else {
-        exitCode = 2;
-        state = "running";
-      }
-    } else {
+    // A queued or in-progress bugbot run means a new pass is starting. It
+    // wins over an older completed check on the same SHA, so status right
+    // after `review` of an already-reviewed SHA does not report the previous
+    // pass as done (N2). The limit keeps a queued run from being cut off (N7).
+    let activeRun = false;
+    if (check === null || check.status === "completed") {
       const runsResult = await gh([
         "run",
         "list",
@@ -780,6 +871,8 @@ export async function runStatus(
         repository,
         "--commit",
         headSha,
+        "--limit",
+        "100",
         "--json",
         "status,name,workflowName",
       ]);
@@ -789,13 +882,26 @@ export async function runStatus(
       } catch {
         throw new Error("gh run list returned invalid JSON");
       }
-      if (hasActiveBugbotRun(runsJson)) {
-        exitCode = 2;
-        state = "running";
-      } else {
-        exitCode = 3;
-        state = "none";
-      }
+      activeRun = hasActiveBugbotRun(runsJson);
+    }
+
+    let exitCode: 0 | 2 | 3;
+    let state: "done" | "running" | "none";
+    let conclusion: string | null = null;
+
+    if (check !== null && check.status !== "completed") {
+      exitCode = 2;
+      state = "running";
+    } else if (activeRun) {
+      exitCode = 2;
+      state = "running";
+    } else if (check !== null) {
+      exitCode = 0;
+      state = "done";
+      conclusion = check.conclusion;
+    } else {
+      exitCode = 3;
+      state = "none";
     }
 
     const commentsResult = await gh([

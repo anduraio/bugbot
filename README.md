@@ -77,15 +77,18 @@ Anything else is rejected before `gh` runs.
 Starts the repository's caller workflow:
 
 ```sh
-gh workflow run bugbot.yml -R <owner>/<repo> -f pr=<n>
+gh workflow run bugbot.yml -R <owner>/<repo> --ref <head-branch> -f pr=<n>
 ```
 
-`--workflow <file>` overrides `bugbot.yml`. The caller must have a
-`workflow_dispatch` trigger with a `pr` input; `examples/caller.yml` shows the
-shape. If `gh` says the workflow or that trigger is missing, the command
-prints how to add it.
+`--workflow <file>` overrides `bugbot.yml`. The caller must be on the PR's
+head branch with a `workflow_dispatch` trigger and a `pr` input;
+`examples/caller.yml` shows the shape. Dispatching on the head branch makes the
+run's head SHA equal to the PR head, so `status` can see it while it is queued.
 
-Exit codes: `0` review requested, `1` usage or `gh` error.
+Fork pull requests are refused: Bugbot skips forks, and a fork's head branch
+cannot be dispatched in the base repository. Nothing is started.
+
+Exit codes: `0` review requested, `1` usage, `gh` error or a fork PR.
 
 ### `bugbot status <pr> [--json]`
 
@@ -94,6 +97,16 @@ summary comment by `andura-bugbot[bot]` carrying `<!-- bugbot:summary -->`.
 It prints the state (`done`, `running`, `none`), conclusion, head SHA, and the
 summary's passes, open comments, marked fixed and skipped counts. `--json`
 prints one machine-readable object instead.
+
+Check runs are requested filtered by name with a full page, and the queued-run
+lookup asks for up to 100 runs, so a busy head SHA cannot hide the `bugbot`
+check or run. A queued or in-progress `bugbot` workflow run wins over an older
+completed check on the same SHA: right after `review` of a commit that was
+reviewed before, `status` reports `running` for the new pass instead of `done`
+for the previous one.
+
+Fork PRs are never dispatched, because `review` refuses them. `status` on a
+fork PR can say `3` until the neutral skipped `bugbot` check is posted.
 
 Exit codes:
 
@@ -117,7 +130,8 @@ Copies `skill/bugbot/SKILL.md` to the harness skills folder under `$HOME`:
 
 An identical file is a no-op. A different file is only overwritten with
 `--force`; `--dry-run` prints the destination and writes nothing. Bugbot never
-writes under `~/.pstack`.
+writes under `~/.pstack`, and refuses when any part of the destination path is
+a symlink or resolves outside `$HOME`.
 
 ## Local review
 

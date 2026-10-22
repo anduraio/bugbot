@@ -1,6 +1,9 @@
 name: bugbot
 
 on:
+  # `bugbot review` dispatches this file on the PR's head branch for a
+  # same-repo PR, so this trigger must exist on that branch too. Fork PRs are
+  # refused by the CLI: Bugbot skips forks.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:

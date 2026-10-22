@@ -17,6 +17,7 @@ import {
   minConfidenceFromEnv,
   parseMarker,
   reasonSimilarity,
+  regexScanStats,
   shouldPost,
   stripTrailingAngleGroups,
   stripTrailingBracketGroup,
@@ -811,17 +812,19 @@ describe("enclosingSymbol", () => {
     expect(symbol).toBe("");
   });
 
-  it("scans 400k unterminated regex classes closed only at the end in under 500 ms (R5-N1)", () => {
-    // The final `]` defeats the lastCloseBracket fast path, so every `/` scans
-    // up to MAX_REGEX_LITERAL_CHARS; without that cap this is quadratic.
+  it("bounds regex literal rescanning on 400k unterminated classes (R5-N1)", () => {
+    // The final `]` defeats the lastCloseBracket fast path, so every `/` would
+    // scan to the end of the line without MAX_REGEX_LITERAL_CHARS (quadratic).
+    // Assert the work bound, not wall-clock: the old 500 ms limit was flaky.
     const content = "/[".repeat(199_989) + "]";
     expect(content.length).toBeLessThan(MAX_SYMBOL_SCAN_CHARS);
-    const started = performance.now();
+    regexScanStats.chars = 0;
     const symbol = enclosingSymbol(content, 1);
-    const elapsed = performance.now() - started;
 
-    expect(elapsed, `${elapsed.toFixed(1)}ms`).toBeLessThan(500);
     expect(symbol).toBe("");
+    // Capped: about 200k starts x 256 chars. Uncapped: about 20 billion.
+    expect(regexScanStats.chars).toBeGreaterThan(0);
+    expect(regexScanStats.chars).toBeLessThan(100_000_000);
   });
 
   it("scans 133k is{ repeats in under 500 ms (R4-B1)", () => {

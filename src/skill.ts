@@ -1,11 +1,19 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
  * `bugbot install-skill --harness <name>` copies the vendored /bugbot skill
  * into one harness's skills folder under $HOME. It never writes under
- * ~/.pstack and never deletes anything.
+ * ~/.pstack, never writes through a symlink, and never deletes anything.
  */
 
 export const HARNESS_PATHS = {
@@ -29,7 +37,8 @@ Copies the /bugbot skill into the harness skills folder under $HOME:
 
 An identical file is a no-op. A different file is only overwritten with
 --force. --dry-run prints the destination and writes nothing.
-Bugbot never writes under ~/.pstack.
+Bugbot never writes under ~/.pstack, and refuses when any part of the
+destination path is a symlink or resolves outside $HOME.
 
 Exit codes: 0 installed (or already identical), 1 usage or file error.`;
 
@@ -102,6 +111,69 @@ function parseInstallArgs(args: readonly string[]): InstallOptions {
   return { harness, force, dryRun };
 }
 
+function isInside(parent: string, child: string): boolean {
+  const fromParent = relative(parent, child);
+  return (
+    fromParent === "" ||
+    (!fromParent.startsWith("..") && !fromParent.startsWith(sep))
+  );
+}
+
+/**
+ * Refuses symlinks anywhere in the destination path and any destination that
+ * resolves outside $HOME or under ~/.pstack. A textual check cannot see a
+ * symlinked skills folder (B4), so walk the real filesystem instead. The
+ * nearest existing ancestor is resolved too: if a link appears after this
+ * check, the atomic rename below still replaces the link rather than writing
+ * through it.
+ */
+async function destinationProblem(
+  home: string,
+  destination: string,
+): Promise<string | null> {
+  let homeReal: string;
+  try {
+    homeReal = await realpath(home);
+  } catch {
+    return `HOME ${JSON.stringify(home)} does not exist`;
+  }
+
+  const parts = relative(resolve(home), destination).split(sep);
+  let current = resolve(home);
+  let nearest = current;
+  for (const part of parts) {
+    current = join(current, part);
+    let info;
+    try {
+      info = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // The rest of the path does not exist yet; mkdir creates it.
+        break;
+      }
+      return `could not inspect ${current}: ${errorMessage(error)}`;
+    }
+    if (info.isSymbolicLink()) {
+      return `${current} is a symlink`;
+    }
+    nearest = current;
+  }
+
+  let nearestReal: string;
+  try {
+    nearestReal = await realpath(nearest);
+  } catch (error) {
+    return `could not resolve ${nearest}: ${errorMessage(error)}`;
+  }
+  if (!isInside(homeReal, nearestReal)) {
+    return `${nearest} resolves outside HOME (${nearestReal})`;
+  }
+  if (isInside(join(homeReal, ".pstack"), nearestReal)) {
+    return `${nearest} resolves inside ~/.pstack`;
+  }
+  return null;
+}
+
 export async function runInstallSkill(
   args: readonly string[],
   deps: InstallSkillDeps = {},
@@ -134,6 +206,15 @@ export async function runInstallSkill(
     fromHome.split(sep).includes(".pstack")
   ) {
     fail("Bugbot: refuses to install a skill under ~/.pstack");
+    return 1;
+  }
+
+  const problem = await destinationProblem(resolve(home), destination);
+  if (problem !== null) {
+    fail(
+      `Bugbot: refuses to install the skill at ${destination}: ${problem}. ` +
+        "Nothing was written.",
+    );
     return 1;
   }
 
@@ -174,7 +255,29 @@ export async function runInstallSkill(
 
   try {
     await mkdir(destinationDir, { recursive: true });
-    await writeFile(destination, content, "utf8");
+    const raced = await destinationProblem(resolve(home), destination);
+    if (raced !== null) {
+      fail(
+        `Bugbot: refuses to install the skill at ${destination}: ${raced}. ` +
+          "Nothing was written.",
+      );
+      return 1;
+    }
+    // Write a sibling temp file and rename so a symlink planted after the
+    // check above is replaced, never followed (B4).
+    const temporary = join(
+      destinationDir,
+      `.SKILL.md.${process.pid}.${Date.now()}.${Math.random()
+        .toString(36)
+        .slice(2)}.tmp`,
+    );
+    try {
+      await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+      await rename(temporary, destination);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
   } catch (error) {
     fail(`Bugbot: could not install the skill at ${destination}: ${errorMessage(error)}`);
     return 1;

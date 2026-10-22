@@ -475,6 +475,13 @@ function lifetimeAt(line: string, index: number): string | null {
 const MAX_REGEX_LITERAL_CHARS = 256;
 
 /**
+ * Characters scanned by `regexLiteralEnd`. Exported for the R5-N1 test: the
+ * cap makes this linear, and a work bound is deterministic where a wall-clock
+ * limit was flaky (N8).
+ */
+export const regexScanStats = { chars: 0 };
+
+/**
  * Index of the closing `/` of a regex literal, or -1 when this line has none.
  * `lastCloseBracket` is `line.lastIndexOf("]")`, computed once per line: a
  * character class that has no `]` after it can never close, so `/[/[/[...` is
@@ -482,6 +489,7 @@ const MAX_REGEX_LITERAL_CHARS = 256;
  */
 function regexLiteralEnd(line: string, start: number, lastCloseBracket: number): number {
   const limit = Math.min(line.length, start + 1 + MAX_REGEX_LITERAL_CHARS);
+  regexScanStats.chars += Math.max(0, limit - (start + 1));
   let inClass = false;
   let index = start + 1;
   while (index < limit) {
