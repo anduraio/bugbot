@@ -11,9 +11,9 @@ goes `neutral` and the summary says why. When a re-check proves a finding is
 gone, Bugbot replies `Looks fixed as of <sha7>.` and leaves resolving the
 thread to a person.
 
-Status: step 8, cross-pass dedupe, incremental review and honest summary
-counts. `review --local` builds a review from a diff file and prints the
-findings plus the comments that would post; it never posts.
+Status: step 10, the CLI to start a review, inspect its check and summary, and
+install the `/bugbot` skill. `review --local` builds a review from a diff file
+and prints the findings plus the comments that would post; it never posts.
 
 ## Layout
 
@@ -26,7 +26,10 @@ findings plus the comments that would post; it never posts.
   cross-pass dedupe, comment body and marker
 - `src/gate.ts` - pure draft/fork gate shared by the workflow and the CLI
 - `src/github.ts` - inline comments, summary, check run, replies
-- `src/cli.ts` - `bugbot review|status`
+- `src/gh.ts` - the `gh` CLI runner behind `review <pr>` and `status <pr>`
+- `src/skill.ts` - `install-skill` for each harness
+- `src/cli.ts` - `bugbot review|status|install-skill`
+- `skill/bugbot/SKILL.md` - the `/bugbot` skill
 - `prompts/` - pstack review texts, vendored with source headers (MIT)
 - `scripts/sync-prompts.sh` - manual refresh of `prompts/` from a local pstack
 - `examples/caller.yml` - per-repo caller workflow with explicit secrets
@@ -53,6 +56,68 @@ PSTACK_DIR=/path/to/pstack scripts/sync-prompts.sh
 
 The script rewrites the headers and the README hashes, prints what changed,
 and makes no network calls. CI never runs it and it never commits.
+
+## CLI
+
+The three commands below talk to GitHub only through `gh`, so `gh auth login`
+supplies the auth. The CLI never reads, takes or prints a token. `review <pr>`
+makes one write request (`gh workflow run`); `status` only reads.
+
+All three accept the same pull request argument:
+
+- `https://github.com/<owner>/<repo>/pull/<n>`
+- `<owner>/<repo>#<n>`
+- a bare number with `--repo <owner>/<repo>`, or a bare number in a checkout
+  (the repo is resolved with `gh repo view --json nameWithOwner`)
+
+Anything else is rejected before `gh` runs.
+
+### `bugbot review <pr>`
+
+Starts the repository's caller workflow:
+
+```sh
+gh workflow run bugbot.yml -R <owner>/<repo> -f pr=<n>
+```
+
+`--workflow <file>` overrides `bugbot.yml`. The caller must have a
+`workflow_dispatch` trigger with a `pr` input; `examples/caller.yml` shows the
+shape. If `gh` says the workflow or that trigger is missing, the command
+prints how to add it.
+
+Exit codes: `0` review requested, `1` usage or `gh` error.
+
+### `bugbot status <pr> [--json]`
+
+Reads the PR head SHA, the check runs named `bugbot` on that SHA, and the
+summary comment by `andura-bugbot[bot]` carrying `<!-- bugbot:summary -->`.
+It prints the state (`done`, `running`, `none`), conclusion, head SHA, and the
+summary's passes, open comments, marked fixed and skipped counts. `--json`
+prints one machine-readable object instead.
+
+Exit codes:
+
+- `0` a `bugbot` check on the head SHA is completed
+- `2` the check, or a `bugbot` workflow run for the head SHA, is queued or in
+  progress (poll again)
+- `3` nothing has run for this head SHA (never ran, or the caller is missing)
+- `1` usage or `gh` error
+
+### `bugbot install-skill --harness <name> [--force] [--dry-run]`
+
+Copies `skill/bugbot/SKILL.md` to the harness skills folder under `$HOME`:
+
+| Harness | Destination |
+| --- | --- |
+| `claude` | `~/.claude/skills/bugbot/SKILL.md` |
+| `claude-personal` | `~/.claude-personal/skills/bugbot/SKILL.md` |
+| `grok` | `~/.grok/skills/bugbot/SKILL.md` |
+| `opencode` | `~/.config/opencode/skills/bugbot/SKILL.md` |
+| `agents` | `~/.agents/skills/bugbot/SKILL.md` |
+
+An identical file is a no-op. A different file is only overwritten with
+`--force`; `--dry-run` prints the destination and writes nothing. Bugbot never
+writes under `~/.pstack`.
 
 ## Local review
 

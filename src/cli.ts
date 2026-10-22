@@ -30,6 +30,14 @@ import {
 } from "./github.js";
 import { pullRequestFromEvent, shouldReview } from "./gate.js";
 import {
+  MAIN_HELP,
+  REVIEW_HELP,
+  STATUS_HELP,
+  runRemoteReview,
+  runStatus,
+} from "./gh.js";
+import { INSTALL_HELP, runInstallSkill } from "./skill.js";
+import {
   buildContext,
   changedLinesFromDiff,
   diffLineTexts,
@@ -1617,6 +1625,11 @@ export async function runPrReview(
 }
 
 export async function review(args: readonly string[] = []): Promise<number> {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(REVIEW_HELP);
+    return 0;
+  }
+
   if (args.includes("--local")) {
     // Local output goes to stdout only: it must never land in a GitHub job
     // summary, even when GITHUB_STEP_SUMMARY happens to be set.
@@ -1628,6 +1641,12 @@ export async function review(args: readonly string[] = []): Promise<number> {
       console.log(`Bugbot couldn't review: ${errorMessage(error)}`);
       return 0;
     }
+  }
+
+  // `bugbot review <pr>` starts the caller workflow. With no arguments the
+  // action's own run (`node dist/cli.js review`) still reviews from env vars.
+  if (args.length > 0) {
+    return runRemoteReview(args);
   }
 
   try {
@@ -1648,22 +1667,49 @@ export async function review(args: readonly string[] = []): Promise<number> {
   }
 }
 
-export async function status(_args: readonly string[] = []): Promise<number> {
-  console.log("Bugbot status: step 2 skeleton, status is not implemented.");
-  return 0;
+export async function status(args: readonly string[] = []): Promise<number> {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(STATUS_HELP);
+    return 0;
+  }
+  return runStatus(args);
+}
+
+export async function installSkill(
+  args: readonly string[] = [],
+): Promise<number> {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(INSTALL_HELP);
+    return 0;
+  }
+  return runInstallSkill(args);
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv;
+
+  if (
+    command === undefined ||
+    command === "--help" ||
+    command === "-h" ||
+    command === "help"
+  ) {
+    console.log(MAIN_HELP);
+    return 0;
+  }
 
   switch (command) {
     case "review":
       return review(args);
     case "status":
       return status(args);
+    case "install-skill":
+      return installSkill(args);
     default:
       console.error(
-        "usage: bugbot review [<pr-url|number>] [--local] | bugbot status <pr-url|number>",
+        "usage: bugbot review [<pr-url|number>] [--local] | " +
+          "bugbot status <pr-url|number> | " +
+          "bugbot install-skill --harness <name>",
       );
       return 2;
   }

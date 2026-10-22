@@ -27,7 +27,8 @@ jobs:
     # decides whether a draft is reviewed. If they drift, a run either starts
     # and skips, or never starts at all.
     if: github.event.action != 'labeled' || github.event.label.name == 'bugbot'
-    uses: anduraio/bugbot/.github/workflows/review.yml@v1
+    uses: anduraio/bugbot/.github/workflows/review.yml@<bugbot-commit-sha>
+    # Pin a full 40-character Bugbot commit SHA above; never a moving tag.
     with:
       pr: ${{ inputs.pr }}
       # Must match the literal in the job-level `if` above.
