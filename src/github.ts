@@ -603,6 +603,8 @@ export interface GitHubOptions extends GitHubTransportOptions {
 
 export interface CheckRunHandle {
   id: number;
+  /** The GitHub App that created the run; null or absent when unknown. */
+  appId?: number | null;
   /** The request that created (or, in a dry run, would create) the run. */
   planned?: PlannedRequest;
 }
@@ -612,6 +614,8 @@ export interface CheckRunInfo {
   id: number;
   status: string | null;
   externalId: string | null;
+  /** The GitHub App that owns the run; null when the response had none. */
+  appId: number | null;
 }
 
 /** A neutral check never fails the PR. Bugbot has no failure conclusion. */
@@ -722,7 +726,7 @@ export async function startCheck(
     );
   }
 
-  return { id, planned: response.plan };
+  return { id, appId: appIdOf(payload?.app), planned: response.plan };
 }
 
 /**
@@ -847,6 +851,7 @@ export async function listCheckRuns(
           id,
           status: asString(run.status),
           externalId: asString(run.external_id),
+          appId: appIdOf(run.app),
         });
       }
     }
@@ -1029,7 +1034,7 @@ export async function postReview(
       const status = error instanceof GitHubError ? (error.status ?? 0) : 0;
       failed.push({ file: comment.file, line: comment.line, status });
       log(
-        `Bugbot could not post ${comment.file}:${comment.line} (status ${status})`,
+        `Bugbot could not post ${safeDisplay(comment.file)}:${comment.line} (status ${status})`,
       );
     }
   }
@@ -1147,6 +1152,16 @@ export async function upsertSummary(
   return { action: "created", planned: response.plan, previousBody: null };
 }
 
+/**
+ * Makes a diff path or file name safe to print. A legal git path can carry a
+ * newline or carriage return, and a line that starts with `::` is a workflow
+ * command in an Actions log. Every control character becomes `?`, so no output
+ * line can be started or split by a file name (R1-N3).
+ */
+export function safeDisplay(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "?");
+}
+
 /** Escapes a backtick so a hostile file name cannot close a code span. */
 function escapeBacktick(text: string): string {
   return text.replaceAll("`", "&#96;");
@@ -1199,7 +1214,9 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
   if (summary.truncated.length > 0) {
     const shown = summary.truncated.slice(0, MAX_TRUNCATED_FILES);
     const more = summary.truncated.length - shown.length;
-    const list = shown.map((file) => `\`${escapeBacktick(file)}\``).join(", ");
+    const list = shown
+      .map((file) => `\`${escapeBacktick(safeDisplay(file))}\``)
+      .join(", ");
     lines.push(
       "",
       `**Files reduced to fit the context budget:** ${list}${
@@ -1756,6 +1773,11 @@ function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function appIdOf(value: unknown): number | null {
+  const app = asRecord(value);
+  return app === null ? null : positiveInteger(app.id);
+}
+
 function positiveInteger(value: unknown): number | null {
   const number = asNumber(value);
   return number !== null && Number.isSafeInteger(number) && number > 0
@@ -2018,13 +2040,13 @@ function pullPath(
  */
 function contentsPath(repository: string, path: string): string {
   if (path === "" || path.startsWith("/") || path.includes("\u0000")) {
-    throw new Error(`refusing to read unsafe path: ${path}`);
+    throw new Error(`refusing to read unsafe path: ${safeDisplay(path)}`);
   }
 
   const segments = path.split("/");
   for (const segment of segments) {
     if (segment === "" || segment === "." || segment === "..") {
-      throw new Error(`refusing to read unsafe path: ${path}`);
+      throw new Error(`refusing to read unsafe path: ${safeDisplay(path)}`);
     }
   }
 

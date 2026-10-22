@@ -21,6 +21,7 @@ import {
   readRepositoryFile,
   redact,
   renderSummary,
+  safeDisplay,
   reportSkipped,
   resolveFixedThreads,
   startCheck,
@@ -516,6 +517,7 @@ describe("check runs", () => {
     const handle = await startCheck(options({ fetch: fetchFn }));
 
     expect(handle.id).toBe(77);
+    expect(handle.appId).toBeNull();
     expect(calls).toHaveLength(1);
     const call = calls[0]!;
     expect(call.method).toBe("POST");
@@ -526,6 +528,14 @@ describe("check runs", () => {
       status: "in_progress",
       external_id: "12345",
     });
+  });
+
+  it("reports the app that created the check run", async () => {
+    const { fetchFn } = recording(() => json({ id: 77, app: { id: 4242 } }, 201));
+
+    const handle = await startCheck(options({ fetch: fetchFn }));
+
+    expect(handle).toMatchObject({ id: 77, appId: 4242 });
   });
 
   it("finishes neutral or success with a capped summary", async () => {
@@ -870,6 +880,72 @@ describe("postReview", () => {
       expect((body.comments as unknown[]).length).toBe(1);
     }
     expect(logs[0]).toContain("b.ts:2");
+  });
+});
+
+describe("safe file names in output (R1-N3)", () => {
+  const hostile = "x\n::warning::pwned\\y.ts";
+
+  it("replaces every control character with ? and keeps the rest", () => {
+    expect(safeDisplay(hostile)).toBe("x?::warning::pwned\\y.ts");
+    expect(safeDisplay("a\rb\u0000c\u001bd\u007fe\u0085f\u2028g\u2029h")).toBe(
+      "a?b?c?d?e?f?g?h",
+    );
+    expect(safeDisplay("src/ünï/ok file.ts")).toBe("src/ünï/ok file.ts");
+  });
+
+  it("logs a failed post for a hostile file name on one line", async () => {
+    const { fetchFn } = recording(() => json({ message: "unprocessable" }, 422));
+    const logs: string[] = [];
+
+    await postReview(
+      options({ fetch: fetchFn, log: (line) => logs.push(line) }),
+      [plannedComment({ file: hostile, line: 4 })],
+    );
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toBe(
+      "Bugbot could not post x?::warning::pwned\\y.ts:4 (status 422)",
+    );
+  });
+
+  it("keeps a hostile path out of the unsafe-path error", async () => {
+    const { fetchFn } = recording(() => json({}));
+
+    const cases: Array<[string, string]> = [
+      ["a/../x\n::warning::pwned", "a/../x?::warning::pwned"],
+      ["/x\n::warning::pwned", "/x?::warning::pwned"],
+    ];
+    for (const [path, shown] of cases) {
+      const error = await readRepositoryFile({
+        token: TOKEN,
+        repository: "o/r",
+        path,
+        ref: SHA,
+        fetch: fetchFn,
+      }).catch((caught: unknown) => caught as Error);
+
+      expect(error.message).toBe(`refusing to read unsafe path: ${shown}`);
+    }
+  });
+
+  it("escapes control characters in the truncated-files list", () => {
+    const body = renderSummary(
+      {
+        passCount: 1,
+        model: "m",
+        tokensIn: 0,
+        tokensOut: 0,
+        posted: 0,
+        skipped: 0,
+        resolved: 0,
+        truncated: [hostile],
+      },
+      TOKEN,
+    );
+
+    expect(body).toContain("`x?::warning::pwned\\y.ts`");
+    expect(body).not.toContain("\n::warning::");
   });
 });
 
@@ -2161,13 +2237,34 @@ describe("listCheckRuns", () => {
     const found = await listCheckRuns(options({ fetch: fetchFn }));
 
     expect(found).toEqual([
-      { id: 5, status: "completed", externalId: "999" },
-      { id: 88, status: "in_progress", externalId: "12345" },
+      { id: 5, status: "completed", externalId: "999", appId: null },
+      { id: 88, status: "in_progress", externalId: "12345", appId: null },
     ]);
     expect(calls[0]?.path).toBe(`/repos/o/r/commits/${SHA}/check-runs`);
     expect(calls[0]?.search).toContain("check_name=bugbot");
     expect(calls[0]?.search).toContain("filter=all");
     expect(calls[0]?.search).toContain(`per_page=100`);
+  });
+
+  it("reads the app id of each run", async () => {
+    const { fetchFn } = recording(() =>
+      json({
+        check_runs: [
+          {
+            id: 5,
+            name: "bugbot",
+            external_id: "1",
+            status: "in_progress",
+            app: { id: 4242 },
+          },
+          { id: 6, name: "bugbot", external_id: "2", status: "in_progress", app: {} },
+        ],
+      }),
+    );
+
+    const found = await listCheckRuns(options({ fetch: fetchFn }));
+
+    expect(found.map((run) => run.appId)).toEqual([4242, null]);
   });
 
   it("returns an empty list when no run matches", async () => {

@@ -15,6 +15,7 @@ import {
   redact,
   reportSkipped,
   resolveFixedThreads,
+  safeDisplay,
   startCheck,
   upsertSummary,
   type CheckRunHandle,
@@ -638,6 +639,18 @@ function parseRunIds(body: string | null): string[] {
     .filter((value) => value !== "");
 }
 
+/**
+ * True when a check run's `external_id` is a run id no higher than this run's.
+ * A missing or non-numeric id is not ours to complete, and a higher id is a
+ * newer run that is still working.
+ */
+function isNotNewerRun(externalId: string | null, runId: string): boolean {
+  if (externalId === null || !/^\d+$/.test(externalId)) {
+    return false;
+  }
+  return BigInt(externalId) <= BigInt(runId);
+}
+
 function planLine(plan: PlannedRequest): string {
   const body = plan.body === undefined ? "" : ` ${JSON.stringify(plan.body)}`;
   return `Dry run plan: ${plan.method} ${plan.path}${body}`;
@@ -784,29 +797,45 @@ export async function runPrReview(
   }
 
   // A cancelled or superseded run can leave an in_progress `bugbot` check on
-  // this head SHA. Complete every such run that is not this pass. This is
-  // best effort: a failure is logged and the review continues (S6B-N2).
-  if (error === null) {
-    try {
-      const runs = await listCheckRuns(github);
-      const stale = runs.filter(
-        (run) =>
-          run.status === "in_progress" && run.externalId !== runId,
-      );
-      for (const run of stale) {
-        const planned = await finishCheck(
-          github,
-          { id: run.id },
-          "neutral",
-          `Bugbot: superseded by run ${runId}.`,
+  // this head SHA. Complete the ones this app left behind from this run id or
+  // an earlier one. This pass's own check is skipped by id (R1-N1); a newer
+  // run, another app's check and a completed run are never touched (R1-N2).
+  // Best effort: a failure is logged and the review continues (S6B-N2).
+  if (error === null && check !== null) {
+    const own = check;
+    if (own.appId === undefined || own.appId === null) {
+      log("Bugbot: skipping stale check cleanup: the check run's app is unknown");
+    } else {
+      try {
+        const runs = await listCheckRuns(github);
+        const stale = runs.filter(
+          (run) =>
+            run.id !== own.id &&
+            run.status === "in_progress" &&
+            run.appId === own.appId &&
+            isNotNewerRun(run.externalId, runId),
         );
-        if (dryRun) {
-          log(planLine(planned));
+        for (const run of stale) {
+          try {
+            const planned = await finishCheck(
+              github,
+              { id: run.id },
+              "neutral",
+              `Bugbot: superseded by run ${runId}.`,
+            );
+            if (dryRun) {
+              log(planLine(planned));
+            }
+            log(`Bugbot: completed stale in-progress check run ${run.id}`);
+          } catch (caught) {
+            log(
+              `Bugbot: could not complete stale check run ${run.id}: ${reasonOf(caught)}`,
+            );
+          }
         }
-        log(`Bugbot: completed stale in-progress check run ${run.id}`);
+      } catch (caught) {
+        log(`Bugbot: could not list stale check runs: ${reasonOf(caught)}`);
       }
-    } catch (caught) {
-      log(`Bugbot: could not complete stale check runs: ${reasonOf(caught)}`);
     }
   }
 
@@ -862,7 +891,7 @@ export async function runPrReview(
             caught instanceof Error &&
             caught.message === "GitHub request not allowed: unsafe contents path"
           ) {
-            log(`Bugbot: skipping ${path}: ${reasonOf(caught)}`);
+            log(`Bugbot: skipping ${safeDisplay(path)}: ${reasonOf(caught)}`);
             return null;
           }
           throw caught;

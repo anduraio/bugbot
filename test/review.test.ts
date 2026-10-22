@@ -95,6 +95,34 @@ const BACKSLASH_DIFF = [
   "",
 ].join("\n");
 
+/** The GitHub App that owns this pass's check run in the fake world. */
+const APP_ID = 4242;
+/** Another app that also happens to name its check `bugbot`. */
+const OTHER_APP_ID = 9191;
+
+/**
+ * The L1 file name: a newline, then a workflow command, then a backslash. Git
+ * writes it quoted, with `\n` and `\\` as escapes, and the parser decodes it.
+ */
+const HOSTILE_NAME = "x\n::warning::pwned\\y.ts";
+const HOSTILE_QUOTED = String.raw`x\n::warning::pwned\\y.ts`;
+const HOSTILE_DIFF = [
+  `diff --git "a/${HOSTILE_QUOTED}" "b/${HOSTILE_QUOTED}"`,
+  `--- "a/${HOSTILE_QUOTED}"`,
+  `+++ "b/${HOSTILE_QUOTED}"`,
+  "@@ -0,0 +1 @@",
+  "+x",
+  "diff --git a/src/cart.ts b/src/cart.ts",
+  "--- a/src/cart.ts",
+  "+++ b/src/cart.ts",
+  "@@ -1,2 +1,4 @@",
+  " export function total(order) {",
+  "+  const customer = findCustomer(order.customerId);",
+  "+  return customer.name;",
+  " }",
+  "",
+].join("\n");
+
 const FINDING = {
   file: "src/cart.ts",
   line: 3,
@@ -155,11 +183,18 @@ interface World {
   startCheckHangs: boolean;
   startCheckStatus: number;
   finishCheckStatuses: number[];
+  /** The next N check-run PATCH calls never answer (a timeout). */
+  finishCheckHangs: number;
+  /** A status for every PATCH to one check-run id. */
+  finishCheckStatusById: Record<number, number>;
+  /** App id in the startCheck response; null leaves `app` out. */
+  startCheckApp: number | null;
   checkRuns: Array<{
     id: number;
     name: string;
     external_id: string | null;
     status?: string;
+    app?: { id: number };
   }>;
 }
 
@@ -193,6 +228,9 @@ function makeWorld(overrides: Partial<World> = {}): World {
     startCheckHangs: false,
     startCheckStatus: 200,
     finishCheckStatuses: [],
+    finishCheckHangs: 0,
+    finishCheckStatusById: {},
+    startCheckApp: APP_ID,
     checkRuns: [],
     ...overrides,
   };
@@ -375,11 +413,22 @@ function recordedFetch(world: World): {
       if (world.startCheckStatus !== 200) {
         return json({ message: "check create failed" }, world.startCheckStatus);
       }
-      return json({ id: 77 }, 201);
+      return json(
+        world.startCheckApp === null
+          ? { id: 77 }
+          : { id: 77, app: { id: world.startCheckApp } },
+        201,
+      );
     }
 
     if (call.method === "PATCH" && call.path.startsWith("/repos/o/r/check-runs/")) {
-      const status = world.finishCheckStatuses.shift() ?? 200;
+      if (world.finishCheckHangs > 0) {
+        world.finishCheckHangs -= 1;
+        return new Promise<Response>(() => {});
+      }
+      const id = Number.parseInt(call.path.slice("/repos/o/r/check-runs/".length), 10);
+      const status =
+        world.finishCheckStatusById[id] ?? world.finishCheckStatuses.shift() ?? 200;
       return status === 200
         ? json({})
         : json({ message: "finish failed" }, status);
@@ -918,6 +967,46 @@ describe("runPrReview re-check and resolve", () => {
     expect(resolveCalls(calls)).toHaveLength(0);
   });
 
+  it("asks about open threads only and ignores an unknown thread id (M07, M18)", async () => {
+    const world = makeWorld({ reviewContent: JSON.stringify({ findings: [] }) });
+    const body = (id: string, hashChar: string) =>
+      `${marker(hashChar.repeat(40), "7", OLD)}\n\n**High bug: issue ${id}**\n\nreason ${id}`;
+    world.threads = [
+      threadNode([botComment(1001, body("open", "1"))], { id: "PRRT_OPEN" }),
+      threadNode([botComment(1002, body("done", "2"))], {
+        id: "PRRT_RESOLVED",
+        isResolved: true,
+      }),
+      threadNode(
+        [botComment(1003, body("skip", "3")), humanComment(1004, "won't fix")],
+        { id: "PRRT_SKIPPED" },
+      ),
+    ];
+    // The model claims every thread, plus one it was never asked about, is fixed.
+    world.recheckContent = JSON.stringify({
+      results: ["PRRT_OPEN", "PRRT_RESOLVED", "PRRT_SKIPPED", "PRRT_UNKNOWN"].map(
+        (thread) => ({ thread, fixed: true, confidence: 0.95 }),
+      ),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    const asked = messageContent(recheckModelCalls(calls)[0]!, 1);
+    expect(asked.match(/<thread id="/g)).toHaveLength(1);
+    expect(asked).toContain('id="PRRT_OPEN"');
+    expect(asked).not.toContain("PRRT_RESOLVED");
+    expect(asked).not.toContain("PRRT_SKIPPED");
+
+    expect(replyCalls(calls)).toHaveLength(1);
+    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(
+      (resolveCalls(calls)[0]!.body as { variables: { threadId: string } })
+        .variables.threadId,
+    ).toBe("PRRT_OPEN");
+  });
+
   it("never resolves a thread whose hash the main call re-reported (S6B-N5b)", async () => {
     const world = makeWorld();
     const first = await runReview(world);
@@ -1171,6 +1260,55 @@ describe("runPrReview lost check handle", () => {
 });
 
 describe("runPrReview check lifecycle (S6B-N2)", () => {
+  it("retries a finish PATCH that timed out and completes the check (F4)", async () => {
+    // Three hangs use up the request-level timeout retries, so only the
+    // finishCheck-level retry can still complete the check.
+    const world = makeWorld({ finishCheckHangs: 3 });
+    const { result, calls, logs } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    const finish = checkPatches(calls, 77);
+    expect(finish).toHaveLength(4);
+    expect((finish[3]!.body as { conclusion: string }).conclusion).toBe(
+      "success",
+    );
+    const creates = callsWhere(
+      calls,
+      (call) => call.method === "POST" && call.path === "/repos/o/r/check-runs",
+    );
+    expect(creates).toHaveLength(1);
+    expect(logs.some((line) => line.includes("could not finish"))).toBe(false);
+  });
+
+  it("neither creates nor PATCHes when the lost handle's only match is completed (F17)", async () => {
+    const world = makeWorld({
+      startCheckHangs: true,
+      checkRuns: [
+        { id: 52, name: "bugbot", external_id: "111", status: "completed" },
+      ],
+    });
+    const { result, calls, logs } = await runReview(world);
+
+    expect(result.conclusion).toBe("neutral");
+    const creates = callsWhere(
+      calls,
+      (call) => call.method === "POST" && call.path === "/repos/o/r/check-runs",
+    );
+    // Only the lost in_progress create; no completed neutral one.
+    expect(creates).toHaveLength(1);
+    expect((creates[0]!.body as { status?: string }).status).toBe(
+      "in_progress",
+    );
+    expect(
+      callsWhere(
+        calls,
+        (call) =>
+          call.method === "PATCH" && call.path.startsWith("/repos/o/r/check-runs/"),
+      ),
+    ).toHaveLength(0);
+    expect(logs.some((line) => line.includes("already completed"))).toBe(true);
+  });
+
   it("retries a 500 from the finish PATCH and completes the check", async () => {
     const world = makeWorld({ finishCheckStatuses: [500, 200] });
     const { result, calls, logs } = await runReview(world);
@@ -1208,32 +1346,150 @@ describe("runPrReview check lifecycle (S6B-N2)", () => {
     ).toBe(true);
   });
 
-  it("completes a stale in_progress check from another run at pass start", async () => {
-    const world = makeWorld({
-      checkRuns: [
-        { id: 50, name: "bugbot", external_id: "999", status: "in_progress" },
-        { id: 51, name: "bugbot", external_id: "111", status: "in_progress" },
-      ],
-    });
-    const { result, calls } = await runReview(world);
+  const stale = (
+    id: number,
+    externalId: string | null,
+    extra: { status?: string; app?: number } = {},
+  ) => ({
+    id,
+    name: "bugbot",
+    external_id: externalId,
+    status: extra.status ?? "in_progress",
+    app: { id: extra.app ?? APP_ID },
+  });
 
-    expect(result.conclusion).toBe("success");
-    const lookups = callsWhere(
+  function checkLookups(calls: readonly Recorded[]): Recorded[] {
+    return callsWhere(
       calls,
       (call) =>
         call.method === "GET" &&
         call.path === `/repos/o/r/commits/${HEAD}/check-runs`,
     );
+  }
+
+  it("completes a stale in_progress check from an earlier run at pass start", async () => {
+    const world = makeWorld({ checkRuns: [stale(50, "99")] });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    const lookups = checkLookups(calls);
     expect(lookups.length).toBeGreaterThanOrEqual(1);
     expect(lookups[0]!.search).toContain("filter=all");
 
-    const stale = checkPatches(calls, 50);
-    expect(stale).toHaveLength(1);
-    expect((stale[0]!.body as { conclusion: string }).conclusion).toBe(
+    const patches = checkPatches(calls, 50);
+    expect(patches).toHaveLength(1);
+    expect((patches[0]!.body as { conclusion: string }).conclusion).toBe(
       "neutral",
     );
-    // This pass's own run must be left alone.
-    expect(checkPatches(calls, 51)).toHaveLength(0);
+  });
+
+  it("skips this pass's own check by id, and completes a ghost of the same run id (R1-N1, S1a)", async () => {
+    // 77 is the check this pass just created (same external_id as the ghost).
+    const world = makeWorld({
+      checkRuns: [stale(77, "111"), stale(62, "111")],
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    const ghost = checkPatches(calls, 62);
+    expect(ghost).toHaveLength(1);
+    expect((ghost[0]!.body as { conclusion: string }).conclusion).toBe(
+      "neutral",
+    );
+    // The own check gets exactly one PATCH, the final success one.
+    const own = checkPatches(calls, 77);
+    expect(own).toHaveLength(1);
+    expect((own[0]!.body as { conclusion: string }).conclusion).toBe("success");
+  });
+
+  it("leaves a newer run's in_progress check alone (R1-N2)", async () => {
+    const world = makeWorld({
+      checkRuns: [stale(61, "222"), stale(63, "50")],
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkPatches(calls, 61)).toHaveLength(0);
+    expect(checkPatches(calls, 63)).toHaveLength(1);
+  });
+
+  it("leaves a run with a missing or non-numeric external_id alone (R1-N2)", async () => {
+    const world = makeWorld({
+      checkRuns: [stale(64, null), stale(65, "not-a-number"), stale(66, "50")],
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkPatches(calls, 64)).toHaveLength(0);
+    expect(checkPatches(calls, 65)).toHaveLength(0);
+    expect(checkPatches(calls, 66)).toHaveLength(1);
+  });
+
+  it("leaves another app's bugbot check alone (R1-N2)", async () => {
+    const world = makeWorld({
+      checkRuns: [stale(60, "50", { app: OTHER_APP_ID }), stale(63, "50")],
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkPatches(calls, 60)).toHaveLength(0);
+    expect(checkPatches(calls, 63)).toHaveLength(1);
+  });
+
+  it("leaves a run with no app alone (R1-N2)", async () => {
+    const noApp = { id: 67, name: "bugbot", external_id: "50", status: "in_progress" };
+    const world = makeWorld({ checkRuns: [noApp] });
+    const { calls } = await runReview(world);
+
+    expect(checkPatches(calls, 67)).toHaveLength(0);
+  });
+
+  it("still completes the next stale run when one PATCH is refused (R1-N2)", async () => {
+    const world = makeWorld({
+      checkRuns: [stale(60, "50"), stale(63, "50")],
+      finishCheckStatusById: { 60: 403 },
+    });
+    const { result, calls, logs } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkPatches(calls, 60)).toHaveLength(1);
+    const next = checkPatches(calls, 63);
+    expect(next).toHaveLength(1);
+    expect((next[0]!.body as { conclusion: string }).conclusion).toBe(
+      "neutral",
+    );
+    expect(
+      logs.some((line) => line.includes("could not complete stale check run 60")),
+    ).toBe(true);
+  });
+
+  it("never PATCHes a completed run (F2)", async () => {
+    const world = makeWorld({
+      checkRuns: [
+        stale(64, "50", { status: "completed" }),
+        stale(65, "111", { status: "completed" }),
+        stale(66, "50", { status: "queued" }),
+      ],
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkPatches(calls, 64)).toHaveLength(0);
+    expect(checkPatches(calls, 65)).toHaveLength(0);
+    expect(checkPatches(calls, 66)).toHaveLength(0);
+  });
+
+  it("skips the cleanup with a log line when the check's app is unknown (R1-N2)", async () => {
+    const world = makeWorld({
+      startCheckApp: null,
+      checkRuns: [stale(63, "50")],
+    });
+    const { result, calls, logs } = await runReview(world);
+
+    expect(result.conclusion).toBe("success");
+    expect(checkLookups(calls)).toHaveLength(0);
+    expect(checkPatches(calls, 63)).toHaveLength(0);
+    expect(logs.some((line) => line.includes("app is unknown"))).toBe(true);
   });
 
   it("finishes every in_progress run for this run id when the handle is lost", async () => {
@@ -1395,6 +1651,26 @@ describe("runPrReview contents reads", () => {
     expect(
       callsWhere(calls, (call) => call.path.includes("back%5Cslash.ts")),
     ).toHaveLength(0);
+  });
+
+  it("prints no line that starts with :: for a hostile file name (R1-N3, L1)", async () => {
+    const world = makeWorld({
+      diff: HOSTILE_DIFF,
+      files: { "src/cart.ts": HEAD_CART },
+    });
+    const { result, logs } = await runReview(world);
+
+    expect(result).toMatchObject({ exitCode: 0, conclusion: "success" });
+    const skipping = logs.filter((line) => line.includes("skipping"));
+    expect(skipping).toHaveLength(1);
+    expect(skipping[0]).toContain("x?::warning::pwned\\y.ts");
+    for (const line of logs) {
+      for (const part of line.split(/\r\n|\r|\n/)) {
+        expect(part.startsWith("::")).toBe(false);
+      }
+      expect(/[\u0000-\u0009\u000b-\u001f]/.test(line)).toBe(false);
+      expect(line).not.toContain(HOSTILE_NAME);
+    }
   });
 
   it("hashes a LEFT finding with the base content symbol (M19)", async () => {
