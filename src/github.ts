@@ -12,13 +12,14 @@ import type { FetchLike, Sleep } from "./model.js";
 
 /**
  * GitHub output: inline comments, the summary comment, the `bugbot` check run
- * and reply/resolve for fixed threads.
+ * and replies for fixed threads.
  *
  * Every request goes through `request()`, which checks a small allowlist
  * BEFORE calling fetch. There is deliberately no code path that can build a
  * merge, approve, dismiss or requested-reviewer request: those routes are not
- * in the allowlist, review events must be exactly `COMMENT`, and only the two
- * GraphQL documents below are accepted. Bugbot stays comment-only.
+ * in the allowlist, review events must be exactly `COMMENT`, and only the one
+ * GraphQL document below is accepted. Bugbot stays comment-only: it replies
+ * that a thread looks fixed and leaves resolving to a person.
  */
 
 const DEFAULT_BASE_URL = "https://api.github.com";
@@ -78,17 +79,8 @@ const REVIEW_THREADS_QUERY = `query BugbotReviewThreads($owner: String!, $name: 
   }
 }`;
 
-const RESOLVE_REVIEW_THREAD_MUTATION = `mutation BugbotResolveReviewThread($threadId: ID!) {
-  resolveReviewThread(input: {threadId: $threadId}) {
-    thread { id isResolved }
-  }
-}`;
-
-/** The only GraphQL documents this file may send. */
-const GRAPHQL_DOCUMENTS: ReadonlySet<string> = new Set([
-  REVIEW_THREADS_QUERY,
-  RESOLVE_REVIEW_THREAD_MUTATION,
-]);
+/** The only GraphQL document this file may send. */
+const GRAPHQL_DOCUMENTS: ReadonlySet<string> = new Set([REVIEW_THREADS_QUERY]);
 
 type HttpMethod = "GET" | "POST" | "PATCH";
 
@@ -727,7 +719,11 @@ export interface BugbotThread {
   category: Category | null;
   reason: string;
   state: "open" | "resolved" | "skipped";
-  /** True when a bot reply already starts "Fixed in " (S6A-N9). */
+  /**
+   * True when a bot reply already starts "Fixed in " (older passes) or
+   * "Looks fixed as of " (step 8f). Such a thread is marked fixed: it is not
+   * re-checked, not counted open, and never gets a second fixed reply.
+   */
   hasFixedReply?: boolean;
   /**
    * The first comment's original diff hunk, when GitHub returned one. Optional
@@ -767,8 +763,9 @@ export interface SummaryComment {
   body: string;
 }
 
-export interface ResolveThreadsResult {
-  resolved: number;
+export interface ReplyThreadsResult {
+  /** Replies posted this pass; each one marks its thread fixed for a person. */
+  replied: number;
   failed: number;
   planned: readonly PlannedRequest[];
 }
@@ -799,7 +796,8 @@ export interface ReviewSummary {
    */
   openComments: number | "unknown";
   skipped: SkippedCounts;
-  resolved: number;
+  /** Replies posted this pass, each marking a fixed thread for a person. */
+  markedFixed: number;
   /** Findings that did not land as inline comments (S6B-B1). */
   failed?: number;
   truncated: readonly string[];
@@ -1340,7 +1338,7 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
         .join(", ")}`,
     );
   }
-  lines.push(`- Resolved: ${summary.resolved}`);
+  lines.push(`- Marked fixed this pass: ${summary.markedFixed}`);
 
   if (summary.error !== undefined && summary.error.trim() !== "") {
     lines.push(
@@ -1385,21 +1383,22 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
 }
 
 /**
- * Replies "Fixed in <sha7>." to each open thread Bugbot owns, then resolves it
- * with GraphQL. Resolved and skipped threads are untouched. One failure is
- * logged and the rest continue.
+ * Replies `Looks fixed as of <sha7>.` to each open thread Bugbot owns. It never
+ * resolves a thread; a person does that with one click. Resolved, skipped and
+ * already-marked threads are untouched, so no thread gets a second fixed reply.
+ * One failure is logged and the rest continue.
  */
-export async function resolveFixedThreads(
+export async function replyFixedThreads(
   options: GitHubOptions,
   threads: readonly BugbotThread[],
   fixedSha: string,
-): Promise<ResolveThreadsResult> {
+): Promise<ReplyThreadsResult> {
   validateOptions(options);
   validateHeadSha(fixedSha, "fixedSha");
   const context = transport(options);
   const log = logger(options);
   const planned: PlannedRequest[] = [];
-  let resolved = 0;
+  let replied = 0;
   let failed = 0;
 
   for (const thread of threads) {
@@ -1408,8 +1407,8 @@ export async function resolveFixedThreads(
     }
 
     try {
-      // A half-finished earlier pass may already have replied "Fixed in ...".
-      // Only resolve then; do not send a second reply (S6A-N9).
+      // A thread already marked fixed by an earlier reply never gets a second
+      // one, whatever wording that reply used (S6A-N9, S8F).
       if (thread.hasFixedReply !== true) {
         const reply = await request(context, {
           method: "POST",
@@ -1418,22 +1417,15 @@ export async function resolveFixedThreads(
             options.prNumber,
             `comments/${thread.firstCommentId}/replies`,
           ),
-          body: { body: `Fixed in ${fixedSha.slice(0, 7)}.` },
+          body: { body: `Looks fixed as of ${fixedSha.slice(0, 7)}.` },
         });
         planned.push(reply.plan);
+        replied += 1;
       }
-
-      const mutation = await graphqlRequest(
-        context,
-        RESOLVE_REVIEW_THREAD_MUTATION,
-        { threadId: thread.threadId },
-      );
-      planned.push(mutation.planned);
-      resolved += 1;
     } catch (error) {
       failed += 1;
       log(
-        `Bugbot could not resolve ${thread.threadId}: ${safeErrorMessage(
+        `Bugbot could not reply on ${thread.threadId}: ${safeErrorMessage(
           error,
           options.token,
         )}`,
@@ -1441,7 +1433,7 @@ export async function resolveFixedThreads(
     }
   }
 
-  return { resolved, failed, planned };
+  return { replied, failed, planned };
 }
 
 // --- transport ------------------------------------------------------------
@@ -2065,11 +2057,15 @@ function parseThreadNode(value: unknown, botLogin: string): BugbotThread | null 
       !isBotAuthor(asRecord(reply.author), botLogin, "graphql") &&
       isSkipReply(asString(reply.body) ?? ""),
   );
-  const hasFixedReply = replies.some(
-    (reply) =>
-      isBotAuthor(asRecord(reply.author), botLogin, "graphql") &&
-      (asString(reply.body) ?? "").trimStart().startsWith("Fixed in "),
-  );
+  const hasFixedReply = replies.some((reply) => {
+    if (!isBotAuthor(asRecord(reply.author), botLogin, "graphql")) {
+      return false;
+    }
+    const text = (asString(reply.body) ?? "").trimStart();
+    return (
+      text.startsWith("Fixed in ") || text.startsWith("Looks fixed as of ")
+    );
+  });
 
   const isResolved = node.isResolved === true;
   const parsed = parseThreadBody(body);

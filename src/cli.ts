@@ -16,7 +16,7 @@ import {
   readRepositoryFile,
   redact,
   reportSkipped,
-  resolveFixedThreads,
+  replyFixedThreads,
   safeDisplay,
   startCheck,
   upsertSummary,
@@ -973,7 +973,7 @@ export async function runPrReview(
 
   let posted = 0;
   let failedToPost = 0;
-  let resolved = 0;
+  let markedFixed = 0;
   let openThreads = 0;
   /** False until the thread list is read; the summary must not report 0 then. */
   let threadsListed = false;
@@ -1182,7 +1182,11 @@ export async function runPrReview(
       const threads = await listBugbotThreads(github);
       threadsListed = true;
       threadRunIds = threads.map((thread) => thread.marker.runId);
-      openThreads = threads.filter((thread) => thread.state === "open").length;
+      // A thread with a fixed reply is marked fixed even while it is still
+      // unresolved: a person resolves it, and it must not count as open.
+      openThreads = threads.filter(
+        (thread) => thread.state === "open" && thread.hasFixedReply !== true,
+      ).length;
       // A missing category is mapped to "bug" so the marker hash can still
       // match; the empty symbol makes the fuzzy branch effectively hash-only.
       const existing: ExistingFinding[] = threads.map((thread) => ({
@@ -1272,7 +1276,7 @@ export async function runPrReview(
       }
 
       // A thread whose finding the main call re-reported this pass is counted
-      // as a duplicate by classifyFindings. It must not be resolved by the
+      // as a duplicate by classifyFindings. It must not be marked fixed by the
       // re-check (S6B-N5b). Ask the classifier per eligible thread, with the
       // findings narrowed to that thread's file and category, so the decision
       // uses the exact hash/fuzzy logic without rescanning every file per
@@ -1340,12 +1344,14 @@ export async function runPrReview(
       // older commit. At most 15, oldest first by first comment id. Outdated
       // threads (line null, originalLine set) are included and anchored on
       // originalLine; a thread with neither line cannot be located and stays
-      // skipped, and a thread the main call just re-reported must stay open
-      // (S6B-N5, S8D-B1).
+      // skipped, a thread the main call just re-reported must stay open
+      // (S6B-N5, S8D-B1), and a thread already marked fixed by a reply is
+      // skipped so it costs no repeat tokens (8f).
       const targets = threads
         .filter(
           (thread) =>
             thread.state === "open" &&
+            thread.hasFixedReply !== true &&
             changedPaths.has(thread.path) &&
             thread.marker.sha !== github.headSha &&
             (thread.line !== null || thread.originalLine !== null) &&
@@ -1416,14 +1422,14 @@ export async function runPrReview(
               fixed.has(thread.threadId),
             );
             if (fixedThreads.length > 0) {
-              const resolvedResult = await resolveFixedThreads(
+              const replyResult = await replyFixedThreads(
                 github,
                 fixedThreads,
                 github.headSha,
               );
-              resolved = resolvedResult.resolved;
+              markedFixed = replyResult.replied;
               if (dryRun) {
-                for (const plan of resolvedResult.planned) {
+                for (const plan of replyResult.planned) {
                   log(planLine(plan));
                 }
               }
@@ -1478,11 +1484,11 @@ export async function runPrReview(
     // over the last known count. Keep the previous summary's value, or say
     // `unknown` when there is none.
     openComments: threadsListed
-      ? Math.max(0, openThreads - resolved) + posted
+      ? Math.max(0, openThreads - markedFixed) + posted
       : (parseOpenComments(previous?.body ?? null) ?? "unknown"),
     failed: failedToPost,
     skipped: skippedBuckets,
-    resolved,
+    markedFixed,
     truncated,
     ...(runs.length > 0 ? { runs } : {}),
     ...(error === null ? {} : { error }),
@@ -1605,7 +1611,7 @@ export async function runPrReview(
   log(
     `Bugbot review complete: pass ${passCount}, ${posted} inline comment${
       posted === 1 ? "" : "s"
-    }, ${resolved} resolved.`,
+    }, ${markedFixed} marked fixed.`,
   );
   return { exitCode: 0, conclusion: "success" };
 }

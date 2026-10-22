@@ -7,7 +7,9 @@ can tell when a review pass is done.
 
 **Bugbot is comment-only.** It never approves, never requests changes and
 never blocks, fails or merges a pull request. If it cannot review, the check
-goes `neutral` and the summary says why.
+goes `neutral` and the summary says why. When a re-check proves a finding is
+gone, Bugbot replies `Looks fixed as of <sha7>.` and leaves resolving the
+thread to a person.
 
 Status: step 8, cross-pass dedupe, incremental review and honest summary
 counts. `review --local` builds a review from a diff file and prints the
@@ -23,7 +25,7 @@ findings plus the comments that would post; it never posts.
 - `src/filter.ts` - finding schema, confidence/severity/triage gate, hash,
   cross-pass dedupe, comment body and marker
 - `src/gate.ts` - pure draft/fork gate shared by the workflow and the CLI
-- `src/github.ts` - inline comments, summary, check run, reply/resolve
+- `src/github.ts` - inline comments, summary, check run, replies
 - `src/cli.ts` - `bugbot review|status`
 - `prompts/` - pstack review texts, vendored with source headers (MIT)
 - `scripts/sync-prompts.sh` - manual refresh of `prompts/` from a local pstack

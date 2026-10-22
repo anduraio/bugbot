@@ -23,7 +23,7 @@ import {
   renderSummary,
   safeDisplay,
   reportSkipped,
-  resolveFixedThreads,
+  replyFixedThreads,
   startCheck,
   upsertSummary,
   type BugbotThread,
@@ -234,7 +234,7 @@ function reviewSummary(overrides: Partial<ReviewSummary> = {}): ReviewSummary {
     posted: 3,
     openComments: 7,
     skipped: { duplicate: 1, belowConfidence: 1 },
-    resolved: 1,
+    markedFixed: 1,
     truncated: [],
     ...overrides,
   };
@@ -328,7 +328,7 @@ describe("assertAllowedRequest", () => {
     }
   });
 
-  it("rejects GraphQL bodies that are not one of the two known documents", () => {
+  it("rejects GraphQL bodies that are not the one known document", () => {
     expect(() => assertAllowedRequest({ method: "POST", path: "/graphql" })).toThrow(
       /GraphQL operation not allowed/,
     );
@@ -959,7 +959,7 @@ describe("safe file names in output (R1-N3)", () => {
         posted: 0,
         openComments: 0,
         skipped: {},
-        resolved: 0,
+        markedFixed: 0,
         truncated: [hostile],
       },
       TOKEN,
@@ -1021,7 +1021,8 @@ describe("upsertSummary", () => {
     expect(body).toContain("- Posted this pass: 3");
     expect(body).toContain("- Open Bugbot comments: 7");
     expect(body).toContain("- Skipped: 1 duplicate, 1 below confidence");
-    expect(body).toContain("- Resolved: 1");
+    expect(body).toContain("- Marked fixed this pass: 1");
+    expect(body).not.toContain("- Resolved");
     expect(body.trimEnd().endsWith("Bugbot only comments; it never approves or blocks.")).toBe(
       true,
     );
@@ -1109,20 +1110,16 @@ describe("upsertSummary", () => {
   });
 });
 
-describe("resolveFixedThreads", () => {
-  it("replies and resolves only open threads, leaving skipped and resolved alone", async () => {
+describe("replyFixedThreads", () => {
+  it("replies only to open threads and never sends a GraphQL request", async () => {
     const { fetchFn, calls } = recording((call) => {
       if (call.path.endsWith("/replies")) {
         return json({ id: 1 }, 201);
       }
-      return json({
-        data: {
-          resolveReviewThread: { thread: { id: "PRRT_1", isResolved: true } },
-        },
-      });
+      throw new Error("no GraphQL request expected");
     });
 
-    const result = await resolveFixedThreads(
+    const result = await replyFixedThreads(
       options({ fetch: fetchFn }),
       [
         bugbotThread(),
@@ -1137,18 +1134,14 @@ describe("resolveFixedThreads", () => {
       HEAD_SHA,
     );
 
-    expect(result).toMatchObject({ resolved: 1, failed: 0 });
-    expect(calls).toHaveLength(2);
+    expect(result).toMatchObject({ replied: 1, failed: 0 });
+    expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.path).toBe("/repos/o/r/pulls/1/comments/1001/replies");
-    expect(calls[0]?.body).toEqual({ body: "Fixed in 0123456." });
-    expect(calls[1]?.path).toBe("/graphql");
-    expect((calls[1]?.body as { variables: { threadId: string } }).variables).toEqual({
-      threadId: "PRRT_1",
-    });
+    expect(calls[0]?.body).toEqual({ body: "Looks fixed as of 0123456." });
   });
 
-  it("continues after one failing reply", async () => {
+  it("continues after one failing reply and logs the thread id", async () => {
     const logs: string[] = [];
     const { fetchFn, calls } = recording((call) => {
       if (call.path.endsWith("/replies")) {
@@ -1157,14 +1150,10 @@ describe("resolveFixedThreads", () => {
         }
         return json({ id: 2 }, 201);
       }
-      return json({
-        data: {
-          resolveReviewThread: { thread: { id: "PRRT_2", isResolved: true } },
-        },
-      });
+      throw new Error("no GraphQL request expected");
     });
 
-    const result = await resolveFixedThreads(
+    const result = await replyFixedThreads(
       options({ fetch: fetchFn, log: (line) => logs.push(line) }),
       [
         bugbotThread({ threadId: "PRRT_1", firstCommentId: 1001 }),
@@ -1173,9 +1162,27 @@ describe("resolveFixedThreads", () => {
       HEAD_SHA,
     );
 
-    expect(result).toMatchObject({ resolved: 1, failed: 1 });
-    expect(calls).toHaveLength(3);
-    expect(logs[0]).toContain("PRRT_1");
+    expect(result).toMatchObject({ replied: 1, failed: 1 });
+    expect(calls).toHaveLength(2);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("Bugbot could not reply on PRRT_1:");
+    expect(logs[0]).toContain("500");
+    expect(logs[0]).not.toContain(TOKEN);
+  });
+
+  it("never posts a second fixed reply on a thread already marked fixed", async () => {
+    const { fetchFn, calls } = recording(() => {
+      throw new Error("no request expected");
+    });
+
+    const result = await replyFixedThreads(
+      options({ fetch: fetchFn }),
+      [bugbotThread({ hasFixedReply: true })],
+      HEAD_SHA,
+    );
+
+    expect(result).toMatchObject({ replied: 0, failed: 0 });
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -1398,7 +1405,7 @@ describe("retry safety (S6A-B1)", () => {
     );
     const logs: string[] = [];
 
-    const result = await resolveFixedThreads(
+    const result = await replyFixedThreads(
       options({
         fetch: fetchFn,
         sleep: async () => {},
@@ -1408,7 +1415,7 @@ describe("retry safety (S6A-B1)", () => {
       HEAD_SHA,
     );
 
-    expect(result).toMatchObject({ resolved: 0, failed: 1 });
+    expect(result).toMatchObject({ replied: 0, failed: 1 });
     expect(calls).toHaveLength(1);
     expect(logs[0]).toContain("PRRT_1");
     expect(logs[0]).toContain("504");
@@ -1423,29 +1430,6 @@ describe("retry safety (S6A-B1)", () => {
       startCheck(options({ fetch: fetchFn, sleep: async () => {} })),
     ).rejects.toMatchObject({ name: "GitHubError", status: 504 });
     expect(calls).toHaveLength(1);
-  });
-
-  it("sends the GraphQL mutation exactly once on a 504", async () => {
-    const { fetchFn, calls } = recording((call) =>
-      call.path.endsWith("/replies")
-        ? json({ id: 1 }, 201)
-        : json({ message: "gateway timeout" }, 504),
-    );
-    const logs: string[] = [];
-
-    const result = await resolveFixedThreads(
-      options({
-        fetch: fetchFn,
-        sleep: async () => {},
-        log: (line) => logs.push(line),
-      }),
-      [bugbotThread()],
-      HEAD_SHA,
-    );
-
-    expect(result).toMatchObject({ resolved: 0, failed: 1 });
-    expect(calls).toHaveLength(2);
-    expect(logs[0]).toContain("504");
   });
 
   it("still retries a 504 on a GET", async () => {
@@ -1569,9 +1553,12 @@ describe("dry run", () => {
     expect(review.posted).toBe(1);
     expect(review.planned[0]?.body).toMatchObject({ event: "COMMENT" });
 
-    const resolved = await resolveFixedThreads(dry, [bugbotThread()], HEAD_SHA);
-    expect(resolved).toMatchObject({ resolved: 1, failed: 0 });
-    expect(resolved.planned).toHaveLength(2);
+    const replied = await replyFixedThreads(dry, [bugbotThread()], HEAD_SHA);
+    expect(replied).toMatchObject({ replied: 1, failed: 0 });
+    expect(replied.planned).toHaveLength(1);
+    expect(replied.planned[0]?.body).toEqual({
+      body: "Looks fixed as of 0123456.",
+    });
 
     expect(calls).toHaveLength(0);
   });
@@ -1617,7 +1604,7 @@ describe("dry run", () => {
     expect(real.calls[0]?.body).toEqual(dry.planned[0]?.body);
   });
 
-  it("reads review threads but never resolves them (S6A-B3)", async () => {
+  it("reads review threads and plans a reply without resolving (S6A-B3, S8F)", async () => {
     const { fetchFn, calls } = recording((call) => {
       if (call.path === "/graphql") {
         return threadsResponse([threadNode([botComment()])]);
@@ -1632,9 +1619,12 @@ describe("dry run", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.path).toBe("/graphql");
 
-    const resolved = await resolveFixedThreads(dry, threads, HEAD_SHA);
-    expect(resolved).toMatchObject({ resolved: 1, failed: 0 });
-    expect(resolved.planned).toHaveLength(2);
+    const replied = await replyFixedThreads(dry, threads, HEAD_SHA);
+    expect(replied).toMatchObject({ replied: 1, failed: 0 });
+    expect(replied.planned).toHaveLength(1);
+    expect(replied.planned[0]?.path).toBe(
+      "/repos/o/r/pulls/1/comments/1001/replies",
+    );
     expect(calls).toHaveLength(1);
   });
 });
@@ -1644,13 +1634,6 @@ describe("write surface", () => {
     const { fetchFn, calls } = recording((call) => {
       if (call.method === "GET") {
         return json([]);
-      }
-      if (call.path === "/graphql") {
-        return json({
-          data: {
-            resolveReviewThread: { thread: { id: "PRRT_1", isResolved: true } },
-          },
-        });
       }
       if (call.path.endsWith("/check-runs")) {
         return json({ id: 7 }, 201);
@@ -1664,7 +1647,7 @@ describe("write surface", () => {
     await reportSkipped(base, "skipped");
     await postReview(base, [plannedComment()]);
     await upsertSummary(base, reviewSummary());
-    await resolveFixedThreads(base, [bugbotThread()], HEAD_SHA);
+    await replyFixedThreads(base, [bugbotThread()], HEAD_SHA);
 
     expect(calls.length).toBeGreaterThan(0);
     for (const call of calls) {
@@ -2505,7 +2488,7 @@ describe("base and GraphQL URLs (S6A-N6)", () => {
 });
 
 describe("review-threads query retries (R1-N1)", () => {
-  it("retries a 502 on the thread query but not on the resolve mutation", async () => {
+  it("retries a 502 on the thread query but not on a reply POST", async () => {
     let attempts = 0;
     const query = recording((call) => {
       attempts += 1;
@@ -2524,14 +2507,14 @@ describe("review-threads query retries (R1-N1)", () => {
       "reviewThreads",
     );
 
-    const mutation = recording(() => json({ message: "gateway" }, 502));
-    const result = await resolveFixedThreads(
-      options({ fetch: mutation.fetchFn, sleep: async () => {} }),
-      [bugbotThread({ hasFixedReply: true })],
+    const reply = recording(() => json({ message: "gateway" }, 502));
+    const result = await replyFixedThreads(
+      options({ fetch: reply.fetchFn, sleep: async () => {} }),
+      [bugbotThread()],
       HEAD_SHA,
     );
-    expect(result).toMatchObject({ resolved: 0, failed: 1 });
-    expect(mutation.calls).toHaveLength(1);
+    expect(result).toMatchObject({ replied: 0, failed: 1 });
+    expect(reply.calls).toHaveLength(1);
   });
 
   it("retries a timed-out thread query like a GET", async () => {
@@ -2556,31 +2539,23 @@ describe("review-threads query retries (R1-N1)", () => {
   });
 });
 
-describe("resolve idempotency (S6A-N9)", () => {
-  it("resolves a thread that already has a bot Fixed in reply without replying", async () => {
-    const { fetchFn, calls } = recording((call) => {
-      if (call.path === "/graphql") {
-        return json({
-          data: {
-            resolveReviewThread: { thread: { id: "PRRT_1", isResolved: true } },
-          },
-        });
-      }
-      return json({ id: 1 });
+describe("fixed-reply idempotency (S6A-N9, S8F)", () => {
+  it("does not reply to a thread already marked fixed", async () => {
+    const { fetchFn, calls } = recording(() => {
+      throw new Error("no request expected");
     });
 
-    const result = await resolveFixedThreads(
+    const result = await replyFixedThreads(
       options({ fetch: fetchFn }),
       [bugbotThread({ hasFixedReply: true })],
       HEAD_SHA,
     );
 
-    expect(result).toMatchObject({ resolved: 1, failed: 0 });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.path).toBe("/graphql");
+    expect(result).toMatchObject({ replied: 0, failed: 0 });
+    expect(calls).toHaveLength(0);
   });
 
-  it("sets hasFixedReply from a bot reply when listing threads", async () => {
+  it("reads the old Fixed in wording as already marked fixed", async () => {
     const { fetchFn } = recording(() =>
       threadsResponse([
         threadNode([botComment(), comment(BOT, "Fixed in abc1234.")]),
@@ -2589,6 +2564,28 @@ describe("resolve idempotency (S6A-N9)", () => {
 
     const threads = await listBugbotThreads(options({ fetch: fetchFn }));
     expect(threads[0]?.hasFixedReply).toBe(true);
+  });
+
+  it("reads the new Looks fixed as of wording as already marked fixed", async () => {
+    const { fetchFn } = recording(() =>
+      threadsResponse([
+        threadNode([botComment(), comment(BOT, "Looks fixed as of abc1234.")]),
+      ]),
+    );
+
+    const threads = await listBugbotThreads(options({ fetch: fetchFn }));
+    expect(threads[0]?.hasFixedReply).toBe(true);
+  });
+
+  it("does not treat a human reply in either wording as the bot's own (M28)", async () => {
+    for (const wording of ["Fixed in abc1234.", "Looks fixed as of abc1234."]) {
+      const { fetchFn } = recording(() =>
+        threadsResponse([threadNode([botComment(), comment("a-human", wording)])]),
+      );
+
+      const threads = await listBugbotThreads(options({ fetch: fetchFn }));
+      expect(threads[0]?.hasFixedReply).toBe(false);
+    }
   });
 });
 

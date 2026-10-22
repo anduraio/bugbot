@@ -395,6 +395,8 @@ interface World {
   modelInvalidJson: boolean;
   recheckContent: string;
   recheckStatus: number;
+  /** First comment ids whose reply POST answers 500. */
+  replyFailures: number[];
   startCheckHangs: boolean;
   startCheckStatus: number;
   finishCheckStatuses: number[];
@@ -453,6 +455,7 @@ function makeWorld(overrides: Partial<World> = {}): World {
     modelInvalidJson: false,
     recheckContent: JSON.stringify({ results: [] }),
     recheckStatus: 200,
+    replyFailures: [],
     startCheckHangs: false,
     startCheckStatus: 200,
     finishCheckStatuses: [],
@@ -701,6 +704,12 @@ function recordedFetch(world: World): {
       call.method === "POST" &&
       /^\/repos\/o\/r\/pulls\/1\/comments\/[0-9]+\/replies$/.test(call.path)
     ) {
+      const id = Number(
+        /\/comments\/([0-9]+)\/replies$/.exec(call.path)?.[1] ?? 0,
+      );
+      if (world.replyFailures.includes(id)) {
+        return json({ message: "reply rejected" }, 500);
+      }
       return json({ id: 901 }, 201);
     }
 
@@ -716,15 +725,6 @@ function recordedFetch(world: World): {
                   nodes: world.threads,
                 },
               },
-            },
-          },
-        });
-      }
-      if (query.includes("resolveReviewThread")) {
-        return json({
-          data: {
-            resolveReviewThread: {
-              thread: { id: "PRRT_1", isResolved: true },
             },
           },
         });
@@ -825,13 +825,13 @@ function replyCalls(calls: readonly Recorded[]): Recorded[] {
   return callsWhere(calls, (call) => call.path.includes("/comments/") && call.path.endsWith("/replies"));
 }
 
-function resolveCalls(calls: readonly Recorded[]): Recorded[] {
+function mutationCalls(calls: readonly Recorded[]): Recorded[] {
   return callsWhere(
     calls,
     (call) =>
       call.path === "/graphql" &&
-      String((call.body as { query?: string }).query ?? "").includes(
-        "resolveReviewThread",
+      /\bmutation\b/.test(
+        String((call.body as { query?: string }).query ?? ""),
       ),
   );
 }
@@ -1164,7 +1164,7 @@ describe("runPrReview step 8c dedupe and incremental scope", () => {
     expect(second.result.conclusion).toBe("success");
     expect(reviewCalls(second.calls)).toHaveLength(0);
     expect(recheckModelCalls(second.calls)).toHaveLength(0);
-    expect(resolveCalls(second.calls)).toHaveLength(0);
+    expect(mutationCalls(second.calls)).toHaveLength(0);
     const summary = summaryBody(world);
     expect(summary).toContain("- Posted this pass: 0");
     expect(summary).toContain("- Open Bugbot comments: 1");
@@ -1183,7 +1183,7 @@ describe("runPrReview step 8c dedupe and incremental scope", () => {
     expect(summaryBody(world)).not.toContain("out of scope");
   });
 
-  it("posts the sibling template bug and resolves its fixed neighbour (S8D-R1-N1)", async () => {
+  it("posts the sibling template bug and replies to its fixed neighbour (S8D-R1-N1)", async () => {
     const fixedReason =
       "`user.profile` can be undefined here, so reading `user.profile.name` throws a TypeError.";
     const newReason =
@@ -1208,7 +1208,7 @@ describe("runPrReview step 8c dedupe and incremental scope", () => {
 
     expect(postedLines(calls).map((comment) => comment.line)).toEqual([4]);
     expect(recheckModelCalls(calls)).toHaveLength(1);
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
     expect(summaryBody(world)).toContain("- Posted this pass: 1");
     expect(summaryBody(world)).not.toContain("duplicate");
   });
@@ -1269,10 +1269,10 @@ describe("runPrReview step 8c dedupe and incremental scope", () => {
 
     // Without the main wiring the real sibling bug (xss next to the fixed
     // sqli thread) is dropped; without the re-check wiring the fixed thread
-    // is treated as re-reported and never resolves.
+    // is treated as re-reported and never marked fixed.
     expect(postedLines(calls).map((comment) => comment.line)).toEqual([3]);
     expect(recheckModelCalls(calls)).toHaveLength(1);
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
   it("posts only in-hunk findings on synchronize when before is an ancestor", async () => {
@@ -1713,7 +1713,7 @@ describe("re-check prompt escaping (M35)", () => {
   });
 });
 
-describe("runPrReview re-check and resolve", () => {
+describe("runPrReview re-check and replies", () => {
   async function fixedWorld(
     confidence: number,
     fixed = true,
@@ -1735,7 +1735,7 @@ describe("runPrReview re-check and resolve", () => {
     return world;
   }
 
-  it("replies Fixed in <sha7> and resolves a fixed thread at 0.9", async () => {
+  it("replies Looks fixed as of <sha7> and leaves a fixed thread open at 0.9", async () => {
     const world = await fixedWorld(0.9);
     const { result, calls } = await runReview(world, {}, {}, "333");
 
@@ -1743,13 +1743,13 @@ describe("runPrReview re-check and resolve", () => {
     const replies = replyCalls(calls);
     expect(replies).toHaveLength(1);
     expect((replies[0]!.body as { body: string }).body).toBe(
-      `Fixed in ${HEAD.slice(0, 7)}.`,
+      `Looks fixed as of ${HEAD.slice(0, 7)}.`,
     );
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
     expect(summaryBody(world)).toContain("- Passes: 3");
-    expect(summaryBody(world)).toContain("- Resolved: 1");
-    // The resolved thread is no longer open this pass, so the summary count
-    // must drop it rather than keeping the pre-resolve list length.
+    expect(summaryBody(world)).toContain("- Marked fixed this pass: 1");
+    // The thread is still unresolved, but it has a fixed reply: it is marked
+    // fixed, so it must not count as open.
     expect(summaryBody(world)).toContain("- Open Bugbot comments: 0");
 
     const finish = callsWhere(
@@ -1759,47 +1759,47 @@ describe("runPrReview re-check and resolve", () => {
     expect((finish[0]!.body as { conclusion: string }).conclusion).toBe("success");
   });
 
-  it("does not resolve or reply at 0.7 confidence", async () => {
+  it("does not reply at 0.7 confidence", async () => {
     const world = await fixedWorld(0.7);
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
-    expect(summaryBody(world)).toContain("- Resolved: 0");
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Marked fixed this pass: 0");
   });
 
-  it("does not resolve at 0.79 confidence (M24 boundary)", async () => {
+  it("does not reply at 0.79 confidence (M24 boundary)", async () => {
     const world = await fixedWorld(0.79);
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
-    expect(summaryBody(world)).toContain("- Resolved: 0");
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Marked fixed this pass: 0");
   });
 
-  it("resolves at exactly 0.8 confidence (M24 boundary)", async () => {
+  it("replies at exactly 0.8 confidence (M24 boundary)", async () => {
     const world = await fixedWorld(0.8);
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
     expect(replyCalls(calls)).toHaveLength(1);
-    expect(resolveCalls(calls)).toHaveLength(1);
-    expect(summaryBody(world)).toContain("- Resolved: 1");
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Marked fixed this pass: 1");
   });
 
-  it("does not resolve when the model says fixed:false at 0.9 (M23)", async () => {
+  it("does not reply when the model says fixed:false at 0.9 (M23)", async () => {
     const world = await fixedWorld(0.9, false);
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
-    expect(summaryBody(world)).toContain("- Resolved: 0");
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Marked fixed this pass: 0");
   });
 
-  it("does not treat a human Fixed in reply as the bot's own (M28)", async () => {
+  it("does not treat a human fixed reply as the bot's own (M28)", async () => {
     const world = makeWorld();
     const first = await runReview(world);
     const firstBody = (
@@ -1822,10 +1822,10 @@ describe("runPrReview re-check and resolve", () => {
     expect(result.conclusion).toBe("success");
     // A human reply must not satisfy S6A-N9, so the bot still replies once.
     expect(replyCalls(calls)).toHaveLength(1);
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
-  it("re-checks an outdated thread at originalLine and resolves it (S8D-B1)", async () => {
+  it("re-checks an outdated thread at originalLine and replies (S8D-B1)", async () => {
     const world = makeWorld({
       diff: PAGINATION_DIFF,
       files: { "src/pagination.ts": PAGINATION_HEAD },
@@ -1863,9 +1863,9 @@ describe("runPrReview re-check and resolve", () => {
     expect(asked).toContain("commit it was posted on");
     expect(replyCalls(calls)).toHaveLength(1);
     expect((replyCalls(calls)[0]!.body as { body: string }).body).toBe(
-      `Fixed in ${HEAD.slice(0, 7)}.`,
+      `Looks fixed as of ${HEAD.slice(0, 7)}.`,
     );
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
   it("keeps an outdated thread open when the re-check says not fixed", async () => {
@@ -1900,7 +1900,7 @@ describe("runPrReview re-check and resolve", () => {
     expect(result.conclusion).toBe("success");
     expect(recheckModelCalls(calls)).toHaveLength(1);
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
   it("never re-checks an outdated thread the main call re-reported", async () => {
@@ -1927,7 +1927,7 @@ describe("runPrReview re-check and resolve", () => {
     expect(reviewCalls(calls)).toHaveLength(0);
     expect(recheckModelCalls(calls)).toHaveLength(0);
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
     expect(summaryBody(world)).toContain("- Skipped: 1 duplicate");
   });
 
@@ -1993,7 +1993,7 @@ describe("runPrReview re-check and resolve", () => {
 
     expect(result.conclusion).toBe("success");
     expect(recheckModelCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
   it("gives a long outdated file a window around originalLine, a short one the whole file", async () => {
@@ -2205,9 +2205,9 @@ describe("runPrReview re-check and resolve", () => {
       Array.from({ length: ids.length }, (_, index) => `PRRT_${index}`),
     );
     expect(asked).not.toContain(`id="PRRT_${ids.length}"`);
-    // Only the threads in the request resolve; the rest stay open.
+    // Only the threads in the request get a reply; the rest stay open.
     expect(replyCalls(calls)).toHaveLength(ids.length);
-    expect(resolveCalls(calls)).toHaveLength(ids.length);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
   it("asks about open threads only and ignores an unknown thread id (M07, M18)", async () => {
@@ -2243,14 +2243,13 @@ describe("runPrReview re-check and resolve", () => {
     expect(asked).not.toContain("PRRT_SKIPPED");
 
     expect(replyCalls(calls)).toHaveLength(1);
-    expect(resolveCalls(calls)).toHaveLength(1);
-    expect(
-      (resolveCalls(calls)[0]!.body as { variables: { threadId: string } })
-        .variables.threadId,
-    ).toBe("PRRT_OPEN");
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(replyCalls(calls)[0]!.path).toBe(
+      "/repos/o/r/pulls/1/comments/1001/replies",
+    );
   });
 
-  it("never resolves a thread whose hash the main call re-reported (S6B-N5b)", async () => {
+  it("never replies to a thread whose hash the main call re-reported (S6B-N5b)", async () => {
     const world = makeWorld();
     const first = await runReview(world);
     const firstBody = (
@@ -2262,7 +2261,7 @@ describe("runPrReview re-check and resolve", () => {
       ]),
     ];
     // The main call reports the same finding again: it is a cross-pass
-    // duplicate, and the thread must stay open rather than be resolved.
+    // duplicate, and the thread must stay open rather than be marked fixed.
     world.recheckContent = JSON.stringify({
       results: [{ thread: "PRRT_1", fixed: true, confidence: 0.9 }],
     });
@@ -2272,10 +2271,10 @@ describe("runPrReview re-check and resolve", () => {
     expect(result.conclusion).toBe("success");
     expect(reviewCalls(calls)).toHaveLength(0);
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
     const summary = summaryBody(world);
     expect(summary).toContain("- Skipped: 1 duplicate");
-    expect(summary).toContain("- Resolved: 0");
+    expect(summary).toContain("- Marked fixed this pass: 0");
   });
 
   it("re-checks only the 15 oldest eligible threads (M09)", async () => {
@@ -2312,10 +2311,10 @@ describe("runPrReview re-check and resolve", () => {
     expect(asked).toContain('id="PRRT_14"');
     expect(asked).not.toContain('id="PRRT_15"');
     expect(replyCalls(calls)).toHaveLength(15);
-    expect(resolveCalls(calls)).toHaveLength(15);
+    expect(mutationCalls(calls)).toHaveLength(0);
   });
 
-  it("never resolves a human won't-fix thread and never re-posts its hash", async () => {
+  it("never replies to a human won't-fix thread and never re-posts its hash", async () => {
     const world = makeWorld();
     const first = await runReview(world);
     const firstBody = (
@@ -2330,11 +2329,11 @@ describe("runPrReview re-check and resolve", () => {
     expect(second.result.conclusion).toBe("success");
     expect(reviewCalls(second.calls)).toHaveLength(0);
     expect(replyCalls(second.calls)).toHaveLength(0);
-    expect(resolveCalls(second.calls)).toHaveLength(0);
+    expect(mutationCalls(second.calls)).toHaveLength(0);
     expect(threadCalls(second.calls)).toHaveLength(1);
   });
 
-  it("resolves a half-finished thread without a second reply", async () => {
+  it("treats an old Fixed in reply as marked fixed with no second reply or re-check", async () => {
     const world = makeWorld();
     const first = await runReview(world);
     const firstBody = (
@@ -2352,11 +2351,15 @@ describe("runPrReview re-check and resolve", () => {
     const { result, calls } = await runReview(world, {}, {}, "333");
 
     expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(0);
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Marked fixed this pass: 0");
+    expect(summary).toContain("- Open Bugbot comments: 0");
   });
 
-  it("logs a failed re-check and still succeeds with nothing resolved", async () => {
+  it("logs a failed re-check and still succeeds with nothing marked fixed", async () => {
     const world = makeWorld();
     const first = await runReview(world);
     const firstBody = (
@@ -2372,13 +2375,126 @@ describe("runPrReview re-check and resolve", () => {
 
     expect(result.conclusion).toBe("success");
     expect(replyCalls(calls)).toHaveLength(0);
-    expect(resolveCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
     expect(logs.some((line) => line.includes("re-check failed"))).toBe(true);
     const finish = callsWhere(
       calls,
       (call) => call.method === "PATCH" && call.path === "/repos/o/r/check-runs/77",
     );
     expect((finish[0]!.body as { conclusion: string }).conclusion).toBe("success");
+  });
+
+  it("never sends a GraphQL mutation during a pass that replies", async () => {
+    const world = await fixedWorld(0.9);
+    const { calls, logs } = await runReview(world, {}, {}, "333");
+
+    expect(replyCalls(calls)).toHaveLength(1);
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(logs.some((line) => line.includes("could not reply"))).toBe(false);
+  });
+
+  it("skips a thread already marked fixed by the new wording", async () => {
+    const world = makeWorld();
+    const first = await runReview(world);
+    const firstBody = (
+      reviewCalls(first.calls)[0]!.body as { comments: Array<{ body: string }> }
+    ).comments[0]!.body;
+    const oldBody = firstBody.replace(`sha=${HEAD}`, `sha=${OLD}`);
+    world.threads = [
+      threadNode([
+        botComment(1001, oldBody),
+        botComment(1002, "Looks fixed as of abc1234."),
+      ]),
+    ];
+    world.reviewContent = JSON.stringify({ findings: [] });
+    world.recheckContent = JSON.stringify({
+      results: [{ thread: "PRRT_1", fixed: true, confidence: 0.9 }],
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(recheckModelCalls(calls)).toHaveLength(0);
+    expect(replyCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Marked fixed this pass: 0");
+    expect(summary).toContain("- Open Bugbot comments: 0");
+  });
+
+  it("keeps dedupe against a marked-fixed thread but not count it open", async () => {
+    const world = makeWorld({
+      threads: [
+        threadNode([
+          botComment(
+            1001,
+            `**High bug: cart total**\n\nfindCustomer returns undefined for an unknown customerId and customer.name throws.\n\n${marker("e".repeat(40), "7", OLD)}`,
+          ),
+          botComment(1002, "Looks fixed as of abc1234."),
+        ]),
+      ],
+      reviewContent: JSON.stringify({ findings: [FINDING] }),
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    // Same path, category and line: the marked-fixed thread still swallows the
+    // reworded finding, exactly like an open thread.
+    expect(reviewCalls(calls)).toHaveLength(0);
+    expect(recheckModelCalls(calls)).toHaveLength(0);
+    expect(replyCalls(calls)).toHaveLength(0);
+    expect(mutationCalls(calls)).toHaveLength(0);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Skipped: 1 duplicate");
+    expect(summary).toContain("- Marked fixed this pass: 0");
+    expect(summary).toContain("- Open Bugbot comments: 0");
+  });
+
+  it("keeps replying after one failed reply and counts only the posted ones", async () => {
+    const world = makeWorld({
+      reviewContent: JSON.stringify({ findings: [] }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              1001,
+              `${marker("1".repeat(40), "7", OLD)}\n\n**High bug: first**\n\nfirst reason`,
+            ),
+          ],
+          { id: "PRRT_A", line: 2, originalLine: 2 },
+        ),
+        threadNode(
+          [
+            botComment(
+              1002,
+              `${marker("2".repeat(40), "7", OLD)}\n\n**High bug: second**\n\nsecond reason`,
+            ),
+          ],
+          { id: "PRRT_B", line: 3, originalLine: 3 },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [
+          { thread: "PRRT_A", fixed: true, confidence: 0.9 },
+          { thread: "PRRT_B", fixed: true, confidence: 0.9 },
+        ],
+      }),
+      replyFailures: [1001],
+    });
+
+    const { result, calls, logs } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(replyCalls(calls)).toHaveLength(2);
+    expect(mutationCalls(calls)).toHaveLength(0);
+    expect(logs.some((line) => line.includes("Bugbot could not reply on PRRT_A:"))).toBe(
+      true,
+    );
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Marked fixed this pass: 1");
+    // PRRT_A is still open and unmarked; PRRT_B is marked fixed.
+    expect(summary).toContain("- Open Bugbot comments: 1");
   });
 });
 
