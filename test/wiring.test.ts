@@ -1,0 +1,39 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it, vi } from "vitest";
+import { diffLineTexts } from "../src/context.js";
+import { runLocalReview } from "../src/cli.js";
+
+// The local pass has no existing threads, so its lineTextFor wiring cannot
+// change a posted comment. Spy on the real map instead: removing the wiring
+// drops the call to zero (S8D-R2-N5).
+vi.mock("../src/context.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/context.js")>();
+  return { ...actual, diffLineTexts: vi.fn(actual.diffLineTexts) };
+});
+
+const fixtureDir = fileURLToPath(new URL("./fixtures/local/", import.meta.url));
+const modelResponse = readFileSync(
+  join(fixtureDir, "model-response.json"),
+  "utf8",
+);
+
+describe("lineTextFor wiring", () => {
+  it("passes the diff's line text to the local classify call (S8D-R2-N5)", async () => {
+    const spy = vi.mocked(diffLineTexts);
+    spy.mockClear();
+
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async () => new Response(modelResponse, { status: 200 }),
+        env: (name) => (name === "OPENROUTER_API_KEY" ? "test-key" : ""),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});

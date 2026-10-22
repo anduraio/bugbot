@@ -129,6 +129,15 @@ const ALLOWED_ROUTES: readonly AllowedRoute[] = [
     media: "diff",
   },
   {
+    // The before..after comparison for an incremental synchronize pass. JSON
+    // gives ancestry, the diff media type gives the changed hunks.
+    method: "GET",
+    pattern: new RegExp(
+      `^/repos/${OWNER_NAME}/compare/[0-9a-f]{40}\\.\\.\\.[0-9a-f]{40}$`,
+    ),
+    media: "diff",
+  },
+  {
     method: "GET",
     pattern: new RegExp(`^/repos/${OWNER_NAME}/issues/[1-9][0-9]*/comments$`),
     query: { per_page: "positive-integer", page: "positive-integer" },
@@ -537,6 +546,88 @@ export async function fetchPullRequestDiff(
   return response.text;
 }
 
+export interface CompareQuery extends GitHubTransportOptions {
+  token: string;
+  /** "owner/name" of the repository under review. */
+  repository: string;
+  /** The commit before the push. */
+  baseSha: string;
+  /** The commit after the push, normally the PR head. */
+  headSha: string;
+}
+
+/**
+ * GitHub's compare status for base..head. `ahead` means head contains base
+ * (base is an ancestor), `diverged` means a force-push, `behind` means the
+ * event is stale. Step 8c only narrows to the new commits on `ahead`.
+ */
+export async function compareCommitStatus(
+  query: CompareQuery,
+): Promise<string> {
+  validateRepository(query.repository);
+  validateHeadSha(query.baseSha, "baseSha");
+  validateHeadSha(query.headSha, "headSha");
+  const context = transport(query);
+
+  const response = await request(context, {
+    method: "GET",
+    path: comparePath(query.repository, query.baseSha, query.headSha),
+  });
+  const payload = asRecord(response.json);
+  const status = payload === null ? null : asString(payload.status);
+  if (status === null) {
+    throw new GitHubError(
+      "GitHub compare response had no status",
+      response.status,
+    );
+  }
+
+  return status;
+}
+
+/**
+ * Reads the unified diff for before..after. Same 5 MB cap as the PR diff, so
+ * a hostile range ends the incremental narrowing and the caller reviews the
+ * full PR diff instead of a partial one.
+ */
+export async function fetchCompareDiff(query: CompareQuery): Promise<string> {
+  validateRepository(query.repository);
+  validateHeadSha(query.baseSha, "baseSha");
+  validateHeadSha(query.headSha, "headSha");
+  const context = transport(query);
+
+  let response: RequestResult;
+  try {
+    response = await request(context, {
+      method: "GET",
+      path: comparePath(query.repository, query.baseSha, query.headSha),
+      accept: ACCEPT_DIFF,
+      raw: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof GitHubError &&
+      (error.status === 406 || error.status === 422)
+    ) {
+      throw new GitHubError(
+        "compare diff is too large to review (GitHub returned 406/422)",
+        error.status,
+      );
+    }
+    throw error;
+  }
+
+  if (
+    (response.contentLength !== null &&
+      response.contentLength > MAX_DIFF_BYTES) ||
+    response.text.length > MAX_DIFF_BYTES
+  ) {
+    throw new GitHubError("compare diff is too large to review (over 5 MB)");
+  }
+
+  return response.text;
+}
+
 export interface ContentsQuery extends GitHubTransportOptions {
   token: string;
   /** "owner/name" of the repository under review. */
@@ -616,6 +707,8 @@ export interface CheckRunInfo {
   externalId: string | null;
   /** The GitHub App that owns the run; null when the response had none. */
   appId: number | null;
+  /** `success`, `neutral`, ... once completed; null while it runs. */
+  conclusion: string | null;
 }
 
 /** A neutral check never fails the PR. Bugbot has no failure conclusion. */
@@ -675,13 +768,32 @@ export interface ResolveThreadsResult {
   planned: readonly PlannedRequest[];
 }
 
+/** Non-zero skip buckets, named in the summary (step 8c). */
+export interface SkippedCounts {
+  duplicate?: number;
+  belowConfidence?: number;
+  lowSeverity?: number;
+  notInDiff?: number;
+  triageDismissed?: number;
+  overCap?: number;
+  schemaInvalid?: number;
+  outOfScope?: number;
+}
+
 export interface ReviewSummary {
   passCount: number;
   model: string;
   tokensIn: number;
   tokensOut: number;
+  /** Inline comments posted by this pass only. */
   posted: number;
-  skipped: number;
+  /**
+   * Open Bugbot threads after this pass: existing plus this pass's posts.
+   * `unknown` when the pass failed before the thread list was read and no
+   * earlier summary had a count to keep (S8D-B4).
+   */
+  openComments: number | "unknown";
+  skipped: SkippedCounts;
   resolved: number;
   /** Findings that did not land as inline comments (S6B-B1). */
   failed?: number;
@@ -810,15 +922,19 @@ export async function reportSkipped(
 }
 
 /**
- * Lists every `bugbot` check run on this head SHA with `filter=all`, so a run
- * hidden behind a newer one on the same commit is still visible. The caller
- * matches `external_id` to this pass, finishes every still-`in_progress` match
- * (S6B-N2), and completes stale runs from other passes.
+ * Lists every `bugbot` check run on a commit (the head SHA by default) with
+ * `filter=all`, so a run hidden behind a newer one on the same commit is still
+ * visible. The caller matches `external_id` to this pass, finishes every
+ * still-`in_progress` match (S6B-N2), completes stale runs from other passes,
+ * and reads `conclusion` to decide whether the `before` commit was reviewed
+ * (S8D-B3).
  */
 export async function listCheckRuns(
   options: GitHubOptions,
+  sha: string = options.headSha,
 ): Promise<readonly CheckRunInfo[]> {
   validateOptions(options);
+  validateHeadSha(sha, "sha");
   const context = transport(options);
   const runs: CheckRunInfo[] = [];
 
@@ -826,10 +942,7 @@ export async function listCheckRuns(
   for (let index = 0; index < MAX_PAGES; index += 1) {
     const response = await request(context, {
       method: "GET",
-      path: repoPath(
-        options.repository,
-        `commits/${options.headSha}/check-runs`,
-      ),
+      path: repoPath(options.repository, `commits/${sha}/check-runs`),
       query: {
         check_name: "bugbot",
         filter: "all",
@@ -852,6 +965,7 @@ export async function listCheckRuns(
           status: asString(run.status),
           externalId: asString(run.external_id),
           appId: appIdOf(run.app),
+          conclusion: asString(run.conclusion),
         });
       }
     }
@@ -1167,6 +1281,17 @@ function escapeBacktick(text: string): string {
   return text.replaceAll("`", "&#96;");
 }
 
+const SKIPPED_LABELS: ReadonlyArray<readonly [keyof SkippedCounts, string]> = [
+  ["duplicate", "duplicate"],
+  ["belowConfidence", "below confidence"],
+  ["lowSeverity", "low severity"],
+  ["notInDiff", "not in diff"],
+  ["triageDismissed", "triage dismissed"],
+  ["overCap", "over cap"],
+  ["schemaInvalid", "schema invalid"],
+  ["outOfScope", "out of scope"],
+];
+
 /**
  * Renders the one summary comment. The fixed final line is always appended,
  * even if a caller passes an empty or malformed summary. `secret` is the
@@ -1178,6 +1303,11 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
   const lines: string[] = [SUMMARY_MARKER];
   const runs = (summary.runs ?? []).filter((id) => /^\d+$/.test(id));
   const failed = summary.failed ?? 0;
+  const skipped = SKIPPED_LABELS.map(([key, label]) => {
+    const count = Math.max(0, Math.trunc(summary.skipped[key] ?? 0));
+    return [label, count] as const;
+  }).filter(([, count]) => count > 0);
+  const skippedTotal = skipped.reduce((total, [, count]) => total + count, 0);
   if (runs.length > 0) {
     lines.push(
       `${RUNS_MARKER_PREFIX}${runs.slice(-MAX_RUN_IDS).join(",")} -->`,
@@ -1189,11 +1319,23 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
     `- Passes: ${summary.passCount}`,
     `- Model: ${redact(summary.model, secret)}`,
     `- Tokens: ${summary.tokensIn} in / ${summary.tokensOut} out`,
-    `- Posted: ${summary.posted}`,
+    `- Posted this pass: ${summary.posted}`,
+    `- Open Bugbot comments: ${
+      typeof summary.openComments === "number"
+        ? String(summary.openComments)
+        : "unknown"
+    }`,
     `- Failed to post: ${failed}`,
-    `- Skipped: ${summary.skipped}`,
-    `- Resolved: ${summary.resolved}`,
   );
+
+  if (skipped.length > 0) {
+    lines.push(
+      `- Skipped: ${skipped
+        .map(([label, count]) => `${count} ${label}`)
+        .join(", ")}`,
+    );
+  }
+  lines.push(`- Resolved: ${summary.resolved}`);
 
   if (summary.error !== undefined && summary.error.trim() !== "") {
     lines.push(
@@ -1205,7 +1347,7 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
     );
   } else if (
     summary.posted === 0 &&
-    summary.skipped === 0 &&
+    skippedTotal === 0 &&
     failed === 0
   ) {
     lines.push("", "No findings this pass.");
@@ -2031,6 +2173,14 @@ function pullPath(
 ): string {
   const base = repoPath(repository, `pulls/${prNumber}`);
   return suffix === undefined ? base : `${base}/${suffix}`;
+}
+
+function comparePath(
+  repository: string,
+  baseSha: string,
+  headSha: string,
+): string {
+  return repoPath(repository, `compare/${baseSha}...${headSha}`);
 }
 
 /**

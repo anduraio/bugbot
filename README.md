@@ -9,9 +9,9 @@ can tell when a review pass is done.
 never blocks, fails or merges a pull request. If it cannot review, the check
 goes `neutral` and the summary says why.
 
-Status: step 5, filter, self-filter and dedupe. `review --local` builds a
-review from a diff file and prints the findings plus the comments that would
-post; it never posts. The GitHub review path is still a stub until step 6.
+Status: step 8, cross-pass dedupe, incremental review and honest summary
+counts. `review --local` builds a review from a diff file and prints the
+findings plus the comments that would post; it never posts.
 
 ## Layout
 

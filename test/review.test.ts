@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runPrReview, type PrReviewDeps } from "../src/cli.js";
 import {
   enclosingSymbol,
@@ -100,6 +103,71 @@ const APP_ID = 4242;
 /** Another app that also happens to name its check `bugbot`. */
 const OTHER_APP_ID = 9191;
 
+/** A successful bugbot check on the `before` commit (S8D-B3). */
+const BEFORE_SUCCESS = {
+  id: 90,
+  name: "bugbot",
+  external_id: "50",
+  status: "completed",
+  conclusion: "success",
+  app: { id: APP_ID },
+};
+
+/** The reviewer's small fixture: a file whose lines 2..9 are all new. */
+const P_HEAD_DIFF = [
+  "diff --git a/src/p.ts b/src/p.ts",
+  "--- a/src/p.ts",
+  "+++ b/src/p.ts",
+  "@@ -1,2 +1,10 @@",
+  " export function p() {",
+  "+  const a = 1;",
+  "+  const b = 2;",
+  "+  const c = 3;",
+  "+  const d = 4;",
+  "+  const e = 5;",
+  "+  const f = 6;",
+  "+  const g = 7;",
+  "+  const h = 8;",
+  " }",
+  "",
+].join("\n");
+
+const P_HEAD = [
+  "export function p() {",
+  "  const a = 1;",
+  "  const b = 2;",
+  "  const c = 3;",
+  "  const d = 4;",
+  "  const e = 5;",
+  "  const f = 6;",
+  "  const g = 7;",
+  "  const h = 8;",
+  "}",
+  "",
+].join("\n");
+
+const P_BASE = "export function p() {\n}\n";
+
+/** N3: base line 10 was removed; an earlier push shifted it to before line 4. */
+const N3_BASE = `${Array.from({ length: 9 }, () => "  filler();").join("\n")}\n  removed();\n`;
+const N3_HEAD = `${Array.from({ length: 9 }, () => "  filler();").join("\n")}\n`;
+const N3_PR_DIFF = [
+  "diff --git a/src/p.ts b/src/p.ts",
+  "--- a/src/p.ts",
+  "+++ b/src/p.ts",
+  "@@ -10,1 +9,0 @@",
+  "-  removed();",
+  "",
+].join("\n");
+const N3_COMPARE_DIFF = [
+  "diff --git a/src/p.ts b/src/p.ts",
+  "--- a/src/p.ts",
+  "+++ b/src/p.ts",
+  "@@ -4,1 +9,0 @@",
+  "-  removed();",
+  "",
+].join("\n");
+
 /**
  * The L1 file name: a newline, then a workflow command, then a backslash. Git
  * writes it quoted, with `\n` and `\\` as escapes, and the parser decodes it.
@@ -138,6 +206,60 @@ const FINDING = {
   triage: "fix",
 };
 
+const LIVE_FIRST_REASON =
+  "The discount rounds down before tax, so the total is off by one cent for every order.";
+const LIVE_REWORDED_REASON =
+  "Rounding happens before tax is applied; each order total can be one cent too low.";
+
+/** Push 1: the off-by-one at line 7. Push 2 only touches the doc line. */
+const LIVE_DIFF = [
+  "diff --git a/src/discount.ts b/src/discount.ts",
+  "--- a/src/discount.ts",
+  "+++ b/src/discount.ts",
+  "@@ -1,8 +1,8 @@",
+  " export function applyDiscount(total: number): number {",
+  "   // Applies a ten percent discount.",
+  "   const discounted = total * 0.9;",
+  "   if (discounted < 0) {",
+  "     return 0;",
+  "   }",
+  "-  return discounted;",
+  "+  return Math.round(discounted * 100) / 100;",
+  " }",
+  "",
+].join("\n");
+
+const LIVE_HEAD = [
+  "export function applyDiscount(total: number): number {",
+  "  // Applies a ten percent discount.",
+  "  const discounted = total * 0.9;",
+  "  if (discounted < 0) {",
+  "    return 0;",
+  "  }",
+  "  return Math.round(discounted * 100) / 100;",
+  "}",
+  "",
+].join("\n");
+
+const LIVE_BASE = LIVE_HEAD.replace(
+  "return Math.round(discounted * 100) / 100;",
+  "return discounted;",
+);
+
+/** The increments of a synchronize pass: only the doc line changed. */
+const SYNC_DIFF = [
+  "diff --git a/src/discount.ts b/src/discount.ts",
+  "--- a/src/discount.ts",
+  "+++ b/src/discount.ts",
+  "@@ -1,4 +1,4 @@",
+  " export function applyDiscount(total: number): number {",
+  "-  // Applies a ten percent discount.",
+  "+  // Applies a ten percent discount to the subtotal.",
+  "   const discounted = total * 0.9;",
+  "   if (discounted < 0) {",
+  "",
+].join("\n");
+
 interface Recorded {
   method: string;
   path: string;
@@ -146,9 +268,7 @@ interface Recorded {
   accept: string;
   body: unknown;
   headers: Record<string, string>;
-}
-
-interface RestComment {
+}interface RestComment {
   id: number;
   user: { login: string; type: "Bot" | "User" };
   body: string;
@@ -170,6 +290,9 @@ interface World {
   baseFiles: Record<string, string | null>;
   agentsMd: string | null;
   agentsBase: string | null;
+  compareStatus: string;
+  compareDiff: string;
+  compareStatusFailure: number;
   threads: unknown[];
   comments: RestComment[];
   reviewContent: string;
@@ -194,6 +317,16 @@ interface World {
     name: string;
     external_id: string | null;
     status?: string;
+    conclusion?: string;
+    app?: { id: number };
+  }>;
+  /** Runs returned for a check-run lookup on a commit other than the head. */
+  beforeCheckRuns: Array<{
+    id: number;
+    name: string;
+    external_id: string | null;
+    status?: string;
+    conclusion?: string;
     app?: { id: number };
   }>;
 }
@@ -215,6 +348,9 @@ function makeWorld(overrides: Partial<World> = {}): World {
     baseFiles: { "src/cart.ts": BASE_CART },
     agentsMd: "# House rules\n\nBe careful.",
     agentsBase: null,
+    compareStatus: "ahead",
+    compareDiff: "",
+    compareStatusFailure: 200,
     threads: [],
     comments: [],
     reviewContent: JSON.stringify({ findings: [FINDING] }),
@@ -232,6 +368,7 @@ function makeWorld(overrides: Partial<World> = {}): World {
     finishCheckStatusById: {},
     startCheckApp: APP_ID,
     checkRuns: [],
+    beforeCheckRuns: [],
     ...overrides,
   };
 }
@@ -369,6 +506,19 @@ function recordedFetch(world: World): {
       });
     }
 
+    if (
+      call.method === "GET" &&
+      /^\/repos\/o\/r\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(call.path)
+    ) {
+      if (call.accept === "application/vnd.github.diff") {
+        return text(world.compareDiff);
+      }
+      if (world.compareStatusFailure !== 200) {
+        return json({ message: "compare failed" }, world.compareStatusFailure);
+      }
+      return json({ status: world.compareStatus });
+    }
+
     if (call.method === "GET" && call.path.startsWith("/repos/o/r/contents/")) {
       const path = decodeURIComponent(call.path.slice("/repos/o/r/contents/".length));
       const ref = url.searchParams.get("ref");
@@ -438,7 +588,11 @@ function recordedFetch(world: World): {
       call.method === "GET" &&
       /^\/repos\/o\/r\/commits\/[0-9a-f]{40}\/check-runs$/.test(call.path)
     ) {
-      return json({ check_runs: world.checkRuns });
+      const sha = call.path.split("/")[5];
+      return json({
+        check_runs:
+          sha === world.headSha ? world.checkRuns : world.beforeCheckRuns,
+      });
     }
 
     if (call.method === "POST" && call.path === "/repos/o/r/pulls/1/reviews") {
@@ -494,6 +648,23 @@ function recordedFetch(world: World): {
 
 function envWith(values: Record<string, string>): (name: string) => string {
   return (name) => values[name] ?? "";
+}
+
+const eventDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of eventDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Writes a throwaway GitHub event payload and returns its path. */
+function eventPath(payload: Record<string, unknown>): string {
+  const dir = mkdtempSync(join(tmpdir(), "bugbot-event-"));
+  eventDirs.push(dir);
+  const path = join(dir, "event.json");
+  writeFileSync(path, JSON.stringify(payload), "utf8");
+  return path;
 }
 
 const BASE_ENV: Record<string, string> = {
@@ -661,7 +832,7 @@ describe("runPrReview pass 1", () => {
     const summary = String((summaryPosts[0]!.body as { body: string }).body);
     expect(summary).toContain("<!-- bugbot:runs 111 -->");
     expect(summary).toContain("- Passes: 1");
-    expect(summary).toContain("- Posted: 1");
+    expect(summary).toContain("- Posted this pass: 1");
     expect(summary).toContain("Bugbot only comments; it never approves or blocks.");
 
     const start = callsWhere(
@@ -707,7 +878,7 @@ describe("runPrReview post failures (S6B-B1)", () => {
     expect(reviewCalls(calls)).toHaveLength(2);
 
     const summary = summaryBody(world);
-    expect(summary).toContain("- Posted: 0");
+    expect(summary).toContain("- Posted this pass: 0");
     expect(summary).toContain("- Failed to post: 1");
     expect(summary).not.toContain("No findings this pass.");
 
@@ -726,7 +897,7 @@ describe("runPrReview post failures (S6B-B1)", () => {
     expect(logs.some((line) => line.includes("timed out"))).toBe(true);
 
     const summary = summaryBody(world);
-    expect(summary).toContain("- Posted: 0");
+    expect(summary).toContain("- Posted this pass: 0");
     expect(summary).toContain("- Failed to post: 1");
     expect(summary).not.toContain("No findings this pass.");
 
@@ -753,7 +924,7 @@ describe("runPrReview pass 2 (same findings)", () => {
     expect(reviewCalls(second.calls)).toHaveLength(0);
     expect(summaryBody(world)).toContain("- Passes: 2");
     expect(summaryBody(world)).toContain("<!-- bugbot:runs 111,222 -->");
-    expect(summaryBody(world)).toContain("- Posted: 0");
+    expect(summaryBody(world)).toContain("- Posted this pass: 0");
     expect(threadCalls(second.calls)).toHaveLength(1);
 
     const summaryCreates = callsWhere(
@@ -793,6 +964,613 @@ describe("runPrReview pass 2 (same findings)", () => {
     expect(second.result.conclusion).toBe("success");
     expect(reviewCalls(second.calls)).toHaveLength(0);
     expect(summaryBody(world)).toContain("- Passes: 2");
+  });
+});
+
+describe("runPrReview step 8c dedupe and incremental scope", () => {
+  const liveFinding = (overrides: Partial<typeof FINDING> = {}) => ({
+    ...FINDING,
+    file: "src/discount.ts",
+    line: 7,
+    reason: LIVE_FIRST_REASON,
+    suggested_fix: "Round after applying tax.",
+    ...overrides,
+  });
+
+  function liveWorld(overrides: Partial<World> = {}): World {
+    return makeWorld({
+      diff: LIVE_DIFF,
+      files: { "src/discount.ts": LIVE_HEAD },
+      baseFiles: { "src/discount.ts": LIVE_BASE },
+      reviewContent: JSON.stringify({ findings: [liveFinding()] }),
+      ...overrides,
+    });
+  }
+
+  function compareCalls(calls: readonly Recorded[]): Recorded[] {
+    return callsWhere(calls, (call) => call.path.includes("/compare/"));
+  }
+
+  function pFinding(
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      file: "src/p.ts",
+      line: 3,
+      side: "RIGHT",
+      severity: "high",
+      category: "bug",
+      confidence: 0.95,
+      reason: "x",
+      suggested_fix: "y",
+      angle: "interrogate:correctness",
+      symbol: "p",
+      triage: "fix",
+      ...overrides,
+    };
+  }
+
+  function pWorld(findings: unknown[], overrides: Partial<World> = {}): World {
+    return makeWorld({
+      diff: P_HEAD_DIFF,
+      files: { "src/p.ts": P_HEAD },
+      baseFiles: { "src/p.ts": P_BASE },
+      reviewContent: JSON.stringify({ findings }),
+      ...overrides,
+    });
+  }
+
+  function pThread(
+    line: number | null,
+    reason: string,
+    hash = "d".repeat(40),
+    id = "PRRT_P1",
+  ): Record<string, unknown> {
+    return threadNode(
+      [
+        botComment(
+          7001,
+          `${marker(hash, "100", OLD)}\n\n**High bug: ${reason}**\n\n${reason}`,
+        ),
+      ],
+      { id, path: "src/p.ts", line, originalLine: 6 },
+    );
+  }
+
+  function postedLines(calls: readonly Recorded[]): Array<{
+    path: string;
+    line: number;
+    side?: string;
+  }> {
+    return reviewCalls(calls).flatMap(
+      (call) =>
+        (call.body as { comments: Array<{ path: string; line: number; side?: string }> })
+          .comments,
+    );
+  }
+
+  it("does not repost a reworded finding at the same F:7 on a second push (live case)", async () => {
+    const world = liveWorld();
+    const first = await runReview(world);
+    const firstBody = (
+      reviewCalls(first.calls)[0]!.body as { comments: Array<{ body: string }> }
+    ).comments[0]!.body;
+
+    world.threads = [
+      threadNode([botComment(2001, firstBody.replace(`sha=${HEAD}`, `sha=${OLD}`))], {
+        path: "src/discount.ts",
+        line: 7,
+        originalLine: 7,
+      }),
+    ];
+    world.reviewContent = JSON.stringify({
+      findings: [liveFinding({ reason: LIVE_REWORDED_REASON })],
+    });
+
+    const second = await runReview(world, {}, {}, "222");
+
+    expect(second.result.conclusion).toBe("success");
+    expect(reviewCalls(second.calls)).toHaveLength(0);
+    expect(recheckModelCalls(second.calls)).toHaveLength(0);
+    expect(resolveCalls(second.calls)).toHaveLength(0);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 0");
+    expect(summary).toContain("- Open Bugbot comments: 1");
+    expect(summary).toContain("- Skipped: 1 duplicate");
+
+    // With the incremental scope active, the same repeat is still counted as a
+    // duplicate: cross-pass dedupe runs before the scope test (S8D-R1-N1).
+    const path = eventPath({ action: "synchronize", before: OLD, after: HEAD });
+    world.compareStatus = "ahead";
+    world.compareDiff = SYNC_DIFF;
+    world.beforeCheckRuns = [BEFORE_SUCCESS];
+    const third = await runReview(world, { GITHUB_EVENT_PATH: path }, {}, "333");
+    expect(reviewCalls(third.calls)).toHaveLength(0);
+    expect(recheckModelCalls(third.calls)).toHaveLength(0);
+    expect(summaryBody(world)).toContain("- Skipped: 1 duplicate");
+    expect(summaryBody(world)).not.toContain("out of scope");
+  });
+
+  it("posts the sibling template bug and resolves its fixed neighbour (S8D-R1-N1)", async () => {
+    const fixedReason =
+      "`user.profile` can be undefined here, so reading `user.profile.name` throws a TypeError.";
+    const newReason =
+      "`order.customer` can be undefined here, so reading `order.customer.email` throws a TypeError.";
+    const threadBody = `**High bug: ${fixedReason}**\n\n${fixedReason}\n\n**Suggested fix:**\nGuard the read.\n\n${marker("d".repeat(40), "100", OLD)}`;
+    const world = pWorld([pFinding({ line: 4, reason: newReason })], {
+      threads: [
+        threadNode([botComment(7001, threadBody)], {
+          id: "PRRT_P1",
+          path: "src/p.ts",
+          line: 3,
+          originalLine: 3,
+          diffSide: "RIGHT",
+        }),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_P1", fixed: true, confidence: 0.95 }],
+      }),
+    });
+
+    const { calls } = await runReview(world, {}, {}, "222");
+
+    expect(postedLines(calls).map((comment) => comment.line)).toEqual([4]);
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    expect(resolveCalls(calls)).toHaveLength(1);
+    expect(summaryBody(world)).toContain("- Posted this pass: 1");
+    expect(summaryBody(world)).not.toContain("duplicate");
+  });
+
+  it("pins the bare-word diff text wiring in the main and re-check passes (S8D-R2-N5)", async () => {
+    const diff = [
+      "diff --git a/src/p.ts b/src/p.ts",
+      "--- a/src/p.ts",
+      "+++ b/src/p.ts",
+      "@@ -1,2 +1,4 @@",
+      " export function p() {",
+      '+  db.query("SELECT * FROM t WHERE id = " + id);',
+      '+  res.send("<p>" + name + "</p>");',
+      " }",
+      "",
+    ].join("\n");
+    const head = [
+      "export function p() {",
+      '  db.query("SELECT * FROM t WHERE id = " + id);',
+      '  res.send("<p>" + name + "</p>");',
+      "}",
+      "",
+    ].join("\n");
+    const sqlReason =
+      "The id parameter is concatenated into the SQL query string, so a crafted value can run arbitrary SQL.";
+    const xssReason =
+      "The name parameter is concatenated into the HTML response without escaping, so a crafted value can run arbitrary script.";
+    const world = makeWorld({
+      diff,
+      files: { "src/p.ts": head },
+      baseFiles: { "src/p.ts": "export function p() {\n}\n" },
+      reviewContent: JSON.stringify({
+        findings: [pFinding({ line: 3, reason: xssReason })],
+      }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              7001,
+              `**High bug: ${sqlReason}**\n\n${sqlReason}\n\n${marker("d".repeat(40), "100", OLD)}`,
+            ),
+          ],
+          {
+            id: "PRRT_P1",
+            path: "src/p.ts",
+            line: 2,
+            originalLine: 2,
+            diffSide: "RIGHT",
+          },
+        ),
+      ],
+      recheckContent: JSON.stringify({
+        results: [{ thread: "PRRT_P1", fixed: true, confidence: 0.95 }],
+      }),
+    });
+
+    const { calls } = await runReview(world, {}, {}, "222");
+
+    // Without the main wiring the real sibling bug (xss next to the fixed
+    // sqli thread) is dropped; without the re-check wiring the fixed thread
+    // is treated as re-reported and never resolves.
+    expect(postedLines(calls).map((comment) => comment.line)).toEqual([3]);
+    expect(recheckModelCalls(calls)).toHaveLength(1);
+    expect(resolveCalls(calls)).toHaveLength(1);
+  });
+
+  it("posts only in-hunk findings on synchronize when before is an ancestor", async () => {
+    const path = eventPath({
+      action: "synchronize",
+      before: OLD,
+      after: HEAD,
+    });
+    const world = liveWorld({
+      compareStatus: "ahead",
+      compareDiff: SYNC_DIFF,
+      beforeCheckRuns: [BEFORE_SUCCESS],
+    });
+
+    const { result, calls, logs } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    expect(result.conclusion).toBe("success");
+    expect(reviewCalls(calls)).toHaveLength(0);
+    expect(compareCalls(calls)).toHaveLength(2);
+    expect(logs).toContainEqual(
+      expect.stringContaining("incremental review"),
+    );
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 0");
+    expect(summary).toContain("- Skipped: 1 out of scope");
+  });
+
+  it("keeps the full PR diff when a force-push is not an ancestor", async () => {
+    const path = eventPath({
+      action: "synchronize",
+      before: OLD,
+      after: HEAD,
+    });
+    const world = liveWorld({ compareStatus: "diverged", compareDiff: "" });
+
+    const { result, calls } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    expect(result.conclusion).toBe("success");
+    expect(reviewCalls(calls)).toHaveLength(1);
+    expect(compareCalls(calls)).toHaveLength(1);
+    expect(compareCalls(calls)[0]!.accept).toBe("application/vnd.github+json");
+    expect(summaryBody(world)).toContain("- Posted this pass: 1");
+  });
+
+  it("keeps the full PR diff on reopened", async () => {
+    const path = eventPath({
+      action: "reopened",
+      before: OLD,
+      after: HEAD,
+    });
+    const world = liveWorld();
+
+    const { result, calls } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    expect(result.conclusion).toBe("success");
+    expect(reviewCalls(calls)).toHaveLength(1);
+    expect(compareCalls(calls)).toHaveLength(0);
+  });
+
+  it("reports posted this pass, open comments and each skipped bucket", async () => {
+    const world = makeWorld({
+      reviewContent: JSON.stringify({
+        findings: [
+          FINDING,
+          { ...FINDING, line: 2, confidence: 0.5, reason: "Too unsure to post." },
+          { ...FINDING, line: 99, reason: "Outside the diff." },
+        ],
+      }),
+      threads: [
+        threadNode(
+          [
+            botComment(
+              3001,
+              `${marker("e".repeat(40), "100", OLD)}\n\n**High bug: An older unrelated issue.**\n\nThis is unrelated.`,
+            ),
+          ],
+          { id: "PRRT_OLD", line: 999, originalLine: 999 },
+        ),
+      ],
+    });
+
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    expect(reviewCalls(calls)).toHaveLength(1);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 1");
+    expect(summary).toContain("- Open Bugbot comments: 2");
+    expect(summary).toContain("- Skipped: 1 below confidence, 1 not in diff");
+  });
+
+  it("posts a distinct bug near an open comment (S8D-B1 probe P2b)", async () => {
+    const world = pWorld(
+      [
+        pFinding({
+          line: 5,
+          reason:
+            "Division by zero when the list is empty crashes the report builder.",
+        }),
+      ],
+      {
+        threads: [
+          pThread(
+            3,
+            "Off by one in the loop bound skips the last element.",
+          ),
+        ],
+      },
+    );
+
+    const { calls } = await runReview(world, {}, {}, "222");
+
+    expect(postedLines(calls).map((comment) => comment.line)).toEqual([5]);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 1");
+    expect(summary).not.toContain("duplicate");
+  });
+
+  it("applies the incremental scope before in-pass dedupe (S8D-B2 probe P2d)", async () => {
+    const path = eventPath({ action: "synchronize", before: OLD, after: HEAD });
+    const compareDiff = [
+      "diff --git a/src/p.ts b/src/p.ts",
+      "--- a/src/p.ts",
+      "+++ b/src/p.ts",
+      "@@ -6,1 +6,1 @@",
+      "-  const e = 0;",
+      "+  const e = 5;",
+      "",
+    ].join("\n");
+    const world = pWorld(
+      [
+        pFinding({
+          line: 3,
+          severity: "high",
+          reason: "Loop bound is wrong in the report builder.",
+        }),
+        pFinding({
+          line: 6,
+          severity: "medium",
+          reason: "Division by zero crashes the report builder.",
+        }),
+      ],
+      {
+        compareStatus: "ahead",
+        compareDiff,
+        beforeCheckRuns: [BEFORE_SUCCESS],
+      },
+    );
+
+    const { result, calls } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    expect(result.conclusion).toBe("success");
+    expect(postedLines(calls).map((comment) => comment.line)).toEqual([6]);
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 1");
+    expect(summary).toContain("- Skipped: 1 out of scope");
+    expect(summary).not.toContain("duplicate");
+  });
+
+  it("only narrows when before's own bugbot check succeeded (S8D-B3 probe P3d)", async () => {
+    const path = eventPath({ action: "synchronize", before: OLD, after: HEAD });
+    const compareDiff = [
+      "diff --git a/src/p.ts b/src/p.ts",
+      "--- a/src/p.ts",
+      "+++ b/src/p.ts",
+      "@@ -8,1 +8,1 @@",
+      "-  const h = 0;",
+      "+  const h = 8;",
+      "",
+    ].join("\n");
+    const findingFromPush2 = pFinding({
+      line: 3,
+      reason: "Real bug from push 2: loop bound is wrong.",
+    });
+
+    // The intermediate push was never reviewed (no check run on `before`).
+    const unreviewed = pWorld([findingFromPush2], {
+      compareStatus: "ahead",
+      compareDiff,
+      beforeCheckRuns: [],
+    });
+    const first = await runReview(
+      unreviewed,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+    expect(postedLines(first.calls).map((comment) => comment.line)).toEqual([3]);
+    expect(
+      first.calls.filter(
+        (call) => call.path === `/repos/o/r/commits/${OLD}/check-runs`,
+      ),
+    ).toHaveLength(1);
+    expect(first.logs).toContainEqual(
+      expect.stringContaining(`full review; ${OLD.slice(0, 7)} was not reviewed`),
+    );
+
+    // A successful check from this app is the only thing that narrows.
+    const reviewed = pWorld([findingFromPush2], {
+      compareStatus: "ahead",
+      compareDiff,
+      beforeCheckRuns: [BEFORE_SUCCESS],
+    });
+    const second = await runReview(
+      reviewed,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+    expect(reviewCalls(second.calls)).toHaveLength(0);
+    expect(second.logs).toContainEqual(
+      expect.stringContaining("incremental review"),
+    );
+    expect(summaryBody(reviewed)).toContain("- Skipped: 1 out of scope");
+
+    // Another app's success, or a cancelled/neutral result, is not enough.
+    for (const runs of [
+      [{ ...BEFORE_SUCCESS, app: { id: OTHER_APP_ID } }],
+      [{ ...BEFORE_SUCCESS, conclusion: "cancelled" }],
+      [{ ...BEFORE_SUCCESS, conclusion: "neutral" }],
+      [{ ...BEFORE_SUCCESS, status: "in_progress", conclusion: undefined }],
+    ]) {
+      const world = pWorld([findingFromPush2], {
+        compareStatus: "ahead",
+        compareDiff,
+        beforeCheckRuns: runs,
+      });
+      const { calls } = await runReview(
+        world,
+        { GITHUB_EVENT_PATH: path },
+        {},
+        "333",
+      );
+      expect(postedLines(calls).map((comment) => comment.line)).toEqual([3]);
+    }
+
+    // A hostile conclusion is escaped in the log, never printed raw (N2 shape).
+    const hostile = pWorld([findingFromPush2], {
+      compareStatus: "ahead",
+      compareDiff,
+      beforeCheckRuns: [
+        { ...BEFORE_SUCCESS, conclusion: "neutral\n::error::pwned" },
+      ],
+    });
+    const hostileRun = await runReview(
+      hostile,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+    expect(postedLines(hostileRun.calls).map((comment) => comment.line)).toEqual([
+      3,
+    ]);
+    expect(
+      hostileRun.logs.some((line) => line.includes("(neutral?::error::pwned)")),
+    ).toBe(true);
+    expect(hostileRun.logs.filter((line) => line.startsWith("::"))).toHaveLength(
+      0,
+    );
+
+    // A stale synchronize event (after is not the API head) keeps the full
+    // diff, so the compare and the before lookup are never called.
+    const stalePath = eventPath({
+      action: "synchronize",
+      before: OLD,
+      after: "9".repeat(40),
+    });
+    const stale = pWorld([findingFromPush2], {
+      compareStatus: "ahead",
+      compareDiff,
+      beforeCheckRuns: [BEFORE_SUCCESS],
+    });
+    const staleRun = await runReview(
+      stale,
+      { GITHUB_EVENT_PATH: stalePath },
+      {},
+      "333",
+    );
+    expect(postedLines(staleRun.calls).map((comment) => comment.line)).toEqual([
+      3,
+    ]);
+    expect(compareCalls(staleRun.calls)).toHaveLength(0);
+  });
+
+  it("keeps the last known open count when the pass fails before the threads (S8D-B4 probe P5b)", async () => {
+    const previousBody = [
+      "<!-- bugbot:summary -->",
+      "<!-- bugbot:runs 111 -->",
+      "## Bugbot review",
+      "",
+      "- Passes: 1",
+      "- Open Bugbot comments: 2",
+      "",
+    ].join("\n");
+    const world = pWorld([], {
+      modelStatus: 500,
+      threads: [pThread(3, "Still open.")],
+      comments: [
+        {
+          id: 5001,
+          user: { login: "andura-bugbot", type: "Bot" as const },
+          body: previousBody,
+        },
+      ],
+    });
+
+    const { result } = await runReview(world, {}, {}, "222");
+
+    expect(result.conclusion).toBe("neutral");
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Open Bugbot comments: 2");
+    expect(summary).not.toContain("- Open Bugbot comments: 0");
+
+    const noHistory = pWorld([], { modelStatus: 500 });
+    await runReview(noHistory, {}, {}, "222");
+    expect(summaryBody(noHistory)).toContain("- Open Bugbot comments: unknown");
+  });
+
+  it("checks a LEFT finding against the base-side line numbers of the hunks (N3)", async () => {
+    const path = eventPath({ action: "synchronize", before: OLD, after: HEAD });
+    const world = makeWorld({
+      diff: N3_PR_DIFF,
+      files: { "src/p.ts": N3_HEAD },
+      baseFiles: { "src/p.ts": N3_BASE },
+      compareStatus: "ahead",
+      compareDiff: N3_COMPARE_DIFF,
+      beforeCheckRuns: [BEFORE_SUCCESS],
+      reviewContent: JSON.stringify({
+        findings: [
+          pFinding({
+            line: 10,
+            side: "LEFT",
+            reason: "Removed guard on the tail element.",
+          }),
+        ],
+      }),
+    });
+
+    const { calls } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    expect(reviewCalls(calls)).toHaveLength(1);
+    expect(postedLines(calls)).toMatchObject([{ line: 10, side: "LEFT" }]);
+    expect(summaryBody(world)).toContain("- Posted this pass: 1");
+  });
+
+  it("escapes the compare status so it cannot start a workflow command (N2)", async () => {
+    const path = eventPath({ action: "synchronize", before: OLD, after: HEAD });
+    const world = pWorld([pFinding({ line: 3 })], {
+      compareStatus: "ahead\n::error::injected",
+    });
+
+    const { logs } = await runReview(
+      world,
+      { GITHUB_EVENT_PATH: path },
+      {},
+      "333",
+    );
+
+    const lines = logs.join("\n").split("\n");
+    expect(lines.some((line) => line.startsWith("::error::injected"))).toBe(
+      false,
+    );
+    expect(lines).toContainEqual(
+      expect.stringContaining("ahead?::error::injected"),
+    );
   });
 });
 
@@ -878,6 +1656,9 @@ describe("runPrReview re-check and resolve", () => {
     expect(resolveCalls(calls)).toHaveLength(1);
     expect(summaryBody(world)).toContain("- Passes: 3");
     expect(summaryBody(world)).toContain("- Resolved: 1");
+    // The resolved thread is no longer open this pass, so the summary count
+    // must drop it rather than keeping the pre-resolve list length.
+    expect(summaryBody(world)).toContain("- Open Bugbot comments: 0");
 
     const finish = callsWhere(
       calls,
@@ -1031,7 +1812,7 @@ describe("runPrReview re-check and resolve", () => {
     expect(replyCalls(calls)).toHaveLength(0);
     expect(resolveCalls(calls)).toHaveLength(0);
     const summary = summaryBody(world);
-    expect(summary).toContain("- Skipped: 1");
+    expect(summary).toContain("- Skipped: 1 duplicate");
     expect(summary).toContain("- Resolved: 0");
   });
 

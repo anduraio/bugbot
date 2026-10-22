@@ -128,7 +128,8 @@ describe("runLocalReview", () => {
     expect(calls).toBe(1);
 
     // The dismissed medium finding is summarized; the dismissed high finding
-    // survives the safety override; the lower-confidence repeat dedupes.
+    // survives the safety override and is a different bug two lines from 48,
+    // so S8D-B1 keeps both; the lower-confidence repeat dedupes by hash.
     expect(result.planned.map((comment) => `${comment.file}:${comment.line}`)).toEqual([
       "src/cart.ts:48",
       "src/cart.ts:46",
@@ -142,6 +143,7 @@ describe("runLocalReview", () => {
       triageDismissed: 1,
       duplicate: 1,
       overCap: 0,
+      outOfScope: 0,
       schemaInvalid: 1,
     });
     expect(result.existing).toEqual([]);
@@ -538,7 +540,7 @@ describe("runLocalReview", () => {
 });
 
 describe("fail-safe field normalization through runLocalReview", () => {
-  it("posts high, security and data findings with every malformed triage value", async () => {
+  it("never dismisses high, security or data findings with every malformed triage value", async () => {
     const triages: unknown[] = ["DISMISS", "dismiss ", "skip", null, 3];
     const findings: unknown[] = [];
 
@@ -565,7 +567,10 @@ describe("fail-safe field normalization through runLocalReview", () => {
     expect(result.exitCode).toBe(0);
     expect(result.dropped.count).toBe(0);
     expect(result.findings).toHaveLength(15);
-    expect(result.planned).toHaveLength(15);
+    // Every category survives the malformed dismiss values. The five copies
+    // of each category share F:48, so step 8c keeps one per category.
+    expect(result.planned).toHaveLength(3);
+    expect(result.summary.duplicate).toBe(12);
     expect(result.summary.triageDismissed).toBe(0);
   });
 

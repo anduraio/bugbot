@@ -565,17 +565,57 @@ export function hunkContextText(header: string): string {
 }
 
 /**
- * Hunk line ranges and header context per file and side, used as the symbol
- * fallback when the file content is unavailable (a dropped context file, or a
- * LEFT finding whose pre-change content is not on disk).
+ * Finds the PR diff hunk that contains one compare-diff hunk's head side, so
+ * its before-side line numbers can be translated to the PR base numbering a
+ * LEFT finding uses (N3). Both diffs share head numbering; only the old side
+ * differs when earlier commits in the PR shifted lines.
+ */
+function baseHunkFor(
+  prFile: DiffFile,
+  hunk: DiffHunk,
+): { oldStart: number } | null {
+  const candidate = prFile.hunks.find((prHunk) => {
+    if (prHunk.oldLines === 0 || prHunk.newStart > hunk.newStart) {
+      return false;
+    }
+    return (
+      prHunk.newStart === hunk.newStart ||
+      (prHunk.newLines > 0 &&
+        hunk.newStart <= prHunk.newStart + prHunk.newLines - 1)
+    );
+  });
+  if (candidate === undefined) {
+    return null;
+  }
+
+  const offset = hunk.newStart - candidate.newStart;
+  return offset < 0 ? null : { oldStart: candidate.oldStart + offset };
+}
+
+/**
+ * New-side and base-side line ranges covered by the diff's hunks, keyed by the
+ * file's post-change path. LEFT ranges are the old-side numbering of `diff`.
+ *
+ * Pass the full PR diff as `prDiff` on an incremental pass: HEAD numbering is
+ * the same in both diffs, so each compare hunk is then anchored to the PR
+ * diff hunk around it and its LEFT range is expressed in PR base numbering,
+ * which is the numbering a LEFT finding uses (N3).
  */
 export function hunkContextsFromDiff(
   diff: string,
+  prDiff?: string,
 ): Map<string, readonly HunkContextRange[]> {
   const result = new Map<string, HunkContextRange[]>();
+  const prFiles = new Map<string, DiffFile>();
+  if (prDiff !== undefined) {
+    for (const file of parseDiff(prDiff).files) {
+      prFiles.set(file.path, file);
+    }
+  }
 
   for (const file of parseDiff(diff).files) {
     const ranges: HunkContextRange[] = [];
+    const prFile = prFiles.get(file.path);
 
     for (const hunk of file.hunks) {
       const context = hunkContextText(hunk.header);
@@ -588,10 +628,12 @@ export function hunkContextsFromDiff(
         });
       }
       if (hunk.oldLines > 0) {
+        const base = prFile === undefined ? null : baseHunkFor(prFile, hunk);
+        const start = base?.oldStart ?? hunk.oldStart;
         ranges.push({
           side: "LEFT",
-          start: hunk.oldStart,
-          end: hunk.oldStart + hunk.oldLines - 1,
+          start,
+          end: start + hunk.oldLines - 1,
           context,
         });
       }
@@ -601,6 +643,50 @@ export function hunkContextsFromDiff(
   }
 
   return result;
+}
+
+/**
+ * The diff's own text for each line it carries, by post-change path, side and
+ * line number, so callers can tell which bare words a finding could be naming
+ * as code (S8D-R1-N1).
+ */
+export function diffLineTexts(
+  diff: string,
+): (file: string, line: number, side: DiffSide) => string | undefined {
+  const byPath = new Map<
+    string,
+    { LEFT: Map<number, string>; RIGHT: Map<number, string> }
+  >();
+
+  for (const file of parseDiff(diff).files) {
+    const sides = {
+      LEFT: new Map<number, string>(),
+      RIGHT: new Map<number, string>(),
+    };
+    for (const hunk of file.hunks) {
+      let oldLine = hunk.oldStart;
+      let newLine = hunk.newStart;
+      for (const raw of hunk.lines) {
+        const marker = raw[0] ?? "";
+        const text = raw.slice(1);
+        if (marker === "+") {
+          sides.RIGHT.set(newLine, text);
+          newLine += 1;
+        } else if (marker === "-") {
+          sides.LEFT.set(oldLine, text);
+          oldLine += 1;
+        } else if (marker === " ") {
+          sides.LEFT.set(oldLine, text);
+          sides.RIGHT.set(newLine, text);
+          oldLine += 1;
+          newLine += 1;
+        }
+      }
+    }
+    byPath.set(file.path, sides);
+  }
+
+  return (file, line, side) => byPath.get(file)?.[side].get(line);
 }
 
 /** New-side line ranges covered by hunks, keyed by the file's post-change path. */

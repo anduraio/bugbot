@@ -1819,7 +1819,38 @@ export interface ExistingFinding {
   symbol: string;
   reason: string;
   state: "open" | "resolved" | "skipped";
+  /** The thread's current line, null when GitHub calls the thread outdated. */
+  line?: number | null;
+  /** Where the thread was anchored before it became outdated. */
+  originalLine?: number | null;
+  /** The diff side the thread is anchored to, when known (N5). */
+  side?: DiffSide | null;
 }
+
+/** A changed hunk on one side of an incremental diff. */
+export interface ScopeRange {
+  side: DiffSide;
+  start: number;
+  end: number;
+}
+
+/** Hunk ranges keyed by path, for the synchronize incremental scope. */
+export type ScopeLines = ReadonlyMap<string, readonly ScopeRange[]>;
+
+/**
+ * A finding may be a duplicate when an open Bugbot comment (not an earlier
+ * finding in the same pass) has the same path, category and side and its line
+ * is within this many lines (step 8c).
+ */
+export const LOCATION_DUPLICATE_WINDOW = 3;
+
+/**
+ * A nearby line alone is not enough: two different bugs are routinely a line
+ * or two apart. Within the window the reasons must also overlap at least this
+ * much. The same line needs no text check, so a pure reword still dedupes.
+ * Cross-pass only; in-pass duplicates need the same line (S8D-R1-N1).
+ */
+export const LOCATION_DUPLICATE_SIMILARITY = 0.2;
 
 /** One finding ready to become an inline comment. */
 export interface PlannedComment {
@@ -1850,6 +1881,8 @@ export interface ClassifySummary {
   triageDismissed: number;
   duplicate: number;
   overCap: number;
+  /** Findings outside the before..after hunks on an incremental pass. */
+  outOfScope: number;
   /** Findings that failed schema validation (including model-layer drops). */
   schemaInvalid: number;
 }
@@ -1886,10 +1919,26 @@ export interface ClassifyOptions {
     side: DiffSide,
   ) => string | undefined;
   /**
+   * The diff's own text for an anchor line, used to recognise bare words that
+   * the code uses as identifiers when the cross-pass veto compares two reasons
+   * (S8D-R1-N1). Without it only backticked tokens count.
+   */
+  lineTextFor?: (
+    file: string,
+    line: number,
+    side: DiffSide,
+  ) => string | undefined;
+  /**
    * Findings the model layer already dropped as schema-invalid, so the
    * summary buckets add up to the model's raw finding count.
    */
   schemaInvalid?: number;
+  /**
+   * Incremental scope: the before..after hunks on synchronize. When set, a
+   * finding whose line is outside every hunk for its file and side counts as
+   * outOfScope instead of posting. Undefined keeps the full PR diff.
+   */
+  scope?: ScopeLines;
 }
 
 interface Candidate {
@@ -1913,6 +1962,7 @@ function emptySummary(): ClassifySummary {
     triageDismissed: 0,
     duplicate: 0,
     overCap: 0,
+    outOfScope: 0,
     schemaInvalid: 0,
   };
 }
@@ -1962,11 +2012,202 @@ function compareDuplicateCandidates(a: Candidate, b: Candidate): number {
   return 0;
 }
 
+/** The comment's current line, falling back to original_line when outdated. */
+function existingCommentLine(item: ExistingFinding): number | null {
+  if (item.line !== undefined && item.line !== null) {
+    return item.line;
+  }
+  return item.originalLine ?? null;
+}
+
+/**
+ * True when two findings on the same path, category and side are the same
+ * finding by location. The same line is always the same finding (the line
+ * window catches a model that reworded the reason enough to change the hash).
+ * A reword often changes which identifier it names, so the identifier veto
+ * does not apply on the same line (S8D-R2-N2). A nearby line only counts when
+ * the reasons also overlap, so two different bugs three lines apart both post
+ * (S8D-B1). When both reasons name code identifiers and share none of them,
+ * the match is a sibling template rather than a reword, so it is not a
+ * duplicate (S8D-R1-N1). `identifiers` is a callback so the line scans run
+ * only for a nearby pair that reaches the veto (S8D-R2-N1).
+ */
+function isNearLocationDuplicate(
+  line: number,
+  reason: string,
+  otherLine: number,
+  otherReason: string,
+  identifiers: () => {
+    candidate: ReadonlySet<string>;
+    other: ReadonlySet<string>;
+  },
+): boolean {
+  const delta = Math.abs(line - otherLine);
+  if (delta > LOCATION_DUPLICATE_WINDOW) {
+    return false;
+  }
+  if (delta === 0) {
+    return true;
+  }
+  if (reasonSimilarity(reason, otherReason) < LOCATION_DUPLICATE_SIMILARITY) {
+    return false;
+  }
+
+  const named = identifiers();
+  return !(
+    named.candidate.size > 0 &&
+    named.other.size > 0 &&
+    !setsIntersect(named.candidate, named.other)
+  );
+}
+
+const IDENTIFIER_TOKEN = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+const BACKTICKED_SPAN = /`([^`]+)`/g;
+
+function setsIntersect(
+  a: ReadonlySet<string>,
+  b: ReadonlySet<string>,
+): boolean {
+  for (const value of a) {
+    if (b.has(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Code identifiers a reason names: every token inside backticks, plus
+ * identifier-like words that the diff line itself uses as code. Two sibling
+ * bugs written from one template name different code (`user.profile` vs
+ * `order.customer`), while a reword names the same `end`, `start`, `pageSize`
+ * and `slice` (S8D-R1-N1).
+ */
+function namedIdentifiers(
+  reason: string,
+  lineText: string | undefined,
+): Set<string> {
+  const named = new Set<string>();
+  for (const match of reason.matchAll(BACKTICKED_SPAN)) {
+    for (const token of (match[1] ?? "").match(IDENTIFIER_TOKEN) ?? []) {
+      named.add(token);
+    }
+  }
+
+  const lineTokens = new Set(lineText?.match(IDENTIFIER_TOKEN) ?? []);
+  for (const token of reason.match(IDENTIFIER_TOKEN) ?? []) {
+    if (lineTokens.has(token)) {
+      named.add(token);
+    }
+  }
+
+  return named;
+}
+
+/**
+ * Identifier sets for one classify pass, computed on demand and memoized per
+ * candidate and per thread. A pair reaches the veto at most once, so this
+ * bounds the full diff-line scans: nothing is scanned when the window or the
+ * similarity check already rejects the pair, the candidate is scanned at most
+ * once across all its threads, and each thread at most once across all
+ * candidates (S8D-R2-N1).
+ */
+interface IdentifierMemo {
+  candidate(candidate: Candidate): ReadonlySet<string>;
+  thread(item: ExistingFinding, line: number, side: DiffSide): ReadonlySet<string>;
+}
+
+function identifierMemo(
+  lineTextFor: ClassifyOptions["lineTextFor"],
+): IdentifierMemo {
+  const candidates = new WeakMap<Candidate, ReadonlySet<string>>();
+  const threads = new WeakMap<ExistingFinding, ReadonlySet<string>>();
+
+  return {
+    candidate: (candidate) => {
+      const known = candidates.get(candidate);
+      if (known !== undefined) {
+        return known;
+      }
+      const named = namedIdentifiers(
+        candidate.finding.reason,
+        lineTextFor?.(
+          candidate.finding.file,
+          candidate.finding.line,
+          candidate.finding.side,
+        ),
+      );
+      candidates.set(candidate, named);
+      return named;
+    },
+    thread: (item, line, side) => {
+      const known = threads.get(item);
+      if (known !== undefined) {
+        return known;
+      }
+      const named = namedIdentifiers(
+        item.reason,
+        lineTextFor?.(item.file, line, side),
+      );
+      threads.set(item, named);
+      return named;
+    },
+  };
+}
+
+/**
+ * Step 8c location dedupe: same path, category and side as an unresolved
+ * Bugbot comment, at the same line or nearby with a similar reason. A comment
+ * whose side is unknown is not used, so a LEFT finding can never be swallowed
+ * by a RIGHT comment on the same number (N5).
+ */
+function isLocationDuplicate(
+  candidate: Candidate,
+  existing: readonly ExistingFinding[],
+  identifiers: IdentifierMemo,
+): boolean {
+  return existing.some((item) => {
+    if (item.state === "resolved") {
+      return false;
+    }
+    if (
+      item.file !== candidate.finding.file ||
+      item.category !== candidate.finding.category ||
+      item.side === undefined ||
+      item.side === null ||
+      item.side !== candidate.finding.side
+    ) {
+      return false;
+    }
+    const line = existingCommentLine(item);
+    if (line === null) {
+      return false;
+    }
+    const side = item.side;
+
+    return isNearLocationDuplicate(
+      candidate.finding.line,
+      candidate.finding.reason,
+      line,
+      item.reason,
+      () => ({
+        candidate: identifiers.candidate(candidate),
+        other: identifiers.thread(item, line, side),
+      }),
+    );
+  });
+}
+
 function isExistingDuplicate(
   candidate: Candidate,
   existing: readonly ExistingFinding[],
+  identifiers: IdentifierMemo,
 ): boolean {
   if (existing.some((item) => item.hash === candidate.hash)) {
+    return true;
+  }
+
+  if (isLocationDuplicate(candidate, existing, identifiers)) {
     return true;
   }
 
@@ -1980,14 +2221,33 @@ function isExistingDuplicate(
   );
 }
 
+/** True when the finding's line is inside a hunk of the incremental diff. */
+function scopeAllows(finding: Finding, scope: ScopeLines): boolean {
+  const ranges = scope.get(finding.file);
+  if (ranges === undefined) {
+    return false;
+  }
+
+  return ranges.some(
+    (range) =>
+      range.side === finding.side &&
+      finding.line >= range.start &&
+      finding.line <= range.end,
+  );
+}
+
 /**
  * Turns schema-valid findings into inline comments plus summary counts.
  *
  * Per finding the checks run in this order: schema, confidence/severity/diff
- * line, self-triage with the safety override, in-pass dedupe (same hash keeps
- * the highest confidence, then the lowest anchor), cross-pass dedupe against
- * existing comments, then the per-pass cap. Invalid items count as
- * `schemaInvalid`, so the printed buckets add up to the model's findings.
+ * line, self-triage with the safety override, cross-pass dedupe against
+ * existing comments, incremental scope, in-pass hash dedupe (the highest
+ * confidence, then the lowest anchor), in-pass same-line location dedupe, then
+ * the per-pass cap. Scope runs before the in-pass passes so an out-of-scope
+ * neighbour cannot remove an in-scope finding (S8D-B2), while cross-pass
+ * dedupe stays first so a reworded repeat is still a duplicate. Invalid items
+ * count as `schemaInvalid`, so the printed buckets add up to the model's
+ * findings.
  */
 export function classifyFindings(
   findings: readonly unknown[],
@@ -2054,10 +2314,41 @@ export function classifyFindings(
     });
   }
 
+  // Cross-pass dedupe first: hash equality in any state, a reworded finding
+  // with the same file, category and deterministic symbol, or step 8c location
+  // equality against an unresolved thread. Counting a duplicate before the
+  // scope test is what keeps the live rewrite at F:7 a duplicate rather than
+  // an out-of-scope miss.
+  const afterCrossPass: Candidate[] = [];
+  const identifiers = identifierMemo(options.lineTextFor);
+  for (const candidate of survivors) {
+    if (isExistingDuplicate(candidate, existing, identifiers)) {
+      summary.duplicate += 1;
+      continue;
+    }
+
+    afterCrossPass.push(candidate);
+  }
+
+  // Incremental scope next, before any in-pass dedupe: an out-of-scope
+  // finding must never occupy a line and remove an in-scope neighbour
+  // (S8D-B2). It still counts as out of scope rather than duplicate.
+  const inScope: Candidate[] = [];
+  for (const candidate of afterCrossPass) {
+    if (
+      options.scope !== undefined &&
+      !scopeAllows(candidate.finding, options.scope)
+    ) {
+      summary.outOfScope += 1;
+      continue;
+    }
+    inScope.push(candidate);
+  }
+
   // In-pass dedupe: the same identity keeps its highest-confidence copy, with
   // a deterministic anchor when confidence also ties.
   const bestByHash = new Map<string, Candidate>();
-  for (const candidate of survivors) {
+  for (const candidate of inScope) {
     const previous = bestByHash.get(candidate.hash);
     if (previous === undefined) {
       bestByHash.set(candidate.hash, candidate);
@@ -2074,19 +2365,27 @@ export function classifyFindings(
     }
   }
 
-  // Cross-pass dedupe: hash equality in any state, or a reworded finding with
-  // the same file, category and deterministic symbol.
+  // In-pass location dedupe: a differently worded finding on the exact same
+  // line, path, category and side is the same finding. The within-3-lines rule
+  // deliberately does not apply here: a model that lists two findings in one
+  // response meant two findings, and the live reword was cross-pass
+  // (S8D-R1-N1). Candidates arrive in deterministic quality order, so the
+  // first wins.
+  const keptLocations = new Map<string, Set<number>>();
   const postable: Candidate[] = [];
-  for (const candidate of bestByHash.values()) {
-    if (isExistingDuplicate(candidate, existing)) {
+  for (const candidate of [...bestByHash.values()].sort(compareCandidates)) {
+    const key = `${candidate.finding.file}\u0000${candidate.finding.category}\u0000${candidate.finding.side}`;
+    const occupied = keptLocations.get(key) ?? new Set<number>();
+    if (occupied.has(candidate.finding.line)) {
       summary.duplicate += 1;
       continue;
     }
 
+    occupied.add(candidate.finding.line);
+    keptLocations.set(key, occupied);
     postable.push(candidate);
   }
 
-  postable.sort(compareCandidates);
   const kept = postable.slice(0, maxComments);
   summary.posted = kept.length;
   summary.overCap = postable.length - kept.length;

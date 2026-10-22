@@ -232,7 +232,8 @@ function reviewSummary(overrides: Partial<ReviewSummary> = {}): ReviewSummary {
     tokensIn: 1234,
     tokensOut: 56,
     posted: 3,
-    skipped: 2,
+    openComments: 7,
+    skipped: { duplicate: 1, belowConfidence: 1 },
     resolved: 1,
     truncated: [],
     ...overrides,
@@ -937,7 +938,8 @@ describe("safe file names in output (R1-N3)", () => {
         tokensIn: 0,
         tokensOut: 0,
         posted: 0,
-        skipped: 0,
+        openComments: 0,
+        skipped: {},
         resolved: 0,
         truncated: [hostile],
       },
@@ -946,6 +948,36 @@ describe("safe file names in output (R1-N3)", () => {
 
     expect(body).toContain("`x?::warning::pwned\\y.ts`");
     expect(body).not.toContain("\n::warning::");
+  });
+
+  it("names every non-zero skipped bucket and keeps the markers", () => {
+    const body = renderSummary(
+      reviewSummary({
+        posted: 1,
+        openComments: 3,
+        skipped: {
+          duplicate: 1,
+          belowConfidence: 2,
+          lowSeverity: 0,
+          notInDiff: 1,
+          triageDismissed: 0,
+          overCap: 0,
+          schemaInvalid: 0,
+          outOfScope: 1,
+        },
+        runs: ["111", "222"],
+      }),
+    );
+
+    expect(body.startsWith("<!-- bugbot:summary -->")).toBe(true);
+    expect(body).toContain("<!-- bugbot:runs 111,222 -->");
+    expect(body).toContain("- Posted this pass: 1");
+    expect(body).toContain("- Open Bugbot comments: 3");
+    expect(body).toContain(
+      "- Skipped: 1 duplicate, 2 below confidence, 1 not in diff, 1 out of scope",
+    );
+    expect(body).not.toContain("- Posted:");
+    expect(body).not.toContain("- Skipped: 0");
   });
 });
 
@@ -967,8 +999,9 @@ describe("upsertSummary", () => {
     expect(body).toContain("- Passes: 2");
     expect(body).toContain("- Model: deepseek/deepseek-v4.1-flash-1017");
     expect(body).toContain("- Tokens: 1234 in / 56 out");
-    expect(body).toContain("- Posted: 3");
-    expect(body).toContain("- Skipped: 2");
+    expect(body).toContain("- Posted this pass: 3");
+    expect(body).toContain("- Open Bugbot comments: 7");
+    expect(body).toContain("- Skipped: 1 duplicate, 1 below confidence");
     expect(body).toContain("- Resolved: 1");
     expect(body.trimEnd().endsWith("Bugbot only comments; it never approves or blocks.")).toBe(
       true,
@@ -2237,8 +2270,20 @@ describe("listCheckRuns", () => {
     const found = await listCheckRuns(options({ fetch: fetchFn }));
 
     expect(found).toEqual([
-      { id: 5, status: "completed", externalId: "999", appId: null },
-      { id: 88, status: "in_progress", externalId: "12345", appId: null },
+      {
+        id: 5,
+        status: "completed",
+        externalId: "999",
+        appId: null,
+        conclusion: null,
+      },
+      {
+        id: 88,
+        status: "in_progress",
+        externalId: "12345",
+        appId: null,
+        conclusion: null,
+      },
     ]);
     expect(calls[0]?.path).toBe(`/repos/o/r/commits/${SHA}/check-runs`);
     expect(calls[0]?.search).toContain("check_name=bugbot");
@@ -2276,6 +2321,36 @@ describe("listCheckRuns", () => {
       }),
     );
     expect(await listCheckRuns(options({ fetch: fetchFn }))).toEqual([]);
+  });
+
+  it("reads the conclusion and can list another commit (S8D-B3)", async () => {
+    const other = "d".repeat(40);
+    const { fetchFn, calls } = recording(() =>
+      json({
+        check_runs: [
+          {
+            id: 5,
+            name: "bugbot",
+            external_id: "999",
+            status: "completed",
+            conclusion: "success",
+            app: { id: 4242 },
+          },
+          {
+            id: 6,
+            name: "bugbot",
+            external_id: "1000",
+            status: "completed",
+            conclusion: "neutral",
+          },
+        ],
+      }),
+    );
+
+    const found = await listCheckRuns(options({ fetch: fetchFn }), other);
+
+    expect(found.map((run) => run.conclusion)).toEqual(["success", "neutral"]);
+    expect(calls[0]?.path).toBe(`/repos/o/r/commits/${other}/check-runs`);
   });
 });
 

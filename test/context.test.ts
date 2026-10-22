@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyTokenBudget,
   buildContext,
+  diffLineTexts,
   hunkContextsFromDiff,
   hunkRangesByPath,
   parseDiff,
@@ -869,6 +870,36 @@ describe("hunkContextsFromDiff", () => {
     ]);
   });
 
+  it("translates a compare hunk that starts inside the PR hunk (N3 offset)", () => {
+    const prDiff = [
+      "diff --git a/src/order.ts b/src/order.ts",
+      "--- a/src/order.ts",
+      "+++ b/src/order.ts",
+      "@@ -1,4 +1,4 @@",
+      " a",
+      " b",
+      "-c",
+      "+C",
+      " d",
+      "",
+    ].join("\n");
+    const compareDiff = [
+      "diff --git a/src/order.ts b/src/order.ts",
+      "--- a/src/order.ts",
+      "+++ b/src/order.ts",
+      "@@ -3,2 +3,2 @@",
+      " b",
+      "-c",
+      "+C",
+      "",
+    ].join("\n");
+
+    expect(hunkContextsFromDiff(compareDiff, prDiff).get("src/order.ts")).toEqual([
+      { side: "RIGHT", start: 3, end: 4, context: "" },
+      { side: "LEFT", start: 3, end: 4, context: "" },
+    ]);
+  });
+
   it("returns an empty context when the header has none", () => {
     const diff = [
       "diff --git a/src/a.ts b/src/a.ts",
@@ -894,5 +925,36 @@ describe("comment-sicko in the budget", () => {
 
     expect(context.systemPromptChars).toBe(prompt.system.length);
     expect(context.estimatedTokens).toBe(prompt.estimatedTokens);
+  });
+});
+
+describe("diffLineTexts", () => {
+  it("keeps added, deleted and context lines on their own side and path (S8D-R2-N5)", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -4,3 +5,3 @@",
+      " context old",
+      "-deleted",
+      "+added",
+      " tail",
+      "",
+    ].join("\n");
+    const lineText = diffLineTexts(diff);
+
+    // Hunk starts at old line 4 and new line 5.
+    expect(lineText("src/a.ts", 4, "LEFT")).toBe("context old");
+    expect(lineText("src/a.ts", 5, "RIGHT")).toBe("context old");
+    expect(lineText("src/a.ts", 5, "LEFT")).toBe("deleted");
+    expect(lineText("src/a.ts", 5, "RIGHT")).toBe("context old");
+    expect(lineText("src/a.ts", 6, "RIGHT")).toBe("added");
+    expect(lineText("src/a.ts", 6, "LEFT")).toBe("tail");
+    expect(lineText("src/a.ts", 7, "RIGHT")).toBe("tail");
+
+    // A line the diff does not carry, a side it does not carry, and another
+    // file all read undefined rather than throwing.
+    expect(lineText("src/a.ts", 8, "RIGHT")).toBeUndefined();
+    expect(lineText("src/missing.ts", 5, "RIGHT")).toBeUndefined();
   });
 });

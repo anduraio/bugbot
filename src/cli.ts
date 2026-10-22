@@ -4,6 +4,8 @@ import { readFile as readTextFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  compareCommitStatus,
+  fetchCompareDiff,
   fetchPullRequestDetails,
   fetchPullRequestDiff,
   findSummary,
@@ -19,15 +21,18 @@ import {
   startCheck,
   upsertSummary,
   type CheckRunHandle,
+  type CheckRunInfo,
   type GitHubOptions,
   type PlannedRequest,
   type ReviewSummary,
+  type SkippedCounts,
   type SummaryComment,
 } from "./github.js";
 import { pullRequestFromEvent, shouldReview } from "./gate.js";
 import {
   buildContext,
   changedLinesFromDiff,
+  diffLineTexts,
   hunkContextsFromDiff,
   parseDiff,
   selectModel,
@@ -59,6 +64,7 @@ import {
   type ExistingFinding,
   type Finding,
   type PlannedComment,
+  type ScopeLines,
 } from "./filter.js";
 
 /**
@@ -155,6 +161,7 @@ function emptySummary(): ClassifySummary {
     triageDismissed: 0,
     duplicate: 0,
     overCap: 0,
+    outOfScope: 0,
     schemaInvalid: 0,
   };
 }
@@ -522,6 +529,7 @@ export async function runLocalReview(
         }
         return undefined;
       },
+      lineTextFor: diffLineTexts(diff),
     });
 
     log(`Planned comments: ${classified.post.length}`);
@@ -624,6 +632,19 @@ function uniqueRuns(values: readonly string[]): string[] {
   return runs;
 }
 
+/** Reads the last known `Open Bugbot comments` count from a summary. */
+function parseOpenComments(body: string | null): number | null {
+  if (body === null) {
+    return null;
+  }
+  const match = /^- Open Bugbot comments: (\d+)$/m.exec(body);
+  if (match === null) {
+    return null;
+  }
+  const value = Number.parseInt(match[1] ?? "", 10);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 /** Reads the hidden `<!-- bugbot:runs ... -->` line from a summary. */
 function parseRunIds(body: string | null): string[] {
   if (body === null) {
@@ -637,6 +658,60 @@ function parseRunIds(body: string | null): string[] {
     .split(",")
     .map((value) => value.trim())
     .filter((value) => value !== "");
+}
+
+const SHA40 = /^[0-9a-f]{40}$/;
+const MAX_EVENT_BYTES = 2 * 1024 * 1024;
+
+interface SynchronizeRange {
+  before: string;
+  after: string;
+}
+
+/**
+ * The before..after range for a synchronize event, or null when the event is
+ * absent, another action (reopened keeps the full PR diff), malformed, or
+ * names a head other than the one the API returned. GitHub exposes the event
+ * payload through GITHUB_EVENT_PATH, so the workflow needs no extra input.
+ */
+async function synchronizeRange(
+  readEnv: (name: string) => string,
+  headSha: string,
+): Promise<SynchronizeRange | null> {
+  const path = readEnv("GITHUB_EVENT_PATH").trim();
+  if (path === "") {
+    return null;
+  }
+
+  try {
+    const raw = await readTextFile(path, "utf8");
+    if (raw.length > MAX_EVENT_BYTES) {
+      return null;
+    }
+    const event: unknown = JSON.parse(raw);
+    if (typeof event !== "object" || event === null) {
+      return null;
+    }
+    const record = event as Record<string, unknown>;
+    if (record.action !== "synchronize") {
+      return null;
+    }
+    const before = record.before;
+    const after = record.after;
+    if (
+      typeof before !== "string" ||
+      typeof after !== "string" ||
+      !SHA40.test(before) ||
+      !SHA40.test(after) ||
+      before === after ||
+      after !== headSha
+    ) {
+      return null;
+    }
+    return { before, after };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -654,6 +729,62 @@ function isNotNewerRun(externalId: string | null, runId: string): boolean {
 function planLine(plan: PlannedRequest): string {
   const body = plan.body === undefined ? "" : ` ${JSON.stringify(plan.body)}`;
   return `Dry run plan: ${plan.method} ${plan.path}${body}`;
+}
+
+interface ReviewedBefore {
+  ok: boolean;
+  /** One line for the log, naming the check run and its conclusion. */
+  why: string;
+}
+
+/**
+ * S8D-B3: true only when this app left a successful `bugbot` check run on the
+ * `before` commit. Without that, the commits in between were never reviewed
+ * (a cancelled run or a failed pass) and narrowing the scope to `before..after`
+ * would drop their bugs permanently. The lookup reuses the existing
+ * `check_name=bugbot` route and compares the app id, so another app's check
+ * never counts.
+ */
+async function beforeWasReviewed(
+  github: GitHubOptions,
+  check: CheckRunHandle | null,
+  sha: string,
+  reasonOf: (error: unknown) => string,
+): Promise<ReviewedBefore> {
+  const appId = check?.appId;
+  if (appId === undefined || appId === null) {
+    return {
+      ok: false,
+      why: "this pass's bugbot app is unknown, so its check run cannot be matched",
+    };
+  }
+
+  let runs: readonly CheckRunInfo[];
+  try {
+    runs = await listCheckRuns(github, sha);
+  } catch (caught) {
+    return { ok: false, why: `could not read check runs: ${reasonOf(caught)}` };
+  }
+
+  const own = runs.filter((run) => run.appId === appId);
+  if (own.length === 0) {
+    return { ok: false, why: "no check run from this app on that commit" };
+  }
+  if (own.some((run) => run.conclusion === "success")) {
+    return { ok: true, why: "the bugbot check on that commit succeeded" };
+  }
+
+  const conclusions = [
+    ...new Set(
+      own.map((run) => run.conclusion ?? run.status ?? "unknown"),
+    ),
+  ];
+  return {
+    ok: false,
+    why: `the bugbot check did not succeed (${conclusions
+      .map((value) => safeDisplay(value))
+      .join(", ")})`,
+  };
 }
 
 /**
@@ -841,13 +972,17 @@ export async function runPrReview(
 
   let posted = 0;
   let failedToPost = 0;
-  let skippedFindings = 0;
   let resolved = 0;
+  let openThreads = 0;
+  /** False until the thread list is read; the summary must not report 0 then. */
+  let threadsListed = false;
   let tokensIn = 0;
   let tokensOut = 0;
   let modelUsed = model;
   let truncated: readonly string[] = [];
   let threadRunIds: string[] = [];
+  let scope: ScopeLines | undefined;
+  let skippedBuckets: SkippedCounts = {};
 
   if (error === null) {
     try {
@@ -867,6 +1002,62 @@ export async function runPrReview(
       const fileStatus = new Map(
         parsedDiff.files.map((file) => [file.path, file.status]),
       );
+
+      // Step 8c incremental review: on a synchronize push whose `before` is an
+      // ancestor of `after`, only findings inside a before..after hunk may
+      // post. The model still sees every changed file in full. A force-push
+      // (`diverged`), a reopened PR, a stale event or any compare failure
+      // keeps the full PR diff. S8D-B3: `ahead` alone is not enough; the
+      // `before` commit must carry a successful check run from this app,
+      // otherwise its bugs were never reviewed and narrowing would hide them
+      // for good.
+      const syncRange = await synchronizeRange(readEnv, pr.headSha);
+      if (syncRange !== null) {
+        const before = syncRange.before.slice(0, 7);
+        const after = syncRange.after.slice(0, 7);
+        try {
+          const status = await compareCommitStatus({
+            token,
+            repository,
+            baseSha: syncRange.before,
+            headSha: syncRange.after,
+            ...transport,
+          });
+          if (status === "ahead") {
+            const reviewed = await beforeWasReviewed(
+              github,
+              check,
+              syncRange.before,
+              reasonOf,
+            );
+            if (reviewed.ok) {
+              const compareDiff = await fetchCompareDiff({
+                token,
+                repository,
+                baseSha: syncRange.before,
+                headSha: syncRange.after,
+                ...transport,
+              });
+              scope = hunkContextsFromDiff(compareDiff, diff);
+              log(
+                `Bugbot: incremental review ${before}..${after}: ${reviewed.why}`,
+              );
+            } else {
+              log(
+                `Bugbot: full review; ${before} was not reviewed: ${reviewed.why}`,
+              );
+            }
+          } else {
+            log(
+              `Bugbot: full review; ${before} is not an ancestor of ${after} (${safeDisplay(status)})`,
+            );
+          }
+        } catch (caught) {
+          log(
+            `Bugbot: could not read ${before}..${after}, reviewing the full PR diff: ${reasonOf(caught)}`,
+          );
+        }
+      }
 
       // Right side: head content. Left side: base content. Only paths named in
       // the diff are ever requested (plus the AGENTS.md lookup below).
@@ -988,7 +1179,9 @@ export async function runPrReview(
       const parsedResponse = parseJsonResponse(result.raw);
 
       const threads = await listBugbotThreads(github);
+      threadsListed = true;
       threadRunIds = threads.map((thread) => thread.marker.runId);
+      openThreads = threads.filter((thread) => thread.state === "open").length;
       // A missing category is mapped to "bug" so the marker hash can still
       // match; the empty symbol makes the fuzzy branch effectively hash-only.
       const existing: ExistingFinding[] = threads.map((thread) => ({
@@ -998,6 +1191,9 @@ export async function runPrReview(
         symbol: "",
         reason: thread.reason,
         state: thread.state,
+        line: thread.line,
+        originalLine: thread.originalLine,
+        side: thread.side,
       }));
 
       const headFor = (file: string): string | undefined =>
@@ -1027,26 +1223,31 @@ export async function runPrReview(
         return undefined;
       };
       const minConfidence = minConfidenceFromEnv(rawMinConfidence);
+      const lineTextFor = diffLineTexts(diff);
 
       const classified = classifyFindings(parsedResponse.findings, {
         changedLines: parsedDiff.changedLines,
         minConfidence,
         existing,
         schemaInvalid: parsedResponse.dropped.count,
+        scope,
         contentFor,
         contentIsFullFor,
         hunkContextFor,
+        lineTextFor,
       });
 
       const buckets = classified.summary;
-      skippedFindings =
-        buckets.belowConfidence +
-        buckets.lowSeverity +
-        buckets.notInDiff +
-        buckets.triageDismissed +
-        buckets.duplicate +
-        buckets.overCap +
-        buckets.schemaInvalid;
+      skippedBuckets = {
+        duplicate: buckets.duplicate,
+        belowConfidence: buckets.belowConfidence,
+        lowSeverity: buckets.lowSeverity,
+        notInDiff: buckets.notInDiff,
+        triageDismissed: buckets.triageDismissed,
+        overCap: buckets.overCap,
+        schemaInvalid: buckets.schemaInvalid,
+        outOfScope: buckets.outOfScope,
+      };
 
       if (classified.post.length > 0) {
         const intended = classified.post.length;
@@ -1114,11 +1315,15 @@ export async function runPrReview(
               symbol: "",
               reason: thread.reason,
               state: thread.state,
+              line: thread.line,
+              originalLine: thread.originalLine,
+              side: thread.side,
             },
           ],
           contentFor,
           contentIsFullFor,
           hunkContextFor,
+          lineTextFor,
         });
         // In-pass duplicates count too; that only keeps more threads open.
         if (duplicateCheck.summary.duplicate > 0) {
@@ -1244,8 +1449,14 @@ export async function runPrReview(
     tokensIn,
     tokensOut,
     posted,
+    // S8D-B4: a pass that failed before listBugbotThreads must not write 0
+    // over the last known count. Keep the previous summary's value, or say
+    // `unknown` when there is none.
+    openComments: threadsListed
+      ? Math.max(0, openThreads - resolved) + posted
+      : (parseOpenComments(previous?.body ?? null) ?? "unknown"),
     failed: failedToPost,
-    skipped: skippedFindings,
+    skipped: skippedBuckets,
     resolved,
     truncated,
     ...(runs.length > 0 ? { runs } : {}),

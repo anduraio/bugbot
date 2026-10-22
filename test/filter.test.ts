@@ -27,7 +27,9 @@ import {
   type ExistingFinding,
   type Finding,
   type PlannedComment,
+  type ScopeLines,
 } from "../src/filter.js";
+import { diffLineTexts } from "../src/context.js";
 
 function finding(overrides: Partial<Finding> = {}): Finding {
   return FindingSchema.parse({
@@ -1216,6 +1218,12 @@ describe("classifyFindings", () => {
         line: number,
         side: DiffSide,
       ) => string | undefined;
+      lineTextFor?: (
+        file: string,
+        line: number,
+        side: DiffSide,
+      ) => string | undefined;
+      scope?: ScopeLines;
     } = {},
   ) {
     return classifyFindings(items, { changedLines, ...options });
@@ -1294,6 +1302,578 @@ describe("classifyFindings", () => {
     expect(result.summary.posted).toBe(1);
   });
 
+  it("dedupes the same line regardless of wording, and nearby only when the reason overlaps (S8D-B1)", () => {
+    const existingAt = (line: number, reason: string): ExistingFinding[] => [
+      {
+        hash: "a".repeat(40),
+        file: "src/billing.ts",
+        category: "bug",
+        symbol: "",
+        reason,
+        state: "open",
+        line,
+        originalLine: line,
+        side: "RIGHT",
+      },
+    ];
+
+    // The live case: same line, the model reworded it completely.
+    const sameLine = classify(
+      [finding({ line: 42, reason: "Totally new wording for the same defect." })],
+      {
+        existing: existingAt(
+          42,
+          "Something completely unrelated from an earlier pass.",
+        ),
+      },
+    );
+    expect(sameLine.post).toHaveLength(0);
+    expect(sameLine.summary.duplicate).toBe(1);
+
+    // A reworded repeat three lines away still dedupes.
+    const nearbyReworded = classify(
+      [finding({ line: 42, reason: "A reworded null check bug." })],
+      {
+        existing: existingAt(
+          45,
+          "The null check bug is reworded but still the same bug.",
+        ),
+      },
+    );
+    expect(
+      reasonSimilarity(
+        "A reworded null check bug.",
+        "The null check bug is reworded but still the same bug.",
+      ),
+    ).toBeGreaterThanOrEqual(0.2);
+    expect(nearbyReworded.post).toHaveLength(0);
+    expect(nearbyReworded.summary.duplicate).toBe(1);
+
+    // Two different bugs three lines apart both post.
+    const nearbyDifferent = classify(
+      [finding({ line: 42, reason: "A null check bug." })],
+      {
+        existing: existingAt(
+          45,
+          "Completely unrelated arithmetic overflow on another path.",
+        ),
+      },
+    );
+    expect(
+      reasonSimilarity(
+        "A null check bug.",
+        "Completely unrelated arithmetic overflow on another path.",
+      ),
+    ).toBeLessThan(0.2);
+    expect(nearbyDifferent.post).toHaveLength(1);
+    expect(nearbyDifferent.summary.duplicate).toBe(0);
+
+    // Four lines away is never a location duplicate, however similar.
+    const tooFar = classify(
+      [finding({ line: 42, reason: "A reworded null check bug." })],
+      {
+        existing: existingAt(
+          46,
+          "The null check bug is reworded but still the same bug.",
+        ),
+      },
+    );
+    expect(tooFar.post).toHaveLength(1);
+    expect(tooFar.summary.duplicate).toBe(0);
+  });
+
+  it("keeps a nearby bug that names different code and still merges one that names the same code (S8D-R1-N1)", () => {
+    const existingAt = (line: number, reason: string): ExistingFinding[] => [
+      {
+        hash: "a".repeat(40),
+        file: "src/billing.ts",
+        category: "bug",
+        symbol: "",
+        reason,
+        state: "open",
+        line,
+        originalLine: line,
+        side: "RIGHT",
+      },
+    ];
+
+    // The sibling template: the same sentence written about different code.
+    const differentCode = classify(
+      [
+        finding({
+          line: 43,
+          reason:
+            "`order.customer` may be missing on this path, so reading a property throws a TypeError.",
+        }),
+      ],
+      {
+        existing: existingAt(
+          42,
+          "`user.profile` can be undefined here, so reading a property throws a TypeError.",
+        ),
+        lineTextFor: (_file, line) =>
+          line === 42 ? "  return user.profile.name;" : "  return order.customer.email;",
+      },
+    );
+    expect(differentCode.post).toHaveLength(1);
+    expect(differentCode.summary.duplicate).toBe(0);
+
+    // The same code named by both is a reword, not a sibling.
+    const sameCode = classify(
+      [
+        finding({
+          line: 43,
+          reason:
+            "`user.profile` can be undefined here, so reading `user.profile.name` throws.",
+        }),
+      ],
+      {
+        existing: existingAt(
+          42,
+          "`user.profile` can be undefined here, so reading `user.profile.name` throws a TypeError.",
+        ),
+      },
+    );
+    expect(sameCode.post).toHaveLength(0);
+    expect(sameCode.summary.duplicate).toBe(1);
+
+    // The live case: both reasons name `end`, `start`, `pageSize` and `slice`.
+    const live = classify(
+      [
+        finding({
+          line: 43,
+          reason:
+            "`slice` receives `start` and `pageSize`; the `end` bound is missing.",
+        }),
+      ],
+      {
+        existing: existingAt(
+          42,
+          "`slice` takes `start` and `pageSize`, but the `end` index is never passed.",
+        ),
+      },
+    );
+    expect(live.post).toHaveLength(0);
+    expect(live.summary.duplicate).toBe(1);
+
+    // Only one side naming code is not enough to veto: that is a reword.
+    const oneSided = classify(
+      [
+        finding({
+          line: 42,
+          reason: "The profile lookup returns undefined, so the next read throws.",
+        }),
+      ],
+      { existing: existingAt(42, "`user.profile` can be undefined here.") },
+    );
+    expect(oneSided.post).toHaveLength(0);
+    expect(oneSided.summary.duplicate).toBe(1);
+
+    // Identifier-like words that the diff line itself uses as code count too,
+    // so two bare-word siblings naming different code are not merged.
+    const bareSiblings = classify(
+      [
+        finding({
+          line: 43,
+          reason: "begin and finish bound the loop, so the tail is skipped.",
+        }),
+      ],
+      {
+        existing: existingAt(
+          42,
+          "end and start bound the slice, so the pageSize is ignored.",
+        ),
+        lineTextFor: (_file, line) =>
+          line === 42
+            ? "  const rows = items.slice(start, end); // pageSize"
+            : "  const rows = items.slice(begin, finish);",
+      },
+    );
+    expect(bareSiblings.post).toHaveLength(1);
+    expect(bareSiblings.summary.duplicate).toBe(0);
+  });
+
+  it("dedupes a same-line reword regardless of the code it names (S8D-R2-N2)", () => {
+    const existingAt = (line: number, reason: string): ExistingFinding[] => [
+      {
+        hash: "a".repeat(40),
+        file: "src/billing.ts",
+        category: "bug",
+        symbol: "",
+        reason,
+        state: "open",
+        line,
+        originalLine: line,
+        side: "RIGHT",
+      },
+    ];
+
+    // The reviewer's probe: the first pass blames the callee, the reword the
+    // variable. Same line, so it is the same finding.
+    const calleeVsVariable = classify(
+      [
+        finding({
+          line: 42,
+          reason: "`user` is dereferenced after the lookup without a guard.",
+        }),
+      ],
+      {
+        existing: existingAt(
+          42,
+          "`getUser` can return `null`, which is then dereferenced on the next line.",
+        ),
+        lineTextFor: () => "  const user = getUser(id);",
+      },
+    );
+    expect(calleeVsVariable.post).toHaveLength(0);
+    expect(calleeVsVariable.summary.duplicate).toBe(1);
+
+    // No diff line text at all: disjoint backticks are still the same finding
+    // on the same line (reviewer probe MISS2).
+    const noLineText = classify(
+      [finding({ line: 42, reason: "`user` is dereferenced unguarded." })],
+      { existing: existingAt(42, "`getUser` can return `null`.") },
+    );
+    expect(noLineText.post).toHaveLength(0);
+    expect(noLineText.summary.duplicate).toBe(1);
+  });
+
+  it("computes identifier sets only at the veto, once per candidate and thread (S8D-R2-N1)", () => {
+    const threadAt = (
+      line: number,
+      reason: string,
+      hash: string,
+    ): ExistingFinding => ({
+      hash: hash.repeat(40),
+      file: "src/billing.ts",
+      category: "bug",
+      symbol: "",
+      reason,
+      state: "open",
+      line,
+      originalLine: line,
+      side: "RIGHT",
+    });
+    const lineTextFor = (_file: string, line: number, _side: DiffSide): string =>
+      `  const other${line} = compute();`;
+
+    let calls = 0;
+    const counted = (
+      _file: string,
+      line: number,
+      _side: DiffSide,
+    ): string => {
+      calls += 1;
+      return lineTextFor(_file, line, _side);
+    };
+
+    // Outside the line window: no identifier scan.
+    const far = classify(
+      [finding({ line: 42, reason: "`slice` drops the bound." })],
+      {
+        existing: [threadAt(50, "`slice` drops `end`.", "a")],
+        lineTextFor: counted,
+      },
+    );
+    expect(far.summary.duplicate).toBe(0);
+    expect(calls).toBe(0);
+
+    // Inside the window but below the similarity bar: no identifier scan.
+    const dissimilar = classify(
+      [finding({ line: 42, reason: "`alpha` `beta` `gamma` are all ignored." })],
+      {
+        existing: [threadAt(43, "`one` `two` `three` are unrelated.", "a")],
+        lineTextFor: counted,
+      },
+    );
+    expect(dissimilar.summary.duplicate).toBe(0);
+    expect(calls).toBe(0);
+
+    // The same line: a duplicate without touching the diff text.
+    const sameLine = classify(
+      [finding({ line: 42, reason: "`alpha` `beta` are ignored here." })],
+      {
+        existing: [threadAt(42, "`one` `two` are missing here.", "a")],
+        lineTextFor: counted,
+      },
+    );
+    expect(sameLine.summary.duplicate).toBe(1);
+    expect(calls).toBe(0);
+
+    // Two nearby threads: the veto is reached, the candidate line is read
+    // once and each thread line once, not once per candidate x thread pair.
+    const nearby = classify(
+      [
+        finding({
+          line: 42,
+          reason: "`user` is dereferenced after the lookup without a guard.",
+        }),
+      ],
+      {
+        existing: [
+          threadAt(
+            43,
+            "`getUser` can return `null`, so the result is dereferenced without a guard.",
+            "a",
+          ),
+          threadAt(
+            44,
+            "`findUser` may return `null`, so the value is dereferenced without a guard.",
+            "b",
+          ),
+        ],
+        lineTextFor: counted,
+      },
+    );
+    expect(nearby.summary.duplicate).toBe(0);
+    expect(calls).toBe(3);
+  });
+
+  it("keeps two different bugs one line apart inside one pass (S8D-B1 probe P2a)", () => {
+    const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      ["src/billing.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([42, 43, 45, 46])]])],
+    ]);
+    const distinct = classifyFindings(
+      [
+        finding({ line: 42, reason: "The cache is never invalidated." }),
+        finding({ line: 43, reason: "Stale cache entries are served." }),
+      ],
+      { changedLines: lines },
+    );
+    expect(distinct.post.map((comment) => comment.line)).toEqual([42, 43]);
+    expect(distinct.summary.duplicate).toBe(0);
+
+    // Inside one pass the within-3-lines rule is gone: a model that lists two
+    // findings in one response meant two findings (S8D-R1-N1).
+    const rewordedNearby = classifyFindings(
+      [
+        finding({ line: 42, reason: "The cache is never invalidated after writes." }),
+        finding({ line: 45, reason: "The cache is never invalidated after a write." }),
+      ],
+      { changedLines: lines },
+    );
+    expect(rewordedNearby.post.map((comment) => comment.line)).toEqual([42, 45]);
+    expect(rewordedNearby.summary.duplicate).toBe(0);
+
+    const sameLine = classifyFindings(
+      [
+        finding({ line: 42, reason: "The cache is never invalidated." }),
+        finding({ line: 42, reason: "Stale cache entries are served." }),
+      ],
+      { changedLines: lines },
+    );
+    expect(sameLine.post).toHaveLength(1);
+    expect(sameLine.summary.duplicate).toBe(1);
+
+    const farther = classifyFindings(
+      [
+        finding({ line: 42, reason: "The cache is never invalidated after writes." }),
+        finding({ line: 46, reason: "The cache is never invalidated after a write." }),
+      ],
+      { changedLines: lines },
+    );
+    expect(farther.post).toHaveLength(2);
+    expect(farther.summary.duplicate).toBe(0);
+  });
+
+  it("does not dedupe a LEFT finding against a RIGHT comment on the same number (N5)", () => {
+    const result = classify([finding({ side: "LEFT", line: 41 })], {
+      existing: [
+        {
+          hash: "a".repeat(40),
+          file: "src/billing.ts",
+          category: "bug",
+          symbol: "",
+          reason: "Same words on the head side.",
+          state: "open",
+          line: 41,
+          originalLine: 41,
+          side: "RIGHT",
+        },
+      ],
+    });
+
+    expect(result.post).toHaveLength(1);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("does not dedupe the same line in a different category", () => {
+    const result = classify(
+      [finding({ line: 42, category: "security", reason: "Security wording." })],
+      {
+        existing: [
+          {
+            hash: "a".repeat(40),
+            file: "src/billing.ts",
+            category: "bug",
+            symbol: "",
+            reason: "Something completely unrelated.",
+            state: "open",
+            line: 42,
+            originalLine: 42,
+            side: "RIGHT",
+          },
+        ],
+      },
+    );
+
+    expect(result.post).toHaveLength(1);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("does not dedupe the same line in a different path", () => {
+    const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      ["src/billing.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([42])]])],
+      ["src/other.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([42])]])],
+    ]);
+    const result = classifyFindings(
+      [finding({ file: "src/other.ts", line: 42, reason: "Other file wording." })],
+      {
+        changedLines: lines,
+        existing: [
+          {
+            hash: "a".repeat(40),
+            file: "src/billing.ts",
+            category: "bug",
+            symbol: "",
+            reason: "Something completely unrelated.",
+            state: "open",
+            line: 42,
+            originalLine: 42,
+            side: "RIGHT",
+          },
+        ],
+      },
+    );
+
+    expect(result.post).toHaveLength(1);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("does not let a resolved thread at the same location block a new comment", () => {
+    const result = classify([finding({ line: 42, reason: "A new wording." })], {
+      existing: [
+        {
+          hash: "a".repeat(40),
+          file: "src/billing.ts",
+          category: "bug",
+          symbol: "",
+          reason: "Something completely unrelated.",
+          state: "resolved",
+          line: 42,
+          originalLine: 42,
+          side: "RIGHT",
+        },
+      ],
+    });
+
+    expect(result.post).toHaveLength(1);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("does not let a comment with an unknown side block a new comment (N5)", () => {
+    const result = classify([finding({ line: 42, side: "RIGHT" })], {
+      existing: [
+        {
+          hash: "a".repeat(40),
+          file: "src/billing.ts",
+          category: "bug",
+          symbol: "",
+          reason: "Something completely unrelated.",
+          state: "open",
+          line: 42,
+          originalLine: 42,
+        },
+      ],
+    });
+
+    expect(result.post).toHaveLength(1);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("keeps an in-pass LEFT and RIGHT finding on the same line apart (N5)", () => {
+    const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      [
+        "src/billing.ts",
+        new Map<DiffSide, ReadonlySet<number>>([
+          ["RIGHT", new Set([42])],
+          ["LEFT", new Set([42])],
+        ]),
+      ],
+    ]);
+    const result = classifyFindings(
+      [
+        finding({ line: 42, side: "RIGHT", reason: "The head line is wrong." }),
+        finding({ line: 42, side: "LEFT", reason: "The base line is wrong." }),
+      ],
+      { changedLines: lines },
+    );
+
+    expect(result.post.map((comment) => comment.side).sort()).toEqual([
+      "LEFT",
+      "RIGHT",
+    ]);
+    expect(result.summary.duplicate).toBe(0);
+  });
+
+  it("uses originalLine when the thread is outdated", () => {
+    const result = classify([finding({ line: 42, reason: "A reworded null check bug." })], {
+      existing: [
+        {
+          hash: "a".repeat(40),
+          file: "src/billing.ts",
+          category: "bug",
+          symbol: "",
+          reason: "Something completely unrelated.",
+          state: "open",
+          line: null,
+          originalLine: 42,
+          side: "RIGHT",
+        },
+      ],
+    });
+
+    expect(result.post).toHaveLength(0);
+    expect(result.summary.duplicate).toBe(1);
+  });
+
+  it("counts findings outside the incremental hunks as out of scope", () => {
+    const scope = new Map([
+      ["src/billing.ts", [{ side: "RIGHT" as const, start: 40, end: 42 }]],
+    ]);
+    const inside = classifyFindings([finding({ line: 42 })], {
+      changedLines,
+      scope,
+    });
+    expect(inside.post).toHaveLength(1);
+    expect(inside.summary.outOfScope).toBe(0);
+
+    const outside = classifyFindings([finding({ line: 43 })], {
+      changedLines,
+      scope,
+    });
+    expect(outside.post).toHaveLength(0);
+    expect(outside.summary.outOfScope).toBe(1);
+
+    // The scope range's side must match: a RIGHT hunk does not allow a LEFT
+    // finding on the same number (N5).
+    const bothSides = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      [
+        "src/billing.ts",
+        new Map<DiffSide, ReadonlySet<number>>([
+          ["RIGHT", new Set([42])],
+          ["LEFT", new Set([42])],
+        ]),
+      ],
+    ]);
+    const wrongSide = classifyFindings(
+      [finding({ line: 42, side: "LEFT", reason: "A base-side bug." })],
+      { changedLines: bothSides, scope },
+    );
+    expect(wrongSide.post).toHaveLength(0);
+    expect(wrongSide.summary.outOfScope).toBe(1);
+  });
+
   it("dedupes by hash against open, resolved and skipped comments", () => {
     for (const state of ["open", "resolved", "skipped"] as const) {
       const item = finding();
@@ -1361,12 +1941,24 @@ describe("classifyFindings", () => {
   });
 
   it("caps 20 postable findings at 15 and counts the rest, in a stable order", () => {
+    const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      [
+        "src/billing.ts",
+        new Map<DiffSide, ReadonlySet<number>>([
+          ["RIGHT", new Set(Array.from({ length: 20 }, (_value, index) => 100 + index * 4))],
+        ]),
+      ],
+    ]);
     const items = Array.from({ length: 20 }, (_value, index) =>
-      finding({ reason: `Bug number ${index}`, confidence: 0.8 + index * 0.001 }),
+      finding({
+        line: 100 + index * 4,
+        reason: `Bug number ${index}`,
+        confidence: 0.8 + index * 0.001,
+      }),
     );
 
-    const first = classify(items);
-    const second = classify(items);
+    const first = classifyFindings(items, { changedLines: lines });
+    const second = classifyFindings(items, { changedLines: lines });
 
     expect(first.post).toHaveLength(MAX_POSTED_COMMENTS);
     expect(first.summary.posted).toBe(MAX_POSTED_COMMENTS);
@@ -1380,14 +1972,38 @@ describe("classifyFindings", () => {
   });
 
   it("orders by severity before confidence and caps across both", () => {
+    const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
+      [
+        "src/billing.ts",
+        new Map<DiffSide, ReadonlySet<number>>([
+          [
+            "RIGHT",
+            new Set([
+              ...Array.from({ length: 5 }, (_value, index) => 200 + index * 4),
+              ...Array.from({ length: 15 }, (_value, index) => 100 + index * 4),
+            ]),
+          ],
+        ]),
+      ],
+    ]);
     const medium = Array.from({ length: 5 }, (_value, index) =>
-      finding({ severity: "medium", reason: `Medium ${index}`, confidence: 0.99 }),
+      finding({
+        line: 200 + index * 4,
+        severity: "medium",
+        reason: `Medium ${index}`,
+        confidence: 0.99,
+      }),
     );
     const high = Array.from({ length: 15 }, (_value, index) =>
-      finding({ severity: "high", reason: `High ${index}`, confidence: 0.8 }),
+      finding({
+        line: 100 + index * 4,
+        severity: "high",
+        reason: `High ${index}`,
+        confidence: 0.8,
+      }),
     );
 
-    const result = classify([...medium, ...high]);
+    const result = classifyFindings([...medium, ...high], { changedLines: lines });
 
     expect(result.post).toHaveLength(15);
     expect(result.post.every((comment) => comment.severity === "high")).toBe(true);
@@ -1530,17 +2146,19 @@ describe("classifyFindings", () => {
       "async function load(): Promise<{ ok: boolean }> {",
       "  bugLoad();",
       "}",
+      "",
+      "// Second loader.",
       "async function save(): Promise<{ ok: boolean }> {",
       "  bugSave();",
       "}",
     ].join("\n");
     const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
-      ["src/api.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([2, 5])]])],
+      ["src/api.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([2, 7])]])],
     ]);
     const result = classifyFindings(
       [
         finding({ file: "src/api.ts", line: 2, reason: "Same response bug." }),
-        finding({ file: "src/api.ts", line: 5, reason: "Same response bug." }),
+        finding({ file: "src/api.ts", line: 7, reason: "Same response bug." }),
       ],
       { changedLines: lines, contentFor: () => content },
     );
@@ -1600,9 +2218,14 @@ describe("classifyFindings", () => {
       "    bugB();",
       "  }",
       "}",
+      "class C {",
+      "  render() {",
+      "    bugC();",
+      "  }",
+      "}",
     ].join("\n");
     const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
-      ["src/render.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([3, 8])]])],
+      ["src/render.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([3, 8, 13])]])],
     ]);
     let contentReads = 0;
 
@@ -1611,7 +2234,7 @@ describe("classifyFindings", () => {
       [
         finding({ file: "src/render.ts", line: 3, reason: "Bug A." }),
         finding({ file: "src/render.ts", line: 8, reason: "Bug B." }),
-        finding({ file: "src/render.ts", line: 3, reason: "Bug C." }),
+        finding({ file: "src/render.ts", line: 13, reason: "Bug C." }),
       ],
       {
         changedLines: lines,
@@ -1666,18 +2289,19 @@ describe("classifyFindings", () => {
       "  async get<T>(url: string): Promise<T> {",
       "    bugGet();",
       "  }",
+      "",
       "  async post<T>(url: string): Promise<T> {",
       "    bugPost();",
       "  }",
       "}",
     ].join("\n");
     const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
-      ["src/http.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([3, 6])]])],
+      ["src/http.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([3, 7])]])],
     ]);
     const result = classifyFindings(
       [
         finding({ file: "src/http.ts", line: 3, reason: "Same response bug." }),
-        finding({ file: "src/http.ts", line: 6, reason: "Same response bug." }),
+        finding({ file: "src/http.ts", line: 7, reason: "Same response bug." }),
       ],
       { changedLines: lines, contentFor: () => content },
     );
@@ -1695,17 +2319,19 @@ describe("classifyFindings", () => {
       "const fetchA = <T>(url: string): Promise<T> => {",
       "  bugA();",
       "};",
+      "",
+      "// Second fetcher.",
       "const fetchB = <T>(url: string): Promise<T> => {",
       "  bugB();",
       "};",
     ].join("\n");
     const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
-      ["src/fetch.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([2, 5])]])],
+      ["src/fetch.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([2, 7])]])],
     ]);
     const result = classifyFindings(
       [
         finding({ file: "src/fetch.ts", line: 2, reason: "Same fetch bug." }),
-        finding({ file: "src/fetch.ts", line: 5, reason: "Same fetch bug." }),
+        finding({ file: "src/fetch.ts", line: 7, reason: "Same fetch bug." }),
       ],
       { changedLines: lines, contentFor: () => content },
     );
@@ -1724,6 +2350,7 @@ describe("classifyFindings", () => {
       "  async get<T>(url: string): Promise<T> {",
       "    bugGet();",
       "  }",
+      "",
       "  async post<T>(url: string): Promise<T> {",
       "    bugPost();",
       "  }",
@@ -1746,10 +2373,10 @@ describe("classifyFindings", () => {
       },
     ];
     const lines = new Map<string, ReadonlyMap<DiffSide, ReadonlySet<number>>>([
-      ["src/http.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([6])]])],
+      ["src/http.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", new Set([7])]])],
     ]);
     const result = classifyFindings(
-      [finding({ file: "src/http.ts", line: 6, reason: rewordedReason })],
+      [finding({ file: "src/http.ts", line: 7, reason: rewordedReason })],
       { changedLines: lines, existing, contentFor: () => content },
     );
 
@@ -1784,8 +2411,11 @@ describe("classifyFindings", () => {
 
     expect(elapsed, `${elapsed.toFixed(1)}ms`).toBeLessThan(1_000);
     expect(symbolScanStats.scans).toBe(1);
-    expect(result.summary.posted).toBe(MAX_POSTED_COMMENTS);
-    expect(result.summary.duplicate).toBe(0);
+    // 300 differently worded findings on one line share a location, so the
+    // step 8c location rule keeps the first and counts the other 299.
+    expect(result.summary.posted).toBe(1);
+    expect(result.summary.duplicate).toBe(299);
+    expect(result.summary.overCap).toBe(0);
     expect(result.post.length).toBeGreaterThan(0);
     for (const comment of result.post) {
       expect(comment.symbol.split(".").length).toBeLessThanOrEqual(MAX_SYMBOL_NAME_DEPTH);
@@ -1855,12 +2485,12 @@ describe("classifyFindings", () => {
     const result = classify(items);
 
     expect(result.summary).toMatchObject({
-      posted: 2,
+      posted: 1,
       belowConfidence: 1,
       lowSeverity: 1,
       notInDiff: 1,
       triageDismissed: 1,
-      duplicate: 1,
+      duplicate: 2,
       overCap: 0,
       schemaInvalid: 3,
     });
@@ -2075,5 +2705,58 @@ describe("parseMarker", () => {
     expect(
       parseMarker(`<!-- bugbot:v1 id=${"a".repeat(40)} run=1 sha=x -->`),
     ).toEqual({ hash: "a".repeat(40), runId: "1", sha: "x" });
+  });
+});
+
+describe("step 8c identifier scans (S8D-R2-N1)", () => {
+  it("classifies the reviewer's 60 x 60 case on 390 KB lines under a second", () => {
+    const lines = Array.from(
+      { length: 40 },
+      (_value, index) => `${minifiedLine()}${index}`,
+    );
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- /dev/null",
+      "+++ b/src/a.ts",
+      "@@ -0,0 +1,40 @@",
+      ...lines.map((line) => `+${line}`),
+      "",
+    ].join("\n");
+    const lineTextFor = diffLineTexts(diff);
+    const allLines = new Set(lines.map((_line, index) => index + 1));
+    const linesByFile = new Map<
+      string,
+      ReadonlyMap<DiffSide, ReadonlySet<number>>
+    >([["src/a.ts", new Map<DiffSide, ReadonlySet<number>>([["RIGHT", allLines]])]]);
+    const existing: ExistingFinding[] = Array.from({ length: 60 }, (_, index) => ({
+      hash: String(index).padStart(40, "0"),
+      file: "src/a.ts",
+      category: "bug",
+      symbol: "",
+      reason: `Existing reason number ${index} about the first thing.`,
+      state: "open",
+      line: 1 + (index % 20),
+      originalLine: 1 + (index % 20),
+      side: "RIGHT",
+    }));
+    const candidates = Array.from({ length: 60 }, (_, index) =>
+      finding({
+        file: "src/a.ts",
+        line: 21 + (index % 20),
+        reason: `Candidate reason number ${index} about a different thing entirely.`,
+        symbol: "s",
+      }),
+    );
+
+    const started = performance.now();
+    const result = classifyFindings(candidates, {
+      changedLines: linesByFile,
+      existing,
+      lineTextFor,
+    });
+    const elapsed = performance.now() - started;
+
+    expect(result.summary.posted).toBeGreaterThan(0);
+    expect(elapsed).toBeLessThan(1000);
   });
 });
