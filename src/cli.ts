@@ -3,7 +3,26 @@ import { appendFileSync } from "node:fs";
 import { readFile as readTextFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { fetchPullRequest, reportSkipped, type GitHubOptions } from "./github.js";
+import {
+  fetchPullRequestDetails,
+  fetchPullRequestDiff,
+  findSummary,
+  finishCheck,
+  listBugbotThreads,
+  listCheckRuns,
+  postReview,
+  readRepositoryFile,
+  redact,
+  reportSkipped,
+  resolveFixedThreads,
+  startCheck,
+  upsertSummary,
+  type CheckRunHandle,
+  type GitHubOptions,
+  type PlannedRequest,
+  type ReviewSummary,
+  type SummaryComment,
+} from "./github.js";
 import { pullRequestFromEvent, shouldReview } from "./gate.js";
 import {
   buildContext,
@@ -22,10 +41,18 @@ import {
   parseJsonResponse,
   type DroppedFindings,
   type FetchLike,
+  type Sleep,
 } from "./model.js";
+import {
+  RECHECK_SYSTEM_PROMPT,
+  buildRecheckUser,
+  fixedThreadIds,
+  parseRecheckResponse,
+} from "./recheck.js";
 import {
   classifyFindings,
   minConfidenceFromEnv,
+  FindingSchema,
   type ClassifySummary,
   type DiffSide,
   type ExistingFinding,
@@ -534,6 +561,790 @@ export async function runLocalReview(
   }
 }
 
+export interface PrReviewOptions {
+  /** "owner/name" from BUGBOT_REPOSITORY. */
+  repository: string;
+  /** BUGBOT_PR_NUMBER. */
+  prNumber: number;
+  /** BUGBOT_RUN_ID; the check run's external_id and the marker's run id. */
+  runId: string;
+  /** GITHUB_TOKEN, minted by the App. */
+  token: string;
+  /** BUGBOT_HEAD_SHA from the event. The API head is authoritative. */
+  eventHeadSha?: string;
+}
+
+export interface PrReviewDeps {
+  /** Injectable fetch for both GitHub and OpenRouter. */
+  fetch?: FetchLike;
+  /** Injectable sleep for retries and model backoff. */
+  sleep?: Sleep;
+  /** Environment lookup, defaulting to process.env. */
+  env?: (name: string) => string;
+  log?: (line: string) => void;
+  /** GitHub per-attempt timeout, mainly for tests. Default 30 s. */
+  timeoutMs?: number;
+  /** OpenRouter per-attempt timeout, mainly for tests. Default 120 s. */
+  modelTimeoutMs?: number;
+}
+
+export interface PrReviewResult {
+  /** Always 0: Bugbot never fails the job. */
+  exitCode: number;
+  conclusion: "success" | "neutral" | "skipped" | "none";
+  error?: string;
+}
+
+/** Collapses whitespace, removes every known secret, and caps the length. */
+function capReason(text: string, secrets: readonly string[]): string {
+  let value = text.replace(/\s+/g, " ").trim();
+  for (const secret of secrets) {
+    if (secret !== "") {
+      value = redact(value, secret);
+    }
+  }
+  return value.slice(0, 200);
+}
+
+function parsePositiveEnv(raw: string, fallback: number): number {
+  return /^[1-9][0-9]*$/.test(raw) ? Number.parseInt(raw, 10) : fallback;
+}
+
+/** Digits-only run ids, deduplicated, oldest first. */
+function uniqueRuns(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const runs: string[] = [];
+  for (const value of values) {
+    if (/^\d+$/.test(value) && !seen.has(value)) {
+      seen.add(value);
+      runs.push(value);
+    }
+  }
+  return runs;
+}
+
+/** Reads the hidden `<!-- bugbot:runs ... -->` line from a summary. */
+function parseRunIds(body: string | null): string[] {
+  if (body === null) {
+    return [];
+  }
+  const match = /<!-- bugbot:runs ([^>]*) -->/.exec(body);
+  if (match === null) {
+    return [];
+  }
+  return (match[1] ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value !== "");
+}
+
+function planLine(plan: PlannedRequest): string {
+  const body = plan.body === undefined ? "" : ` ${JSON.stringify(plan.body)}`;
+  return `Dry run plan: ${plan.method} ${plan.path}${body}`;
+}
+
+/**
+ * One full non-local review pass: gate, check run, API diff and contents,
+ * context, model, filter with cross-pass dedupe, one COMMENT review, re-check
+ * and resolve, summary upsert, finish the check. Every failure is neutral and
+ * the result is always exit code 0.
+ */
+export async function runPrReview(
+  options: PrReviewOptions,
+  deps: PrReviewDeps = {},
+): Promise<PrReviewResult> {
+  const log = deps.log ?? ((line: string) => console.log(line));
+  const readEnv = deps.env ?? env;
+  const apiKey = readEnv("OPENROUTER_API_KEY");
+  const secrets = [options.token, apiKey].filter((secret) => secret !== "");
+  const reasonOf = (error: unknown): string =>
+    capReason(errorMessage(error), secrets);
+
+  const repository = options.repository.trim();
+  const prNumber = options.prNumber;
+  const runId = options.runId.trim();
+  const token = options.token;
+
+  if (repository === "" || !Number.isInteger(prNumber) || prNumber <= 0) {
+    const line = "BUGBOT_REPOSITORY and BUGBOT_PR_NUMBER are required.";
+    log(`Bugbot couldn't review: ${line}`);
+    return { exitCode: 0, conclusion: "none", error: line };
+  }
+
+  if (token === "") {
+    const line = "GITHUB_TOKEN is not set";
+    log(`Bugbot couldn't review: ${line}`);
+    return { exitCode: 0, conclusion: "none", error: line };
+  }
+
+  const transport = {
+    fetch: deps.fetch,
+    sleep: deps.sleep,
+    env: deps.env,
+    timeoutMs: deps.timeoutMs,
+    log: (line: string) => log(line),
+  };
+  const dryRun = readEnv("BUGBOT_DRY_RUN") === "true";
+  const model = readEnv("BUGBOT_MODEL").trim() || DEFAULT_MODEL;
+  const bigPrModel = readEnv("BUGBOT_BIG_PR_MODEL").trim() || undefined;
+  const maxTokens = parsePositiveEnv(
+    readEnv("BUGBOT_MAX_TOKENS").trim(),
+    DEFAULT_MAX_TOKENS,
+  );
+  // Read raw: minConfidenceFromEnv rejects whitespace instead of trimming it.
+  const rawMinConfidence =
+    deps.env === undefined
+      ? process.env.BUGBOT_MIN_CONFIDENCE
+      : deps.env("BUGBOT_MIN_CONFIDENCE");
+  const commentSicko = readEnv("BUGBOT_COMMENT_SICKO") === "true";
+  const draftLabel = readEnv("BUGBOT_DRAFT_LABEL") || "bugbot";
+
+  let pr;
+  try {
+    pr = await fetchPullRequestDetails({
+      token,
+      repository,
+      prNumber,
+      ...transport,
+    });
+  } catch (error) {
+    const line = reasonOf(error);
+    log(`Bugbot couldn't review: ${line}`);
+    return { exitCode: 0, conclusion: "none", error: line };
+  }
+
+  try {
+    // The event payload is the gate; the API values above are the review. A
+    // malformed labels value throws here and becomes a neutral pass.
+    const gate = shouldReview(
+      pullRequestFromEvent({
+        draft: readEnv("BUGBOT_PR_DRAFT"),
+        fork: readEnv("BUGBOT_PR_FORK"),
+        labels: readEnv("BUGBOT_PR_LABELS"),
+        headSha: options.eventHeadSha ?? "",
+        number: prNumber,
+      }) ?? pr,
+      { label: draftLabel },
+    );
+
+    if (!gate.review) {
+      const github: GitHubOptions = {
+        token,
+        repository,
+        prNumber,
+        headSha: pr.headSha,
+        runId,
+        dryRun,
+        ...transport,
+      };
+      try {
+        const planned = await reportSkipped(github, gate.summary);
+        if (dryRun) {
+          log(planLine(planned));
+        }
+      } catch (error) {
+        log(`Bugbot: could not report the skip: ${reasonOf(error)}`);
+      }
+      log(gate.summary);
+      return { exitCode: 0, conclusion: "skipped" };
+    }
+  } catch (error) {
+    const line = reasonOf(error);
+    log(`Bugbot couldn't review: ${line}`);
+    return { exitCode: 0, conclusion: "none", error: line };
+  }
+
+  const eventHeadSha = (options.eventHeadSha ?? "").trim();
+  if (eventHeadSha !== "" && eventHeadSha !== pr.headSha) {
+    log(
+      `Bugbot: BUGBOT_HEAD_SHA ${eventHeadSha} differs from the API head ${pr.headSha}; reviewing the API head`,
+    );
+  }
+
+  const github: GitHubOptions = {
+    token,
+    repository,
+    prNumber,
+    headSha: pr.headSha,
+    runId,
+    dryRun,
+    ...transport,
+  };
+
+  let check: CheckRunHandle | null = null;
+  let error: string | null = null;
+  try {
+    check = await startCheck(github);
+    if (dryRun && check.planned !== undefined) {
+      log(planLine(check.planned));
+    }
+  } catch (caught) {
+    error = reasonOf(caught);
+    log(`Bugbot: could not start the check run: ${error}`);
+  }
+
+  // A cancelled or superseded run can leave an in_progress `bugbot` check on
+  // this head SHA. Complete every such run that is not this pass. This is
+  // best effort: a failure is logged and the review continues (S6B-N2).
+  if (error === null) {
+    try {
+      const runs = await listCheckRuns(github);
+      const stale = runs.filter(
+        (run) =>
+          run.status === "in_progress" && run.externalId !== runId,
+      );
+      for (const run of stale) {
+        const planned = await finishCheck(
+          github,
+          { id: run.id },
+          "neutral",
+          `Bugbot: superseded by run ${runId}.`,
+        );
+        if (dryRun) {
+          log(planLine(planned));
+        }
+        log(`Bugbot: completed stale in-progress check run ${run.id}`);
+      }
+    } catch (caught) {
+      log(`Bugbot: could not complete stale check runs: ${reasonOf(caught)}`);
+    }
+  }
+
+  let posted = 0;
+  let failedToPost = 0;
+  let skippedFindings = 0;
+  let resolved = 0;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let modelUsed = model;
+  let truncated: readonly string[] = [];
+  let threadRunIds: string[] = [];
+
+  if (error === null) {
+    try {
+      const diff = await fetchPullRequestDiff({
+        token,
+        repository,
+        prNumber,
+        ...transport,
+      });
+      const parsedDiff = parseDiff(diff);
+      if (parsedDiff.files.length === 0) {
+        throw new Error("pull request diff had no files");
+      }
+
+      const changedFiles = parsedDiff.files.map((file) => file.path);
+      const changedPaths = new Set(changedFiles);
+      const fileStatus = new Map(
+        parsedDiff.files.map((file) => [file.path, file.status]),
+      );
+
+      // Right side: head content. Left side: base content. Only paths named in
+      // the diff are ever requested (plus the AGENTS.md lookup below).
+      //
+      // A legal file name such as `back\slash.ts` encodes to `%5C`, which the
+      // contents guard refuses. That skips one file, never the whole pass
+      // (S6B-N4); a `..` path still throws from contentsPath and ends neutral.
+      const readContents = async (
+        path: string,
+        ref: string,
+      ): Promise<string | null> => {
+        try {
+          return await readRepositoryFile({
+            token,
+            repository,
+            path,
+            ref,
+            ...transport,
+          });
+        } catch (caught) {
+          if (
+            caught instanceof Error &&
+            caught.message === "GitHub request not allowed: unsafe contents path"
+          ) {
+            log(`Bugbot: skipping ${path}: ${reasonOf(caught)}`);
+            return null;
+          }
+          throw caught;
+        }
+      };
+
+      const headContents = new Map<string, string | null>();
+      for (const file of parsedDiff.files) {
+        if (file.status === "deleted") {
+          continue;
+        }
+        headContents.set(
+          file.path,
+          await readContents(file.newPath ?? file.path, pr.headSha),
+        );
+      }
+
+      const baseContents = new Map<string, string | null>();
+      for (const file of parsedDiff.files) {
+        const left = parsedDiff.changedLines.get(file.path)?.get("LEFT");
+        if (left === undefined || left.size === 0) {
+          continue;
+        }
+        baseContents.set(
+          file.path,
+          await readContents(file.oldPath ?? file.path, pr.baseSha),
+        );
+      }
+
+      const readFile: ReadFile = async (path: string) =>
+        headContents.get(path) ?? null;
+
+      let agentsMd = "";
+      const headAgents = await readContents("AGENTS.md", pr.headSha);
+      if (headAgents !== null) {
+        agentsMd = headAgents;
+      } else {
+        agentsMd = (await readContents("AGENTS.md", pr.baseSha)) ?? "";
+      }
+
+      const systemPromptChars = (await loadSystemPrompt({ commentSicko }))
+        .length;
+      const request: ReviewRequest = {
+        repository,
+        prNumber,
+        headSha: pr.headSha,
+        baseSha: pr.baseSha,
+        diff,
+        changedFiles,
+        agentsMd,
+        title: pr.title,
+        body: pr.body,
+        maxTokens,
+      };
+
+      const context = await buildContext(request, readFile, {
+        commentSicko,
+        systemPromptChars,
+      });
+      const prompt = await buildPrompt(context, { commentSicko });
+      truncated = context.truncated;
+
+      const selection = selectModel({
+        model,
+        bigPrModel,
+        changedLines: context.totalChangedLines,
+        overBudget: context.overBudget,
+      });
+      if ("skip" in selection) {
+        throw new Error(selection.skip);
+      }
+      modelUsed = redact(selection.model, apiKey);
+
+      if (apiKey === "") {
+        throw new BugbotModelError("OPENROUTER_API_KEY is not set");
+      }
+
+      const result = await callModel(
+        { model: selection.model, system: prompt.system, user: prompt.user },
+        {
+          apiKey,
+          fetch: deps.fetch,
+          sleep: deps.sleep,
+          timeoutMs: deps.modelTimeoutMs,
+        },
+      );
+      tokensIn = result.tokensIn;
+      tokensOut = result.tokensOut;
+      modelUsed = redact(
+        result.model.trim() === "" ? selection.model : result.model,
+        apiKey,
+      );
+
+      const parsedResponse = parseJsonResponse(result.raw);
+
+      const threads = await listBugbotThreads(github);
+      threadRunIds = threads.map((thread) => thread.marker.runId);
+      // A missing category is mapped to "bug" so the marker hash can still
+      // match; the empty symbol makes the fuzzy branch effectively hash-only.
+      const existing: ExistingFinding[] = threads.map((thread) => ({
+        hash: thread.marker.hash,
+        file: thread.path,
+        category: thread.category ?? "bug",
+        symbol: "",
+        reason: thread.reason,
+        state: thread.state,
+      }));
+
+      const headFor = (file: string): string | undefined =>
+        headContents.get(file) ?? undefined;
+      const baseFor = (file: string): string | undefined =>
+        baseContents.get(file) ?? undefined;
+      const contentFor = (
+        file: string,
+        side: DiffSide,
+      ): string | undefined => (side === "RIGHT" ? headFor(file) : baseFor(file));
+      const contentIsFullFor = (file: string, side: DiffSide): boolean => {
+        const content =
+          side === "RIGHT" ? headContents.get(file) : baseContents.get(file);
+        return content !== undefined && content !== null;
+      };
+      const hunkRanges = hunkContextsFromDiff(diff);
+      const hunkContextFor = (
+        file: string,
+        line: number,
+        side: DiffSide,
+      ): string | undefined => {
+        for (const range of hunkRanges.get(file) ?? []) {
+          if (range.side === side && line >= range.start && line <= range.end) {
+            return range.context;
+          }
+        }
+        return undefined;
+      };
+      const minConfidence = minConfidenceFromEnv(rawMinConfidence);
+
+      const classified = classifyFindings(parsedResponse.findings, {
+        changedLines: parsedDiff.changedLines,
+        minConfidence,
+        existing,
+        schemaInvalid: parsedResponse.dropped.count,
+        contentFor,
+        contentIsFullFor,
+        hunkContextFor,
+      });
+
+      const buckets = classified.summary;
+      skippedFindings =
+        buckets.belowConfidence +
+        buckets.lowSeverity +
+        buckets.notInDiff +
+        buckets.triageDismissed +
+        buckets.duplicate +
+        buckets.overCap +
+        buckets.schemaInvalid;
+
+      if (classified.post.length > 0) {
+        const intended = classified.post.length;
+        try {
+          const review = await postReview(github, classified.post);
+          posted = review.posted;
+          // Every comment that did not land is a failure, whether postReview
+          // attributed it or not (S6B-B1). The summary must show the count.
+          failedToPost = Math.max(review.failed.length, intended - review.posted);
+          if (dryRun) {
+            for (const plan of review.planned) {
+              log(planLine(plan));
+            }
+          }
+        } catch (caught) {
+          // A timeout is ambiguous: it may have landed, so nothing is counted
+          // as posted; the outer handler ends the pass neutral.
+          failedToPost = intended;
+          throw caught;
+        }
+      }
+
+      // A thread whose finding the main call re-reported this pass is counted
+      // as a duplicate by classifyFindings. It must not be resolved by the
+      // re-check (S6B-N5b). Ask the classifier per eligible thread, with the
+      // findings narrowed to that thread's file and category, so the decision
+      // uses the exact hash/fuzzy logic without rescanning every file per
+      // finding.
+      const validFindings: Finding[] = [];
+      for (const raw of parsedResponse.findings) {
+        const parsed = FindingSchema.safeParse(raw);
+        if (parsed.success) {
+          validFindings.push(parsed.data);
+        }
+      }
+
+      const reReportedHashes = new Set<string>();
+      for (const thread of threads) {
+        if (
+          thread.state !== "open" ||
+          !changedPaths.has(thread.path) ||
+          thread.marker.sha === github.headSha ||
+          thread.line === null
+        ) {
+          continue;
+        }
+
+        const category = thread.category ?? "bug";
+        const candidates = validFindings.filter(
+          (finding) =>
+            finding.file === thread.path && finding.category === category,
+        );
+        if (candidates.length === 0) {
+          continue;
+        }
+
+        const duplicateCheck = classifyFindings(candidates, {
+          changedLines: parsedDiff.changedLines,
+          minConfidence,
+          existing: [
+            {
+              hash: thread.marker.hash,
+              file: thread.path,
+              category,
+              symbol: "",
+              reason: thread.reason,
+              state: thread.state,
+            },
+          ],
+          contentFor,
+          contentIsFullFor,
+          hunkContextFor,
+        });
+        // In-pass duplicates count too; that only keeps more threads open.
+        if (duplicateCheck.summary.duplicate > 0) {
+          reReportedHashes.add(thread.marker.hash);
+        }
+      }
+
+      // Re-check open threads touched by this diff whose marker is from an
+      // older commit. At most 15, oldest first by first comment id. A thread
+      // with no current line is outdated and left for a later pass, and a
+      // thread the main call just re-reported must stay open (S6B-N5).
+      const targets = threads
+        .filter(
+          (thread) =>
+            thread.state === "open" &&
+            changedPaths.has(thread.path) &&
+            thread.marker.sha !== github.headSha &&
+            thread.line !== null &&
+            !reReportedHashes.has(thread.marker.hash),
+        )
+        // Review thread ids increase with creation time; sorting by the first
+        // comment id is the oldest-first order the decision asks for.
+        .sort((a, b) => a.firstCommentId - b.firstCommentId)
+        .slice(0, 15);
+
+      if (targets.length > 0) {
+        try {
+          const known = new Set(targets.map((thread) => thread.threadId));
+          const user = buildRecheckUser(
+            targets.map((thread) => {
+              const content = headContents.get(thread.path) ?? null;
+              const deleted = fileStatus.get(thread.path) === "deleted";
+              return {
+                threadId: thread.threadId,
+                path: thread.path,
+                line: thread.line ?? 1,
+                reason: thread.reason,
+                status: deleted
+                  ? ("deleted" as const)
+                  : content === null
+                    ? ("unavailable" as const)
+                    : ("present" as const),
+                content,
+              };
+            }),
+            github.headSha,
+          );
+
+          const recheck = await callModel(
+            { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
+            {
+              apiKey,
+              fetch: deps.fetch,
+              sleep: deps.sleep,
+              timeoutMs: deps.modelTimeoutMs,
+              maxOutputTokens: 2_000,
+            },
+          );
+          tokensIn += recheck.tokensIn;
+          tokensOut += recheck.tokensOut;
+
+          const fixed = fixedThreadIds(
+            parseRecheckResponse(recheck.raw, known),
+          );
+          const fixedThreads = targets.filter((thread) =>
+            fixed.has(thread.threadId),
+          );
+          if (fixedThreads.length > 0) {
+            const resolvedResult = await resolveFixedThreads(
+              github,
+              fixedThreads,
+              github.headSha,
+            );
+            resolved = resolvedResult.resolved;
+            if (dryRun) {
+              for (const plan of resolvedResult.planned) {
+                log(planLine(plan));
+              }
+            }
+          }
+        } catch (caught) {
+          log(
+            `Bugbot: re-check failed, leaving threads open: ${reasonOf(caught)}`,
+          );
+        }
+      }
+    } catch (caught) {
+      error = reasonOf(caught);
+      log(`Bugbot couldn't review: ${error}`);
+    }
+  }
+
+  // Pass count: this run, previous summary run ids, and run ids in bot thread
+  // markers. A rerun of the same run id adds no pass. Keep the last 200 ids.
+  let previous: SummaryComment | null | undefined;
+  try {
+    previous = await findSummary(github);
+  } catch (caught) {
+    if (error === null) {
+      error = reasonOf(caught);
+    }
+    log(`Bugbot: could not read the summary: ${reasonOf(caught)}`);
+  }
+
+  const allRuns = uniqueRuns([
+    ...parseRunIds(previous?.body ?? null),
+    ...threadRunIds,
+    runId,
+  ]);
+  const passCount = allRuns.length;
+  const runs = allRuns.slice(-200);
+  const postFailureReason =
+    error === null && failedToPost > 0
+      ? `${failedToPost} finding${
+          failedToPost === 1 ? "" : "s"
+        } could not be posted as inline comment${
+          failedToPost === 1 ? "" : "s"
+        }`
+      : null;
+  const summary: ReviewSummary = {
+    passCount,
+    model: modelUsed,
+    tokensIn,
+    tokensOut,
+    posted,
+    failed: failedToPost,
+    skipped: skippedFindings,
+    resolved,
+    truncated,
+    ...(runs.length > 0 ? { runs } : {}),
+    ...(error === null ? {} : { error }),
+  };
+
+  try {
+    const result = await upsertSummary(
+      github,
+      summary,
+      previous === undefined ? {} : { previous },
+    );
+    if (dryRun) {
+      log(planLine(result.planned));
+    }
+  } catch (caught) {
+    if (error === null) {
+      error = `could not write the summary: ${reasonOf(caught)}`;
+      summary.error = error;
+    }
+    log(`Bugbot: could not write the summary: ${reasonOf(caught)}`);
+  }
+
+  try {
+    let handles: CheckRunHandle[] = [];
+    let createFallback = false;
+    if (check !== null) {
+      handles = [check];
+    } else {
+      // The handle may be lost (a timed-out startCheck). Finish every run for
+      // this run id that is still in_progress, not just the first match
+      // (S6B-N2iii). A run that is already completed is left untouched.
+      const found = await listCheckRuns(github);
+      const matches = found.filter((run) => run.externalId === runId);
+      const inProgress = matches.filter((run) => run.status === "in_progress");
+      if (inProgress.length > 0) {
+        handles = inProgress.map((run) => ({ id: run.id }));
+      } else if (matches.length === 0) {
+        log(
+          "Bugbot: no existing bugbot check run found for this run id; creating a completed neutral one",
+        );
+        createFallback = true;
+      } else {
+        log(
+          `Bugbot: the check run for ${runId} is already completed; leaving it untouched`,
+        );
+      }
+    }
+
+    const output =
+      error !== null
+        ? `Bugbot couldn't review: ${error}`
+        : failedToPost > 0
+          ? `Bugbot reviewed this pull request: ${posted} inline comment${
+              posted === 1 ? "" : "s"
+            }; ${failedToPost} finding${
+              failedToPost === 1 ? "" : "s"
+            } could not be posted.`
+          : `Bugbot reviewed this pull request: ${posted} inline comment${
+              posted === 1 ? "" : "s"
+            }, pass ${passCount}.`;
+    const conclusion =
+      error !== null || postFailureReason !== null ? "neutral" : "success";
+
+    if (handles.length > 0) {
+      let finishFailure: unknown = null;
+      for (const handle of handles) {
+        try {
+          const planned = await finishCheck(
+            github,
+            handle,
+            conclusion,
+            output,
+          );
+          if (dryRun) {
+            log(planLine(planned));
+          }
+        } catch (caught) {
+          finishFailure ??= caught;
+        }
+      }
+
+      if (finishFailure !== null) {
+        log(
+          `Bugbot: could not finish the check run: ${reasonOf(finishFailure)}`,
+        );
+        try {
+          // The PATCH is idempotent but still failed after its retries. One
+          // completed neutral create keeps a check from staying in_progress.
+          const planned = await reportSkipped(github, output);
+          if (dryRun) {
+            log(planLine(planned));
+          }
+          log("Bugbot: created a completed neutral check run instead");
+        } catch (caught) {
+          log(
+            `Bugbot: could not create the fallback check run: ${reasonOf(caught)}`,
+          );
+        }
+      }
+    } else if (createFallback) {
+      const planned = await reportSkipped(github, output);
+      if (dryRun) {
+        log(planLine(planned));
+      }
+    }
+  } catch (caught) {
+    log(`Bugbot: could not finish the check run: ${reasonOf(caught)}`);
+  }
+
+  if (error !== null) {
+    log(`Bugbot couldn't review: ${error}`);
+    return { exitCode: 0, conclusion: "neutral", error };
+  }
+
+  if (postFailureReason !== null) {
+    log(`Bugbot: ${postFailureReason}`);
+    return { exitCode: 0, conclusion: "neutral", error: postFailureReason };
+  }
+
+  log(
+    `Bugbot review complete: pass ${passCount}, ${posted} inline comment${
+      posted === 1 ? "" : "s"
+    }, ${resolved} resolved.`,
+  );
+  return { exitCode: 0, conclusion: "success" };
+}
+
 export async function review(args: readonly string[] = []): Promise<number> {
   if (args.includes("--local")) {
     // Local output goes to stdout only: it must never land in a GitHub job
@@ -548,59 +1359,18 @@ export async function review(args: readonly string[] = []): Promise<number> {
     }
   }
 
-  const repository = env("BUGBOT_REPOSITORY");
-  const prNumber = Number.parseInt(env("BUGBOT_PR_NUMBER"), 10);
-  const runId = env("BUGBOT_RUN_ID");
-  const token = env("GITHUB_TOKEN");
-  const draftLabel = env("BUGBOT_DRAFT_LABEL") || "bugbot";
-  const eventHeadSha = env("BUGBOT_HEAD_SHA");
-
-  if (repository === "" || !Number.isInteger(prNumber) || prNumber <= 0) {
-    report(
-      "Bugbot couldn't review: BUGBOT_REPOSITORY and BUGBOT_PR_NUMBER are required.",
-    );
-    return 0;
-  }
-
   try {
-    // A pull_request event carries draft, fork and labels, so the CLI applies
-    // the same gate from that payload without an API call. Only when the event
-    // has no PR data (workflow_dispatch, or a direct action.yml call) does it
-    // fetch the PR from the API.
-    const pr =
-      pullRequestFromEvent({
-        draft: env("BUGBOT_PR_DRAFT"),
-        fork: env("BUGBOT_PR_FORK"),
-        labels: env("BUGBOT_PR_LABELS"),
-        headSha: eventHeadSha,
-        number: prNumber,
-      }) ?? (await fetchPullRequest({ token, repository, prNumber }));
-
-    const gate = shouldReview(pr, { label: draftLabel });
-    if (!gate.review) {
-      report(gate.summary);
-      const options: GitHubOptions = {
-        token,
-        repository,
-        prNumber,
-        headSha: pr.headSha,
-        runId,
-      };
-
-      try {
-        await reportSkipped(options, gate.summary);
-      } catch {
-        // Step 6 turns this into a completed neutral `bugbot` check run; the
-        // job summary in review.yml is the visible result until then.
-      }
-
-      return 0;
-    }
-
-    report(
-      "Bugbot couldn't review: step 2 skeleton, the review pipeline is not implemented.",
+    const result = await runPrReview(
+      {
+        repository: env("BUGBOT_REPOSITORY"),
+        prNumber: Number.parseInt(env("BUGBOT_PR_NUMBER"), 10),
+        runId: env("BUGBOT_RUN_ID"),
+        token: env("GITHUB_TOKEN"),
+        eventHeadSha: env("BUGBOT_HEAD_SHA"),
+      },
+      { log: report },
     );
-    return 0;
+    return result.exitCode;
   } catch (error) {
     report(`Bugbot couldn't review: ${errorMessage(error)}`);
     return 0;

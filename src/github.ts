@@ -25,13 +25,22 @@ const DEFAULT_BASE_URL = "https://api.github.com";
 const DEFAULT_BOT_LOGIN = "andura-bugbot";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 2;
+const FINISH_CHECK_ATTEMPTS = 3;
 const MAX_RETRY_WAIT_MS = 10_000;
 const MAX_PAGES = 20;
 const MAX_CHECK_SUMMARY = 60_000;
+const MAX_SUMMARY_CHARS = 60_000;
 const MAX_ERROR_CHARS = 200;
 const MAX_TRUNCATED_FILES = 50;
+const MAX_RUN_IDS = 200;
+const MAX_DIFF_BYTES = 5 * 1024 * 1024;
+const MAX_CONTENTS_BYTES = 1024 * 1024;
 const SUMMARY_MARKER = "<!-- bugbot:summary -->";
+const RUNS_MARKER_PREFIX = "<!-- bugbot:runs ";
 const COMMENT_ONLY_NOTE = "Bugbot only comments; it never approves or blocks.";
+const ACCEPT_JSON = "application/vnd.github+json";
+const ACCEPT_DIFF = "application/vnd.github.diff";
+const ACCEPT_RAW = "application/vnd.github.raw";
 const REVIEW_BODY =
   "Bugbot review. Inline comments only; it never approves or blocks.";
 
@@ -96,7 +105,15 @@ interface AllowedRoute {
   readonly pattern: RegExp;
   /** A pull review must carry `event: "COMMENT"`. */
   readonly review?: boolean;
+  /** The only alternate media type this route may ask for. */
+  readonly media?: "diff" | "raw";
+  /** Path is a contents blob and gets strict segment validation. */
+  readonly contents?: boolean;
+  /** Query keys this route may carry, with the only accepted value shape. */
+  readonly query?: Readonly<Record<string, QueryRule>>;
 }
+
+type QueryRule = "hex-sha" | "bugbot" | "positive-integer" | "all";
 
 const OWNER_NAME = "[A-Za-z0-9-]+/[A-Za-z0-9._-]+";
 
@@ -109,10 +126,12 @@ const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   {
     method: "GET",
     pattern: new RegExp(`^/repos/${OWNER_NAME}/pulls/[1-9][0-9]*$`),
+    media: "diff",
   },
   {
     method: "GET",
     pattern: new RegExp(`^/repos/${OWNER_NAME}/issues/[1-9][0-9]*/comments$`),
+    query: { per_page: "positive-integer", page: "positive-integer" },
   },
   {
     method: "POST",
@@ -142,6 +161,23 @@ const ALLOWED_ROUTES: readonly AllowedRoute[] = [
     pattern: new RegExp(`^/repos/${OWNER_NAME}/check-runs/[0-9]+$`),
   },
   {
+    method: "GET",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/commits/[0-9a-f]{40}/check-runs$`),
+    query: {
+      check_name: "bugbot",
+      filter: "all",
+      per_page: "positive-integer",
+      page: "positive-integer",
+    },
+  },
+  {
+    method: "GET",
+    pattern: new RegExp(`^/repos/${OWNER_NAME}/contents/(?:[^/]+/)*[^/]+$`),
+    media: "raw",
+    contents: true,
+    query: { ref: "hex-sha" },
+  },
+  {
     method: "POST",
     pattern: /^\/graphql$/,
   },
@@ -151,13 +187,14 @@ export interface GuardedRequest {
   readonly method: string;
   readonly path: string;
   readonly body?: unknown;
+  readonly query?: Readonly<Record<string, string | number>>;
+  readonly accept?: string;
 }
 
 /**
  * Throws unless the request is one of the allowlisted operations. This is the
  * single gate before every fetch; it rejects the method and path first, then
- * requires review events to be exactly `COMMENT` and GraphQL bodies to use
- * one of the two known documents.
+ * the query keys, media type, review event and GraphQL document.
  */
 export function assertAllowedRequest(request: GuardedRequest): void {
   const method = request.method.toUpperCase();
@@ -181,6 +218,13 @@ export function assertAllowedRequest(request: GuardedRequest): void {
     throw new Error("GitHub request not allowed: invalid repository");
   }
 
+  validateQuery(route, request.query ?? {});
+  validateMedia(route, request.accept);
+
+  if (route.contents === true) {
+    validateContentsPath(request.path);
+  }
+
   const body = asRecord(request.body);
   if (body !== null && "event" in body && body.event !== "COMMENT") {
     throw new Error("GitHub review event must be COMMENT");
@@ -194,6 +238,79 @@ export function assertAllowedRequest(request: GuardedRequest): void {
     const query = body === null ? null : asString(body.query);
     if (query === null || !GRAPHQL_DOCUMENTS.has(query)) {
       throw new Error("GitHub GraphQL operation not allowed");
+    }
+  }
+}
+
+/** Only the allowlisted query keys, with the only value shape each accepts. */
+function validateQuery(
+  route: AllowedRoute,
+  query: Readonly<Record<string, string | number>>,
+): void {
+  const allowed = route.query ?? {};
+  for (const [key, value] of Object.entries(query)) {
+    const rule = allowed[key];
+    if (rule === undefined) {
+      throw new Error(`GitHub request not allowed: query parameter ${key}`);
+    }
+
+    const raw = String(value);
+    const valid =
+      rule === "hex-sha"
+        ? /^[0-9a-f]{40}$/.test(raw)
+        : rule === "bugbot"
+          ? raw === "bugbot"
+          : rule === "all"
+            ? raw === "all"
+            : /^[1-9][0-9]*$/.test(raw);
+    if (!valid) {
+      throw new Error(`GitHub request not allowed: invalid ${key}`);
+    }
+  }
+}
+
+/** The JSON media type everywhere, except the two documented raw reads. */
+function validateMedia(route: AllowedRoute, accept: string | undefined): void {
+  if (accept === undefined || accept === ACCEPT_JSON) {
+    return;
+  }
+  if (accept === ACCEPT_DIFF && route.media === "diff") {
+    return;
+  }
+  if (accept === ACCEPT_RAW && route.media === "raw") {
+    return;
+  }
+  throw new Error("GitHub request not allowed: unsupported Accept header");
+}
+
+/**
+ * Contents paths come from a parsed diff, so they are untrusted. Every segment
+ * is a literal file name: no empty, `.` or `..` segment, no leading slash, no
+ * NUL, and no percent-encoded separator or dot that could normalise away.
+ */
+function validateContentsPath(path: string): void {
+  const marker = "/contents/";
+  const index = path.indexOf(marker);
+  if (index < 0 || path.includes("\u0000")) {
+    throw new Error("GitHub request not allowed: unsafe contents path");
+  }
+
+  const rest = path.slice(index + marker.length);
+  if (rest === "" || rest.startsWith("/") || rest.endsWith("/")) {
+    throw new Error("GitHub request not allowed: unsafe contents path");
+  }
+
+  for (const segment of rest.split("/")) {
+    const lower = segment.toLowerCase();
+    if (
+      segment === "" ||
+      segment === "." ||
+      segment === ".." ||
+      lower.includes("%2f") ||
+      lower.includes("%2e") ||
+      lower.includes("%5c")
+    ) {
+      throw new Error("GitHub request not allowed: unsafe contents path");
     }
   }
 }
@@ -214,8 +331,12 @@ export interface GitHubTransportOptions {
   fetch?: FetchLike;
   /** Injectable sleep, so tests do not wait for backoff. */
   sleep?: Sleep;
-  /** API base URL. Default https://api.github.com. */
+  /** Environment lookup for GITHUB_API_URL / GITHUB_GRAPHQL_URL. */
+  env?: (name: string) => string;
+  /** API base URL. Defaults to GITHUB_API_URL, then https://api.github.com. */
   baseUrl?: string;
+  /** GraphQL URL. Defaults to GITHUB_GRAPHQL_URL, then `<base>/graphql`. */
+  graphqlUrl?: string;
   /** Per-attempt timeout covering fetch and the body read. Default 30 s. */
   timeoutMs?: number;
   /** Build the request (and return it) without sending any write. */
@@ -294,6 +415,182 @@ export async function fetchPullRequest(
   };
 }
 
+export interface PullRequestDetails extends PullRequestState {
+  /** Base commit SHA of the PR, for content reads at the old side. */
+  baseSha: string;
+  title: string;
+  body: string;
+}
+
+/**
+ * The full PR record the non-local review needs: base and head SHAs plus the
+ * title and body. The gate may come from the event payload, but these values
+ * always come from the API at review time.
+ */
+export async function fetchPullRequestDetails(
+  query: PullRequestQuery,
+): Promise<PullRequestDetails> {
+  validateRepository(query.repository);
+  validatePrNumber(query.prNumber);
+  const context = transport(query);
+
+  const response = await request(context, {
+    method: "GET",
+    path: pullPath(query.repository, query.prNumber),
+  });
+  const payload = asRecord(response.json);
+  if (payload === null) {
+    throw new GitHubError(
+      "GitHub pull request response was not an object",
+      response.status,
+    );
+  }
+
+  const head = asRecord(payload.head);
+  const headSha = head === null ? null : asString(head.sha);
+  if (headSha === null) {
+    throw new GitHubError(
+      "GitHub pull request response had no head SHA",
+      response.status,
+    );
+  }
+
+  const base = asRecord(payload.base);
+  const baseSha = base === null ? null : asString(base.sha);
+  if (baseSha === null) {
+    throw new GitHubError(
+      "GitHub pull request response had no base SHA",
+      response.status,
+    );
+  }
+
+  const headRepo = head === null ? null : asRecord(head.repo);
+  const baseRepo = base === null ? null : asRecord(base.repo);
+  const headFullName = headRepo === null ? null : asString(headRepo.full_name);
+  const baseFullName = baseRepo === null ? null : asString(baseRepo.full_name);
+
+  const labels: string[] = [];
+  for (const label of asArray(payload.labels)) {
+    const record = asRecord(label);
+    const name = record === null ? null : asString(record.name);
+    if (name !== null) {
+      labels.push(name);
+    }
+  }
+
+  return {
+    number: query.prNumber,
+    headSha,
+    baseSha,
+    title: asString(payload.title) ?? "",
+    body: asString(payload.body) ?? "",
+    draft: payload.draft === true,
+    fork:
+      headFullName === null ||
+      baseFullName === null ||
+      headFullName !== baseFullName,
+    labels,
+  };
+}
+
+/**
+ * Reads the PR diff at the exact SHAs GitHub reports. It never touches a
+ * checkout. The body is capped at 5 MB; over that, or a 406/422 "too large",
+ * the pass ends neutral with a clear reason instead of sending a partial diff.
+ */
+export async function fetchPullRequestDiff(
+  query: PullRequestQuery,
+): Promise<string> {
+  validateRepository(query.repository);
+  validatePrNumber(query.prNumber);
+  const context = transport(query);
+
+  let response: RequestResult;
+  try {
+    response = await request(context, {
+      method: "GET",
+      path: pullPath(query.repository, query.prNumber),
+      accept: ACCEPT_DIFF,
+      raw: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof GitHubError &&
+      (error.status === 406 || error.status === 422)
+    ) {
+      throw new GitHubError(
+        "pull request diff is too large to review (GitHub returned 406/422)",
+        error.status,
+      );
+    }
+    throw error;
+  }
+
+  if (
+    (response.contentLength !== null &&
+      response.contentLength > MAX_DIFF_BYTES) ||
+    response.text.length > MAX_DIFF_BYTES
+  ) {
+    throw new GitHubError("pull request diff is too large to review (over 5 MB)");
+  }
+
+  return response.text;
+}
+
+export interface ContentsQuery extends GitHubTransportOptions {
+  token: string;
+  /** "owner/name" of the repository under review. */
+  repository: string;
+  /** Repo-relative file path, with `/` separators. */
+  path: string;
+  /** Exact commit SHA. */
+  ref: string;
+}
+
+/**
+ * Reads one file at one commit through the contents API. A 404 (absent at that
+ * commit), a 403 (GitHub refuses a blob over 1 MB), or any body over 1 MB
+ * returns null, so the caller can skip it. Unsafe paths throw before a request.
+ */
+export async function readRepositoryFile(
+  query: ContentsQuery,
+): Promise<string | null> {
+  validateRepository(query.repository);
+  validateHeadSha(query.ref, "ref");
+  const context = transport(query);
+  const path = contentsPath(query.repository, query.path);
+
+  let response: RequestResult;
+  try {
+    response = await request(context, {
+      method: "GET",
+      path,
+      query: { ref: query.ref },
+      accept: ACCEPT_RAW,
+      raw: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof GitHubError &&
+      (error.status === 403 || error.status === 404 || error.status === 413)
+    ) {
+      return null;
+    }
+    throw error;
+  }
+
+  if (
+    (response.contentLength !== null &&
+      response.contentLength > MAX_CONTENTS_BYTES) ||
+    response.text.length > MAX_CONTENTS_BYTES ||
+    response.text.includes("\u0000")
+  ) {
+    return null;
+  }
+
+  return response.text;
+}
+
 export interface GitHubOptions extends GitHubTransportOptions {
   /** Short-lived GitHub App token minted by actions/create-github-app-token. */
   token: string;
@@ -308,6 +605,13 @@ export interface CheckRunHandle {
   id: number;
   /** The request that created (or, in a dry run, would create) the run. */
   planned?: PlannedRequest;
+}
+
+/** One `bugbot` check run on a commit, as the lookup sees it. */
+export interface CheckRunInfo {
+  id: number;
+  status: string | null;
+  externalId: string | null;
 }
 
 /** A neutral check never fails the PR. Bugbot has no failure conclusion. */
@@ -326,6 +630,8 @@ export interface BugbotThread {
   category: Category | null;
   reason: string;
   state: "open" | "resolved" | "skipped";
+  /** True when a bot reply already starts "Fixed in " (S6A-N9). */
+  hasFixedReply?: boolean;
 }
 
 export interface ParsedThreadBody {
@@ -349,6 +655,14 @@ export interface PostReviewResult {
 export interface SummaryResult {
   action: "created" | "updated";
   planned: PlannedRequest;
+  /** The summary body that was there before, for pass-count bookkeeping. */
+  previousBody: string | null;
+}
+
+/** One bot summary comment found on the PR. */
+export interface SummaryComment {
+  id: number;
+  body: string;
 }
 
 export interface ResolveThreadsResult {
@@ -365,7 +679,11 @@ export interface ReviewSummary {
   posted: number;
   skipped: number;
   resolved: number;
+  /** Findings that did not land as inline comments (S6B-B1). */
+  failed?: number;
   truncated: readonly string[];
+  /** Run ids for the hidden pass-count line, oldest first. */
+  runs?: readonly string[];
   /** Optional one-line failure shown as "Bugbot couldn't review: <reason>". */
   error?: string;
 }
@@ -410,6 +728,10 @@ export async function startCheck(
 /**
  * Completes a check run with `neutral` or `success` only. Any other conclusion
  * is rejected here, before a request, so Bugbot can never fail a PR.
+ *
+ * The PATCH is idempotent, so a 5xx or a timeout is retried a bounded number
+ * of times. A caller that still sees a failure must fall back to creating one
+ * completed neutral run, or the check can stay in_progress forever.
  */
 export async function finishCheck(
   options: GitHubOptions,
@@ -423,20 +745,34 @@ export async function finishCheck(
   }
 
   const context = transport(options);
-  const response = await request(context, {
-    method: "PATCH",
-    path: repoPath(options.repository, `check-runs/${check.id}`),
-    body: {
-      status: "completed",
-      conclusion,
-      output: {
-        title: "Bugbot",
-        summary: redact(summary, options.token).slice(0, MAX_CHECK_SUMMARY),
-      },
-    },
-  });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await request(context, {
+        method: "PATCH",
+        path: repoPath(options.repository, `check-runs/${check.id}`),
+        body: {
+          status: "completed",
+          conclusion,
+          output: {
+            title: "Bugbot",
+            summary: redact(summary, options.token).slice(0, MAX_CHECK_SUMMARY),
+          },
+        },
+      });
 
-  return response.plan;
+      return response.plan;
+    } catch (error) {
+      if (!(error instanceof GitHubError)) {
+        throw error;
+      }
+      const status = error.status;
+      const retryable = status === null || status >= 500;
+      if (!retryable || attempt + 1 >= FINISH_CHECK_ATTEMPTS) {
+        throw error;
+      }
+      await context.sleep(500 * 2 ** attempt);
+    }
+  }
 }
 
 /**
@@ -467,6 +803,63 @@ export async function reportSkipped(
   });
 
   return response.plan;
+}
+
+/**
+ * Lists every `bugbot` check run on this head SHA with `filter=all`, so a run
+ * hidden behind a newer one on the same commit is still visible. The caller
+ * matches `external_id` to this pass, finishes every still-`in_progress` match
+ * (S6B-N2), and completes stale runs from other passes.
+ */
+export async function listCheckRuns(
+  options: GitHubOptions,
+): Promise<readonly CheckRunInfo[]> {
+  validateOptions(options);
+  const context = transport(options);
+  const runs: CheckRunInfo[] = [];
+
+  let page = 1;
+  for (let index = 0; index < MAX_PAGES; index += 1) {
+    const response = await request(context, {
+      method: "GET",
+      path: repoPath(
+        options.repository,
+        `commits/${options.headSha}/check-runs`,
+      ),
+      query: {
+        check_name: "bugbot",
+        filter: "all",
+        per_page: 100,
+        page,
+      },
+    });
+
+    const payload = asRecord(response.json);
+    for (const item of asArray(payload?.check_runs)) {
+      const run = asRecord(item);
+      if (run === null) {
+        continue;
+      }
+      const name = asString(run.name);
+      const id = positiveInteger(run.id);
+      if (name === "bugbot" && id !== null) {
+        runs.push({
+          id,
+          status: asString(run.status),
+          externalId: asString(run.external_id),
+        });
+      }
+    }
+
+    if (!response.hasNext) {
+      return runs;
+    }
+    page += 1;
+  }
+
+  throw new GitHubError(
+    `GitHub check-run pagination exceeded ${MAX_PAGES} pages`,
+  );
 }
 
 /**
@@ -520,6 +913,7 @@ export async function listBugbotThreads(
 
   const threads: BugbotThread[] = [];
   const botLogin = botLoginOf(options.botLogin);
+  const log = logger(options);
   let after: string | null = null;
   let complete = false;
 
@@ -537,15 +931,20 @@ export async function listBugbotThreads(
     }
 
     for (const node of asArray(reviewThreads.nodes)) {
-      if (threadCommentsHaveNextPage(node)) {
-        throw new GitHubError(
-          "GitHub review thread has more comments than one page",
-        );
-      }
+      // Parse first: a human-first thread is ignored even when it has more
+      // comments than one page, so a long conversation cannot block the PR.
       const thread = parseThreadNode(node, botLogin);
-      if (thread !== null) {
-        threads.push(thread);
+      if (thread === null) {
+        continue;
       }
+      if (threadCommentsHaveNextPage(node)) {
+        log(
+          `Bugbot: thread ${thread.threadId} has more comments than one page; treating it as skipped`,
+        );
+        threads.push({ ...thread, state: "skipped" });
+        continue;
+      }
+      threads.push(thread);
     }
 
     const pageInfo = asRecord(reviewThreads.pageInfo);
@@ -639,19 +1038,18 @@ export async function postReview(
 }
 
 /**
- * Creates or edits the single summary comment, marked `<!-- bugbot:summary -->`.
- * Only a comment by the bot is edited; a human's look-alike marker is ignored.
+ * Finds the bot-authored summary comment, or null when the PR has none.
+ * Only a comment by the bot carrying the marker counts; a human's look-alike
+ * marker is ignored.
  */
-export async function upsertSummary(
+export async function findSummary(
   options: GitHubOptions,
-  summary: ReviewSummary,
-): Promise<SummaryResult> {
+): Promise<SummaryComment | null> {
   validateOptions(options);
   const context = transport(options);
-  const body = renderSummary(summary, options.token);
   const botLogin = botLoginOf(options.botLogin);
 
-  let existingId: number | null = null;
+  let found: SummaryComment | null = null;
   let hasNext = false;
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     const response = await request(context, {
@@ -685,30 +1083,60 @@ export async function upsertSummary(
       }
       const id = asNumber(comment.id);
       if (id !== null && Number.isSafeInteger(id) && id > 0) {
-        existingId = id;
+        found = { id, body: text };
         break;
       }
     }
 
     hasNext = response.hasNext;
-    if (existingId !== null || !hasNext) {
+    if (found !== null || !hasNext) {
       break;
     }
   }
 
-  if (existingId === null && hasNext) {
+  if (found === null && hasNext) {
     throw new GitHubError(
       `GitHub issue comment pagination exceeded ${MAX_PAGES} pages`,
     );
   }
 
-  if (existingId !== null) {
+  return found;
+}
+
+export interface UpsertSummaryOptions {
+  /**
+   * A summary the caller already read. Omit to scan the comments; pass null
+   * when the caller knows there is none yet.
+   */
+  previous?: SummaryComment | null;
+}
+
+/**
+ * Creates or edits the single summary comment, marked `<!-- bugbot:summary -->`.
+ * Only a comment by the bot is edited; a human's look-alike marker is ignored.
+ */
+export async function upsertSummary(
+  options: GitHubOptions,
+  summary: ReviewSummary,
+  extra: UpsertSummaryOptions = {},
+): Promise<SummaryResult> {
+  validateOptions(options);
+  const context = transport(options);
+  const body = renderSummary(summary, options.token);
+  const previous =
+    extra.previous === undefined ? await findSummary(options) : extra.previous;
+
+  if (previous !== null) {
     const response = await request(context, {
       method: "PATCH",
-      path: repoPath(options.repository, `issues/comments/${existingId}`),
+      path: repoPath(options.repository, `issues/comments/${previous.id}`),
       body: { body },
     });
-    return { action: "updated", planned: response.plan };
+    return {
+      action: "updated",
+      planned: response.plan,
+      previousBody: previous.body,
+    };
   }
 
   const response = await request(context, {
@@ -716,38 +1144,62 @@ export async function upsertSummary(
     path: repoPath(options.repository, `issues/${options.prNumber}/comments`),
     body: { body },
   });
-  return { action: "created", planned: response.plan };
+  return { action: "created", planned: response.plan, previousBody: null };
+}
+
+/** Escapes a backtick so a hostile file name cannot close a code span. */
+function escapeBacktick(text: string): string {
+  return text.replaceAll("`", "&#96;");
 }
 
 /**
  * Renders the one summary comment. The fixed final line is always appended,
  * even if a caller passes an empty or malformed summary. `secret` is the
- * options token and is always applied to the model name and error line.
+ * options token and is always applied to the model name and error line. The
+ * result is capped at 60,000 characters, below GitHub's 65,536 comment limit,
+ * with a truncation note when anything had to go.
  */
 export function renderSummary(summary: ReviewSummary, secret: string): string {
-  const lines: string[] = [
-    SUMMARY_MARKER,
+  const lines: string[] = [SUMMARY_MARKER];
+  const runs = (summary.runs ?? []).filter((id) => /^\d+$/.test(id));
+  const failed = summary.failed ?? 0;
+  if (runs.length > 0) {
+    lines.push(
+      `${RUNS_MARKER_PREFIX}${runs.slice(-MAX_RUN_IDS).join(",")} -->`,
+    );
+  }
+  lines.push(
     "## Bugbot review",
     "",
     `- Passes: ${summary.passCount}`,
     `- Model: ${redact(summary.model, secret)}`,
     `- Tokens: ${summary.tokensIn} in / ${summary.tokensOut} out`,
     `- Posted: ${summary.posted}`,
+    `- Failed to post: ${failed}`,
     `- Skipped: ${summary.skipped}`,
     `- Resolved: ${summary.resolved}`,
-  ];
+  );
 
   if (summary.error !== undefined && summary.error.trim() !== "") {
     lines.push(
       "",
-      `Bugbot couldn't review: ${oneLine(redact(summary.error, secret), 500)}`,
+      `Bugbot couldn't review: ${oneLine(
+        escapeBacktick(redact(summary.error, secret)),
+        500,
+      )}`,
     );
+  } else if (
+    summary.posted === 0 &&
+    summary.skipped === 0 &&
+    failed === 0
+  ) {
+    lines.push("", "No findings this pass.");
   }
 
   if (summary.truncated.length > 0) {
     const shown = summary.truncated.slice(0, MAX_TRUNCATED_FILES);
     const more = summary.truncated.length - shown.length;
-    const list = shown.map((file) => `\`${file}\``).join(", ");
+    const list = shown.map((file) => `\`${escapeBacktick(file)}\``).join(", ");
     lines.push(
       "",
       `**Files reduced to fit the context budget:** ${list}${
@@ -757,7 +1209,15 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
   }
 
   lines.push("", COMMENT_ONLY_NOTE);
-  return lines.join("\n");
+  const body = lines.join("\n");
+  if (body.length <= MAX_SUMMARY_CHARS) {
+    return body;
+  }
+
+  const note = "\n\n_(summary truncated)_";
+  const tail = `\n\n${COMMENT_ONLY_NOTE}`;
+  const room = Math.max(0, MAX_SUMMARY_CHARS - note.length - tail.length);
+  return `${body.slice(0, room)}${note}${tail}`;
 }
 
 /**
@@ -784,16 +1244,20 @@ export async function resolveFixedThreads(
     }
 
     try {
-      const reply = await request(context, {
-        method: "POST",
-        path: pullPath(
-          options.repository,
-          options.prNumber,
-          `comments/${thread.firstCommentId}/replies`,
-        ),
-        body: { body: `Fixed in ${fixedSha.slice(0, 7)}.` },
-      });
-      planned.push(reply.plan);
+      // A half-finished earlier pass may already have replied "Fixed in ...".
+      // Only resolve then; do not send a second reply (S6A-N9).
+      if (thread.hasFixedReply !== true) {
+        const reply = await request(context, {
+          method: "POST",
+          path: pullPath(
+            options.repository,
+            options.prNumber,
+            `comments/${thread.firstCommentId}/replies`,
+          ),
+          body: { body: `Fixed in ${fixedSha.slice(0, 7)}.` },
+        });
+        planned.push(reply.plan);
+      }
 
       const mutation = await graphqlRequest(
         context,
@@ -823,9 +1287,13 @@ interface RequestSpec {
   readonly path: string;
   readonly body?: unknown;
   readonly query?: Readonly<Record<string, string | number>>;
+  /** Alternate media type. Only the diff and raw-contents routes allow one. */
+  readonly accept?: string;
+  /** Return the body text instead of parsing JSON. */
+  readonly raw?: boolean;
   /**
    * True for a POST that only reads (the review-threads query). Dry runs let
-   * reads through and skip every write.
+   * reads through and skip every write. Reads also retry like GETs.
    */
   readonly read?: boolean;
 }
@@ -833,6 +1301,7 @@ interface RequestSpec {
 interface RequestContext {
   readonly token: string;
   readonly baseUrl: string;
+  readonly graphqlUrl: string;
   readonly fetchFn: FetchLike;
   readonly sleep: Sleep;
   readonly timeoutMs: number;
@@ -842,6 +1311,10 @@ interface RequestContext {
 interface RequestResult {
   readonly status: number;
   readonly json: unknown;
+  /** Raw body text. Empty for a dry-run write. */
+  readonly text: string;
+  /** The response's Content-Length when GitHub sent one. */
+  readonly contentLength: number | null;
   /** True when the response's Link header has rel="next". */
   readonly hasNext: boolean;
   readonly plan: PlannedRequest;
@@ -854,12 +1327,27 @@ const defaultSleep: Sleep = (milliseconds) =>
 
 const LINK_NEXT = /<[^>]*>\s*;\s*rel="?next"?/i;
 
+/**
+ * Resolves the API base. An explicit option wins, then GITHUB_API_URL, then
+ * github.com. Both URLs must be https: before any request, so a bad env value
+ * can never send the Authorization header to a plaintext or unexpected host.
+ */
 function transport(
   options: GitHubTransportOptions & { token: string },
 ): RequestContext {
+  const readEnv = options.env ?? ((name: string) => process.env[name] ?? "");
+  const baseRaw =
+    options.baseUrl ?? (readEnv("GITHUB_API_URL").trim() || DEFAULT_BASE_URL);
+  const baseUrl = normalizeHttpsUrl(baseRaw, "GITHUB_API_URL");
+  const graphqlRaw =
+    options.graphqlUrl ??
+    (readEnv("GITHUB_GRAPHQL_URL").trim() || `${baseUrl}/graphql`);
+  const graphqlUrl = normalizeHttpsUrl(graphqlRaw, "GITHUB_GRAPHQL_URL");
+
   return {
     token: options.token,
-    baseUrl: (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    baseUrl,
+    graphqlUrl,
     fetchFn: options.fetch ?? globalThis.fetch,
     sleep: options.sleep ?? defaultSleep,
     timeoutMs:
@@ -868,6 +1356,20 @@ function transport(
         : DEFAULT_TIMEOUT_MS,
     dryRun: options.dryRun === true,
   };
+}
+
+/** Validates the scheme and strips trailing slashes. */
+function normalizeHttpsUrl(raw: string, name: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${name} is not a valid URL`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`${name} must use https`);
+  }
+  return raw.replace(/\/+$/, "");
 }
 
 /** A timeout during one attempt. Retried only for idempotent methods. */
@@ -922,13 +1424,23 @@ async function request(
   // still go through the fake/real fetch.
   const isRead = spec.read === true || spec.method === "GET";
   if (context.dryRun && !isRead) {
-    return { status: 200, json: {}, hasNext: false, plan };
+    return {
+      status: 200,
+      json: {},
+      text: "",
+      contentLength: null,
+      hasNext: false,
+      plan,
+    };
   }
 
-  const url = buildUrl(context.baseUrl, spec.path, spec.query);
+  const url =
+    spec.path === "/graphql"
+      ? context.graphqlUrl
+      : buildUrl(context.baseUrl, spec.path, spec.query);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${context.token}`,
-    Accept: "application/vnd.github+json",
+    Accept: spec.accept ?? ACCEPT_JSON,
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": "bugbot",
   };
@@ -938,6 +1450,9 @@ async function request(
     init.body = JSON.stringify(spec.body);
   }
   const fetch = context.fetchFn;
+  // A read-only POST (the review-threads query) is idempotent, so it retries
+  // on a transient gateway error and on a timeout exactly like a GET (R1-N1).
+  const idempotent = isRead || isIdempotentMethod(spec.method);
 
   for (let attempt = 0; ; attempt += 1) {
     const controller = new AbortController();
@@ -958,7 +1473,7 @@ async function request(
             context.token,
           ),
         );
-        if (attempt < MAX_RETRIES && isIdempotentMethod(spec.method)) {
+        if (attempt < MAX_RETRIES && idempotent) {
           await context.sleep(retryDelayMs(null, attempt));
           continue;
         }
@@ -991,11 +1506,7 @@ async function request(
 
       if (
         attempt < MAX_RETRIES &&
-        isRetryableStatus(
-          spec.method,
-          response.status,
-          retryAfter !== null,
-        )
+        isRetryableStatus(idempotent, response.status, retryAfter !== null)
       ) {
         const delay = retryDelayMs(retryAfter, attempt);
         if (delay > MAX_RETRY_WAIT_MS) {
@@ -1016,6 +1527,18 @@ async function request(
       throw failure;
     }
 
+    const contentLength = contentLengthOf(response);
+    if (spec.raw === true) {
+      return {
+        status: response.status,
+        json: null,
+        text,
+        contentLength,
+        hasNext: LINK_NEXT.test(response.headers.get("link") ?? ""),
+        plan,
+      };
+    }
+
     let json: unknown = null;
     if (text.trim() !== "") {
       try {
@@ -1034,10 +1557,21 @@ async function request(
     return {
       status: response.status,
       json,
+      text,
+      contentLength,
       hasNext: LINK_NEXT.test(response.headers.get("link") ?? ""),
       plan,
     };
   }
+}
+
+function contentLengthOf(response: Response): number | null {
+  const raw = response.headers.get("content-length");
+  if (raw === null || raw.trim() === "") {
+    return null;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 async function graphqlRequest(
@@ -1092,7 +1626,7 @@ function isIdempotentMethod(method: HttpMethod): boolean {
 }
 
 function isRetryableStatus(
-  method: HttpMethod,
+  idempotent: boolean,
   status: number,
   hasRetryAfter: boolean,
 ): boolean {
@@ -1102,7 +1636,7 @@ function isRetryableStatus(
     return true;
   }
   return (
-    isIdempotentMethod(method) &&
+    idempotent &&
     (status === 502 || status === 503 || status === 504)
   );
 }
@@ -1362,6 +1896,11 @@ function parseThreadNode(value: unknown, botLogin: string): BugbotThread | null 
       !isBotAuthor(asRecord(reply.author), botLogin, "graphql") &&
       isSkipReply(asString(reply.body) ?? ""),
   );
+  const hasFixedReply = replies.some(
+    (reply) =>
+      isBotAuthor(asRecord(reply.author), botLogin, "graphql") &&
+      (asString(reply.body) ?? "").trimStart().startsWith("Fixed in "),
+  );
 
   const isResolved = node.isResolved === true;
   const parsed = parseThreadBody(body);
@@ -1381,6 +1920,7 @@ function parseThreadNode(value: unknown, botLogin: string): BugbotThread | null 
     category: parsed.category,
     reason: parsed.reason,
     state: isResolved ? "resolved" : skipped ? "skipped" : "open",
+    hasFixedReply,
   };
 }
 
@@ -1469,4 +2009,27 @@ function pullPath(
 ): string {
   const base = repoPath(repository, `pulls/${prNumber}`);
   return suffix === undefined ? base : `${base}/${suffix}`;
+}
+
+/**
+ * Builds a contents path. Every segment is encoded on its own, so `/` stays a
+ * separator while spaces, `?`, `#` and a literal `%2F` in a file name become
+ * inert. The guard re-checks the result before any fetch.
+ */
+function contentsPath(repository: string, path: string): string {
+  if (path === "" || path.startsWith("/") || path.includes("\u0000")) {
+    throw new Error(`refusing to read unsafe path: ${path}`);
+  }
+
+  const segments = path.split("/");
+  for (const segment of segments) {
+    if (segment === "" || segment === "." || segment === "..") {
+      throw new Error(`refusing to read unsafe path: ${path}`);
+    }
+  }
+
+  return repoPath(
+    repository,
+    `contents/${segments.map((segment) => encodeURIComponent(segment)).join("/")}`,
+  );
 }

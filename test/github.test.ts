@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_POSTED_COMMENTS,
   formatComment,
@@ -9,12 +9,16 @@ import {
   assertAllowedRequest,
   errorDetail,
   fetchPullRequest,
+  fetchPullRequestDiff,
+  findSummary,
   finishCheck,
   GitHubError,
   listBugbotThreads,
+  listCheckRuns,
   normalizeLogin,
   parseThreadBody,
   postReview,
+  readRepositoryFile,
   redact,
   renderSummary,
   reportSkipped,
@@ -1782,8 +1786,8 @@ describe("skip detection (S6A-N3)", () => {
   });
 });
 
-describe("pagination truncation (S6A-N4)", () => {
-  it("throws when a thread has more comments than one page", async () => {
+describe("pagination truncation (S6A-N4, R1-N2)", () => {
+  it("treats a bot thread with more comments than one page as skipped", async () => {
     const { fetchFn } = recording(() =>
       threadsResponse([
         threadNode([botComment()], {
@@ -1795,9 +1799,27 @@ describe("pagination truncation (S6A-N4)", () => {
       ]),
     );
 
-    await expect(
-      listBugbotThreads(options({ fetch: fetchFn })),
-    ).rejects.toThrow(/more comments than one page/);
+    const threads = await listBugbotThreads(
+      options({ fetch: fetchFn, log: () => undefined }),
+    );
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.state).toBe("skipped");
+  });
+
+  it("ignores a long human-only thread before the comment-page check", async () => {
+    const body = formatComment(plannedComment(), "12345", HEAD_SHA);
+    const { fetchFn } = recording(() =>
+      threadsResponse([
+        threadNode([comment("a-human", body)], {
+          comments: {
+            pageInfo: { hasNextPage: true },
+            nodes: [comment("a-human", body)],
+          },
+        }),
+      ]),
+    );
+
+    expect(await listBugbotThreads(options({ fetch: fetchFn }))).toEqual([]);
   });
 });
 
@@ -1852,5 +1874,599 @@ describe("blank botLogin", () => {
       reviewSummary(),
     );
     expect(result.action).toBe("updated");
+  });
+});
+
+// --- step 6b additions ----------------------------------------------------
+
+const SHA = HEAD_SHA;
+
+function rawText(
+  body: string,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "text/plain", ...headers },
+  });
+}
+
+describe("allowlist additions (step 6b)", () => {
+  it("accepts the diff, contents and check-run reads with their query keys", () => {
+    const allowed = [
+      {
+        method: "GET",
+        path: "/repos/o/r/pulls/1",
+        accept: "application/vnd.github.diff",
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/contents/src/a.ts",
+        query: { ref: SHA },
+        accept: "application/vnd.github.raw",
+      },
+      {
+        method: "GET",
+        path: `/repos/o/r/commits/${SHA}/check-runs`,
+        query: {
+          check_name: "bugbot",
+          filter: "all",
+          per_page: 100,
+          page: 1,
+        },
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/issues/1/comments",
+        query: { per_page: 100, page: 2 },
+      },
+    ];
+
+    for (const request of allowed) {
+      expect(() => assertAllowedRequest(request)).not.toThrow();
+    }
+  });
+
+  it("rejects traversal, encoded separators, extra query keys and contents writes", () => {
+    const rejected = [
+      { method: "GET", path: "/repos/o/r/contents/../secrets" },
+      { method: "GET", path: "/repos/o/r/contents/a/./b.ts" },
+      { method: "GET", path: "/repos/o/r/contents/a/%2e%2e/b.ts" },
+      { method: "GET", path: "/repos/o/r/contents/a%2Fb.ts" },
+      { method: "GET", path: "/repos/o/r/contents/a%5Cb.ts" },
+      { method: "GET", path: "/repos/o/r/contents//a.ts" },
+      {
+        method: "GET",
+        path: "/repos/o/r/contents/a.ts",
+        query: { ref: SHA, extra: "1" },
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/contents/a.ts",
+        query: { ref: "A".repeat(40) },
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/contents/a.ts",
+        query: { ref: "a".repeat(39) },
+      },
+      {
+        method: "GET",
+        path: `/repos/o/r/commits/${SHA}/check-runs`,
+        query: { check_name: "other" },
+      },
+      {
+        method: "GET",
+        path: `/repos/o/r/commits/${SHA}/check-runs`,
+        query: { check_name: "bugbot", extra: "1" },
+      },
+      {
+        method: "GET",
+        path: `/repos/o/r/commits/${SHA}/check-runs`,
+        query: { check_name: "bugbot", filter: "latest" },
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/pulls/1",
+        query: { ref: SHA },
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/pulls/1",
+        accept: "application/vnd.github.raw",
+      },
+      {
+        method: "GET",
+        path: "/repos/o/r/issues/1/comments",
+        accept: "application/vnd.github.diff",
+      },
+      { method: "PUT", path: "/repos/o/r/contents/a.ts" },
+      { method: "DELETE", path: "/repos/o/r/contents/a.ts" },
+      { method: "POST", path: "/repos/o/r/contents/a.ts" },
+    ];
+
+    for (const request of rejected) {
+      expect(() => assertAllowedRequest(request)).toThrow();
+    }
+  });
+});
+
+describe("fetchPullRequestDiff", () => {
+  it("reads the diff media type and returns the raw body", async () => {
+    const { fetchFn, calls } = recording(() => rawText("diff --git a/x b/x\n"));
+
+    const diff = await fetchPullRequestDiff({
+      token: TOKEN,
+      repository: "o/r",
+      prNumber: 1,
+      fetch: fetchFn,
+    });
+
+    expect(diff).toBe("diff --git a/x b/x\n");
+    expect(calls[0]?.path).toBe("/repos/o/r/pulls/1");
+    expect(calls[0]?.headers.Accept).toBe("application/vnd.github.diff");
+  });
+
+  it("refuses a body over 5 MB and a 406 or 422", async () => {
+    const big = recording(() =>
+      rawText("x", 200, { "content-length": String(5 * 1024 * 1024 + 1) }),
+    );
+    await expect(
+      fetchPullRequestDiff({
+        token: TOKEN,
+        repository: "o/r",
+        prNumber: 1,
+        fetch: big.fetchFn,
+      }),
+    ).rejects.toThrow(/too large/);
+
+    for (const status of [406, 422]) {
+      const refused = recording(() => json({ message: "diff too large" }, status));
+      await expect(
+        fetchPullRequestDiff({
+          token: TOKEN,
+          repository: "o/r",
+          prNumber: 1,
+          fetch: refused.fetchFn,
+        }),
+      ).rejects.toThrow(/too large/);
+    }
+  });
+
+  it("passes a 500 through as a normal GitHub error", async () => {
+    const failed = recording(() => json({ message: "boom" }, 500));
+    await expect(
+      fetchPullRequestDiff({
+        token: TOKEN,
+        repository: "o/r",
+        prNumber: 1,
+        fetch: failed.fetchFn,
+      }),
+    ).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+describe("readRepositoryFile", () => {
+  it("reads a file at the exact ref with the raw media type", async () => {
+    const { fetchFn, calls } = recording(() => rawText("export const a = 1;\n"));
+
+    const content = await readRepositoryFile({
+      token: TOKEN,
+      repository: "o/r",
+      path: "src/a.ts",
+      ref: SHA,
+      fetch: fetchFn,
+    });
+
+    expect(content).toBe("export const a = 1;\n");
+    expect(calls[0]?.path).toBe("/repos/o/r/contents/src/a.ts");
+    expect(calls[0]?.search).toBe(`?ref=${SHA}`);
+    expect(calls[0]?.headers.Accept).toBe("application/vnd.github.raw");
+  });
+
+  it("encodes each path segment and never collapses a literal percent", async () => {
+    const { fetchFn, calls } = recording(() => rawText("x"));
+
+    await readRepositoryFile({
+      token: TOKEN,
+      repository: "o/r",
+      path: "src/a b#c?d%2Fe.ts",
+      ref: SHA,
+      fetch: fetchFn,
+    });
+
+    expect(calls[0]?.path).toBe(
+      "/repos/o/r/contents/src/a%20b%23c%3Fd%252Fe.ts",
+    );
+  });
+
+  it("returns null for 404, 403 and an over-1-MB body", async () => {
+    for (const status of [403, 404, 413]) {
+      const missing = recording(() => json({ message: "no" }, status));
+      expect(
+        await readRepositoryFile({
+          token: TOKEN,
+          repository: "o/r",
+          path: "src/a.ts",
+          ref: SHA,
+          fetch: missing.fetchFn,
+        }),
+      ).toBeNull();
+    }
+
+    const hugeHeader = recording(() =>
+      rawText("x", 200, { "content-length": String(1024 * 1024 + 1) }),
+    );
+    expect(
+      await readRepositoryFile({
+        token: TOKEN,
+        repository: "o/r",
+        path: "src/a.ts",
+        ref: SHA,
+        fetch: hugeHeader.fetchFn,
+      }),
+    ).toBeNull();
+
+    const hugeBody = recording(() => rawText("x".repeat(1024 * 1024 + 1)));
+    expect(
+      await readRepositoryFile({
+        token: TOKEN,
+        repository: "o/r",
+        path: "src/a.ts",
+        ref: SHA,
+        fetch: hugeBody.fetchFn,
+      }),
+    ).toBeNull();
+  });
+
+  it("refuses unsafe paths before any request", async () => {
+    const { fetchFn, calls } = recording(() => {
+      throw new Error("fetch must not be called for an unsafe path");
+    });
+
+    const unsafe = ["../x", "a/../b", "a/./b", "/a", "a//b", "a\u0000b"];
+    for (const path of unsafe) {
+      await expect(
+        readRepositoryFile({
+          token: TOKEN,
+          repository: "o/r",
+          path,
+          ref: SHA,
+          fetch: fetchFn,
+        }),
+      ).rejects.toThrow(/unsafe path/);
+    }
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("listCheckRuns", () => {
+  it("returns every bugbot run with its status and asks for filter=all", async () => {
+    const { fetchFn, calls } = recording(() =>
+      json({
+        check_runs: [
+          { id: 5, name: "bugbot", external_id: "999", status: "completed" },
+          {
+            id: 88,
+            name: "bugbot",
+            external_id: "12345",
+            status: "in_progress",
+          },
+          { id: 99, name: "other", external_id: "12345", status: "in_progress" },
+        ],
+      }),
+    );
+
+    const found = await listCheckRuns(options({ fetch: fetchFn }));
+
+    expect(found).toEqual([
+      { id: 5, status: "completed", externalId: "999" },
+      { id: 88, status: "in_progress", externalId: "12345" },
+    ]);
+    expect(calls[0]?.path).toBe(`/repos/o/r/commits/${SHA}/check-runs`);
+    expect(calls[0]?.search).toContain("check_name=bugbot");
+    expect(calls[0]?.search).toContain("filter=all");
+    expect(calls[0]?.search).toContain(`per_page=100`);
+  });
+
+  it("returns an empty list when no run matches", async () => {
+    const { fetchFn } = recording(() =>
+      json({
+        check_runs: [
+          { id: 5, name: "other", external_id: "999", status: "in_progress" },
+        ],
+      }),
+    );
+    expect(await listCheckRuns(options({ fetch: fetchFn }))).toEqual([]);
+  });
+});
+
+describe("summary state and pass count", () => {
+  it("findSummary returns the bot body and upsertSummary reuses it", async () => {
+    const oldBody = "old body\n<!-- bugbot:summary -->";
+    const { fetchFn, calls } = recording((call) =>
+      call.method === "GET"
+        ? json([
+            { id: 1, user: restUser("a-human", "User"), body: "<!-- bugbot:summary -->" },
+            botSummaryComment(77, oldBody),
+          ])
+        : json({}),
+    );
+
+    const found = await findSummary(options({ fetch: fetchFn }));
+    expect(found).toEqual({ id: 77, body: oldBody });
+
+    const result = await upsertSummary(
+      options({ fetch: fetchFn }),
+      reviewSummary({ runs: ["111", "222"] }),
+      { previous: found },
+    );
+
+    expect(result.action).toBe("updated");
+    expect(result.previousBody).toBe(oldBody);
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect((patch?.body as { body: string }).body).toContain(
+      "<!-- bugbot:runs 111,222 -->",
+    );
+  });
+
+  it("renders the hidden runs line, keeps the last 200 and escapes backticks", () => {
+    const many = Array.from({ length: 250 }, (_, index) => String(index + 1));
+    const body = renderSummary(
+      reviewSummary({ runs: many, truncated: ["a`b.ts"] }),
+      TOKEN,
+    );
+
+    expect(body).toContain("<!-- bugbot:runs 51,");
+    expect(body).toContain(",250 -->");
+    expect(body).toContain("`a&#96;b.ts`");
+    expect(body).not.toContain("`a`b.ts`");
+    expect(body.endsWith("Bugbot only comments; it never approves or blocks.")).toBe(true);
+  });
+
+  it("caps the rendered summary below GitHub's comment limit", () => {
+    const truncated = Array.from(
+      { length: 50 },
+      (_, index) => `${index}-${"x".repeat(4000)}`,
+    );
+    const body = renderSummary(
+      reviewSummary({ truncated, error: "x".repeat(500) }),
+      TOKEN,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("_(summary truncated)_");
+    expect(body.endsWith("Bugbot only comments; it never approves or blocks.")).toBe(true);
+  });
+});
+
+describe("base and GraphQL URLs (S6A-N6)", () => {
+  it("requires https for GITHUB_API_URL before any request", async () => {
+    const { fetchFn, calls } = recording(() => {
+      throw new Error("fetch must not run");
+    });
+
+    await expect(
+      fetchPullRequest({
+        token: TOKEN,
+        repository: "o/r",
+        prNumber: 1,
+        fetch: fetchFn,
+        env: (name) =>
+          name === "GITHUB_API_URL" ? "http://evil.test:8080" : "",
+      }),
+    ).rejects.toThrow(/https/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("requires https for an explicit baseUrl and GITHUB_GRAPHQL_URL", async () => {
+    const { fetchFn, calls } = recording(() => {
+      throw new Error("fetch must not run");
+    });
+
+    await expect(
+      fetchPullRequest({
+        token: TOKEN,
+        repository: "o/r",
+        prNumber: 1,
+        fetch: fetchFn,
+        baseUrl: "http://evil.test:8080",
+      }),
+    ).rejects.toThrow(/https/);
+
+    await expect(
+      listBugbotThreads(
+        options({
+          fetch: fetchFn,
+          env: (name) =>
+            name === "GITHUB_GRAPHQL_URL" ? "http://evil.test/graphql" : "",
+        }),
+      ),
+    ).rejects.toThrow(/https/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("routes REST to GITHUB_API_URL and GraphQL to GITHUB_GRAPHQL_URL", async () => {
+    const env = (name: string): string =>
+      name === "GITHUB_API_URL"
+        ? "https://ghe.example/api/v3"
+        : name === "GITHUB_GRAPHQL_URL"
+          ? "https://ghe.example/api/graphql"
+          : "";
+
+    const rest = recording(() => pullResponse());
+    await fetchPullRequest({
+      token: TOKEN,
+      repository: "o/r",
+      prNumber: 1,
+      fetch: rest.fetchFn,
+      env,
+    });
+    expect(rest.calls[0]?.url).toBe(
+      "https://ghe.example/api/v3/repos/o/r/pulls/1",
+    );
+
+    const graph = recording(() => threadsResponse([]));
+    await listBugbotThreads(options({ fetch: graph.fetchFn, env }));
+    expect(graph.calls[0]?.url).toBe("https://ghe.example/api/graphql");
+  });
+});
+
+describe("review-threads query retries (R1-N1)", () => {
+  it("retries a 502 on the thread query but not on the resolve mutation", async () => {
+    let attempts = 0;
+    const query = recording((call) => {
+      attempts += 1;
+      if (attempts === 1) {
+        return json({ message: "gateway" }, 502);
+      }
+      return threadsResponse([threadNode([botComment()])]);
+    });
+
+    const threads = await listBugbotThreads(
+      options({ fetch: query.fetchFn, sleep: async () => {} }),
+    );
+    expect(threads).toHaveLength(1);
+    expect(query.calls).toHaveLength(2);
+    expect(String((query.calls[0]?.body as { query: string }).query)).toContain(
+      "reviewThreads",
+    );
+
+    const mutation = recording(() => json({ message: "gateway" }, 502));
+    const result = await resolveFixedThreads(
+      options({ fetch: mutation.fetchFn, sleep: async () => {} }),
+      [bugbotThread({ hasFixedReply: true })],
+      HEAD_SHA,
+    );
+    expect(result).toMatchObject({ resolved: 0, failed: 1 });
+    expect(mutation.calls).toHaveLength(1);
+  });
+
+  it("retries a timed-out thread query like a GET", async () => {
+    let attempts = 0;
+    const fetchFn: FetchLike = () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Promise<Response>(() => {});
+      }
+      return Promise.resolve(threadsResponse([threadNode([botComment()])]));
+    };
+
+    const threads = await deadline(
+      listBugbotThreads(
+        options({ fetch: fetchFn, sleep: async () => {}, timeoutMs: 10 }),
+      ),
+      1_500,
+    );
+
+    expect(threads).toHaveLength(1);
+    expect(attempts).toBe(2);
+  });
+});
+
+describe("resolve idempotency (S6A-N9)", () => {
+  it("resolves a thread that already has a bot Fixed in reply without replying", async () => {
+    const { fetchFn, calls } = recording((call) => {
+      if (call.path === "/graphql") {
+        return json({
+          data: {
+            resolveReviewThread: { thread: { id: "PRRT_1", isResolved: true } },
+          },
+        });
+      }
+      return json({ id: 1 });
+    });
+
+    const result = await resolveFixedThreads(
+      options({ fetch: fetchFn }),
+      [bugbotThread({ hasFixedReply: true })],
+      HEAD_SHA,
+    );
+
+    expect(result).toMatchObject({ resolved: 1, failed: 0 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe("/graphql");
+  });
+
+  it("sets hasFixedReply from a bot reply when listing threads", async () => {
+    const { fetchFn } = recording(() =>
+      threadsResponse([
+        threadNode([botComment(), comment(BOT, "Fixed in abc1234.")]),
+      ]),
+    );
+
+    const threads = await listBugbotThreads(options({ fetch: fetchFn }));
+    expect(threads[0]?.hasFixedReply).toBe(true);
+  });
+});
+
+describe("timeout test gaps (R1-N4)", () => {
+  it("passes an AbortSignal to fetch and aborts it on timeout", async () => {
+    const signals: AbortSignal[] = [];
+    let call = 0;
+    const fetchFn: FetchLike = (_input, init) => {
+      signals.push(init?.signal as AbortSignal);
+      call += 1;
+      if (call === 1) {
+        return Promise.resolve(pullResponse());
+      }
+      return new Promise<Response>(() => {});
+    };
+
+    await fetchPullRequest({
+      token: TOKEN,
+      repository: "o/r",
+      prNumber: 1,
+      fetch: fetchFn,
+    });
+
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[0]?.aborted).toBe(false);
+
+    await expect(
+      deadline(
+        fetchPullRequest({
+          token: TOKEN,
+          repository: "o/r",
+          prNumber: 1,
+          fetch: fetchFn,
+          sleep: async () => {},
+          timeoutMs: 10,
+        }),
+        1_500,
+      ),
+    ).rejects.toThrow(/timed out/);
+
+    const timeoutSignals = signals.slice(1);
+    expect(timeoutSignals).toHaveLength(3);
+    expect(timeoutSignals.every((signal) => signal.aborted)).toBe(true);
+  });
+
+  it("clears the timeout timer on success and on error", async () => {
+    vi.useFakeTimers();
+    try {
+      const ok = recording(() => pullResponse());
+      await fetchPullRequest({
+        token: TOKEN,
+        repository: "o/r",
+        prNumber: 1,
+        fetch: ok.fetchFn,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+
+      const bad = recording(() => json({ message: "boom" }, 500));
+      await expect(
+        fetchPullRequest({
+          token: TOKEN,
+          repository: "o/r",
+          prNumber: 1,
+          fetch: bad.fetchFn,
+        }),
+      ).rejects.toThrow(/500/);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
