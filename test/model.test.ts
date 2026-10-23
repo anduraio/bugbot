@@ -5,6 +5,7 @@ import {
   defaultAttemptTimeoutMs,
   modelHonorsReasoningMaxTokens,
   parseJsonResponse,
+  salvageFindingItems,
   scaledAttemptTimeout,
   type FetchLike,
 } from "../src/model.js";
@@ -30,6 +31,7 @@ function expectedBody(
     response_format: { type: "json_object" },
     max_tokens: maxTokens,
     ...(reasoning === undefined ? {} : { reasoning }),
+    usage: { include: true },
   };
 }
 
@@ -1269,5 +1271,94 @@ describe("parseJsonResponse", () => {
 
   it("throws when the object has no findings array", () => {
     expect(() => parseJsonResponse('{"data":[]}')).toThrow(BugbotModelError);
+  });
+});
+
+const CUT_FINDING = {
+  file: "src/a.ts",
+  line: 4,
+  severity: "high",
+  category: "bug",
+  confidence: 0.9,
+  reason: "a { brace } and a \\\"quote\\\" inside the reason",
+  suggested_fix: "",
+  angle: "interrogate:correctness",
+  symbol: "",
+  triage: "fix",
+};
+
+describe("cut-off replies", () => {
+  const whole = JSON.stringify(CUT_FINDING);
+  const cut = `{"findings":[${whole},${whole},{"file":"src/b.ts","line":7,"reason":"stopped mid-str`;
+
+  it("salvages every complete finding and drops the one being written", () => {
+    expect(salvageFindingItems(cut)).toEqual([CUT_FINDING, CUT_FINDING]);
+  });
+
+  it("salvages a bare array and a fenced reply", () => {
+    expect(salvageFindingItems(`[${whole},{"file"`)).toEqual([CUT_FINDING]);
+    expect(salvageFindingItems("```json\n" + cut)).toEqual([CUT_FINDING, CUT_FINDING]);
+  });
+
+  it("returns null without a findings array and [] when nothing was complete", () => {
+    expect(salvageFindingItems("Sorry, I cannot")).toBeNull();
+    expect(salvageFindingItems('{"findings":[{"file":"src/a.ts"')).toEqual([]);
+  });
+
+  it("parseJsonResponse keeps the complete findings and marks the reply truncated", () => {
+    const parsed = parseJsonResponse(cut);
+    expect(parsed.findings).toHaveLength(2);
+    expect(parsed.truncated).toBe(true);
+    expect(parseJsonResponse(JSON.stringify({ findings: [CUT_FINDING] })).truncated).toBeUndefined();
+    expect(() => parseJsonResponse('{"findings":[{"fi')).toThrow("model response was not valid JSON");
+  });
+
+  it("callModel returns a cut-off reply with complete findings instead of retrying", async () => {
+    const fetch = vi.fn<FetchLike>(async () =>
+      emptyStop({ finishReason: "length", content: cut, tokensIn: 10, tokensOut: 64_000 }),
+    );
+    const logs: string[] = [];
+    const result = await callModel(CALL, {
+      apiKey: "key",
+      fetch,
+      sleep: async () => {},
+      log: (line) => logs.push(line),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result.truncated).toBe(true);
+    expect(result.raw).toBe(cut);
+    expect(logs).toContain("OpenRouter reply cut off at max_tokens=64000; keeping 2 complete findings");
+  });
+
+  it("callModel still retries a cut-off reply with no complete finding", async () => {
+    const fetch = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(emptyStop({ finishReason: "length", content: '{"findings":[{"fi' }))
+      .mockResolvedValueOnce(ok(JSON.stringify({ findings: [] })));
+    const result = await callModel(CALL, { apiKey: "key", fetch, sleep: async () => {}, log: () => {} });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result.truncated).toBeUndefined();
+  });
+
+  it("sums provider-reported cost over every reply", async () => {
+    const withCost = (cost: number, content: string): Response =>
+      new Response(
+        JSON.stringify({
+          model: CALL.model,
+          choices: [{ index: 0, finish_reason: content === "" ? "length" : "stop", message: { content } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, cost },
+        }),
+        { status: 200 },
+      );
+    const fetch = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(withCost(0.25, ""))
+      .mockResolvedValueOnce(withCost(0.125, JSON.stringify({ findings: [] })));
+    const result = await callModel(CALL, { apiKey: "key", fetch, sleep: async () => {}, log: () => {} });
+
+    expect(result.cost).toBe(0.375);
+    expect(result.attempts.map((attempt) => attempt.cost)).toEqual([0.25, 0.125]);
   });
 });

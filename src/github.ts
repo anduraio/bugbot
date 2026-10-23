@@ -787,6 +787,13 @@ export interface ReviewSummary {
   model: string;
   tokensIn: number;
   tokensOut: number;
+  /** Provider-reported USD for this pass; omitted when none was reported. */
+  cost?: number;
+  /**
+   * One line for a review split into parts: parts reviewed, failed parts and
+   * cut-off replies.
+   */
+  parts?: string;
   /**
    * Safe per-attempt reasoning settings and token counts for the main model
    * call, for example `#1 effort=high cap 64000 (...)`.
@@ -862,6 +869,8 @@ export async function finishCheck(
   check: CheckRunHandle,
   conclusion: CheckConclusion,
   summary: string,
+  /** Shown next to the check name, so a failed review is visible at a glance. */
+  title = "Bugbot",
 ): Promise<PlannedRequest> {
   validateOptions(options);
   if (conclusion !== "neutral" && conclusion !== "success") {
@@ -878,7 +887,7 @@ export async function finishCheck(
           status: "completed",
           conclusion,
           output: {
-            title: "Bugbot",
+            title: redact(title, options.token).slice(0, 100),
             summary: redact(summary, options.token).slice(0, MAX_CHECK_SUMMARY),
           },
         },
@@ -1327,6 +1336,19 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
     `- Passes: ${summary.passCount}`,
     `- Model: ${redact(summary.model, secret)}`,
     `- Tokens: ${summary.tokensIn} in / ${summary.tokensOut} out`,
+    ...(summary.cost === undefined ||
+    !Number.isFinite(summary.cost) ||
+    summary.cost <= 0
+      ? []
+      : [`- Cost: $${summary.cost.toFixed(4)}`]),
+    ...(summary.parts === undefined || summary.parts.trim() === ""
+      ? []
+      : [
+          `- Parts: ${oneLine(
+            escapeBacktick(redact(summary.parts, secret)),
+            1_000,
+          )}`,
+        ]),
     ...(summary.reasoning === undefined || summary.reasoning.trim() === ""
       ? []
       : [

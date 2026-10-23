@@ -21,7 +21,9 @@ and prints the findings plus the comments that would post; it never posts.
 - `.github/workflows/review.yml` - reusable workflow for opted-in repos
 - `src/context.ts` - diff, changed files, `AGENTS.md`, token budget
 - `src/prompt.ts` - assembles the vendored prompts and the context
-- `src/model.ts` - OpenRouter call, JSON-only, retries
+- `src/chunk.ts` - splits a big diff into parts at file and hunk boundaries
+- `src/parts.ts` - reviews each part in its own request and merges findings
+- `src/model.ts` - OpenRouter call, JSON-only, retries, cut-off salvage
 - `src/filter.ts` - finding schema, confidence/severity/triage gate, hash,
   cross-pass dedupe, comment body and marker
 - `src/gate.ts` - pure draft/fork gate shared by the workflow and the CLI
@@ -183,9 +185,13 @@ output tokens price measured for DeepSeek v4.1 flash.
 - `BUGBOT_MIN_CONFIDENCE` sets the inline-comment confidence bar (default 0.8).
   A value outside `0` to `1`, or a malformed one, falls back to 0.8; a valid
   lower value such as `0.1` is honored on purpose.
-- `BUGBOT_BIG_PR_MODEL` is the fallback model for a PR over 1500 changed lines
-  or a context that is over budget after truncation. Without it, those
-  reviews are skipped with a reason instead of sent past the budget.
+- `BUGBOT_BIG_PR_MODEL` is the fallback model for a part over 1500 changed
+  lines (a single hunk that big cannot be split) or a context that is over
+  budget after truncation; without it, that part is skipped with a reason.
+  When a split review's part fails on the main model, it is retried once on
+  this model.
+- `BUGBOT_PART_TOKENS` is the input budget for each part of a split review
+  (default 50000, never above `--max-tokens`). See "Big pull requests".
 - `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
   (default 64000). A set value must be a whole number from 1000 to 128000;
   anything else ends the pass with a clear message before any model request.
@@ -210,10 +216,37 @@ output tokens price measured for DeepSeek v4.1 flash.
   budget wins for an allow-listed model and the effort wins for every other
   model.
 
+## Big pull requests
+
+A diff over about half the part budget (after the system prompt), or over
+1000 changed lines, is split into parts. Files stay whole and in diff order;
+a single file that is still too big is split at hunk boundaries with its
+header repeated, and a hunk is never split. Each part gets its own context
+(its files' contents, reduced to fit `part_tokens`), a `<review_part>` block
+naming the files in the other parts, and its own model request. Up to three
+parts run at once. A small PR is one part, held to the same `part_tokens`
+budget, so a short diff over large files is reduced to fit instead of sent as
+one huge request. `max_tokens` caps `part_tokens`.
+
+The prompt asks for at most 10 findings per reply, most severe first, with
+short `reason` and `suggested_fix` fields. If a reply still stops on
+`length` mid-JSON, every finding that was written out in full is kept and the
+summary says the reply was cut off; only a cut-off with no complete finding
+gets the reasoning-off retry.
+
+The merged findings go through the usual filter and post as one review. When
+some parts fail, the rest are still posted, the summary's `Parts` line names
+each failed part, its files and the reason, and the check finishes `neutral`
+with the title "Bugbot reviewed only part of this PR". When nothing could be
+reviewed the title is "Bugbot couldn't review". The summary's `Cost` line is
+the USD OpenRouter reports in `usage.cost`, and every pass logs
+`tokens_in`, `tokens_out` and `cost_usd`.
+
 ## Workflow inputs
 
 The reusable workflow and the composite action accept `model`, `big_pr_model`,
-`max_tokens` (input budget, default 120000), `max_output_tokens` (model output
+`max_tokens` (input budget, default 120000), `part_tokens` (input budget per
+part of a split review, default 50000), `max_output_tokens` (model output
 cap, default 64000), `reasoning_effort` (first-attempt reasoning, default
 `high`, passed as `BUGBOT_REASONING_EFFORT`), `reasoning_max_tokens` (optional
 reasoning budget, default empty = off, passed as
@@ -244,15 +277,18 @@ To switch back to a smaller reasoning spend, set `reasoning_effort: low` (or
 allow-listed model, `reasoning_max_tokens` sets a budget instead. All are one
 input and need no code change.
 
-Worst case for one review with the defaults (64000 output cap, two retries,
+Worst case for a one-part review with the defaults (64000 output cap, two retries,
 one re-check): eight OpenRouter requests (three review attempts, one extra
 reasoning-off review attempt after a `length` stop, and four re-check attempts
 at the re-check's own 16000 cap), at most 320000 output tokens, about 67
 minutes of per-attempt timeouts, and at $1.20 per million output tokens, about
 $0.38. Input tokens are extra. At the maximum accepted `max_output_tokens` of
 128000 the output worst case is 576000 tokens, about $0.69, and about 120
-minutes. The reusable workflow sets no `timeout-minutes`, so GitHub's
-360-minute job default still covers the worst case.
+minutes. A split review makes up to four review attempts per part (the
+re-check still runs once per pass), and runs three parts at once, so its wall
+time grows with every three parts. The reusable workflow sets no
+`timeout-minutes`, so GitHub's 360-minute job default still covers a review
+of several parts.
 
 ## Development
 

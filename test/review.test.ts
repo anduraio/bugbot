@@ -395,6 +395,8 @@ interface World {
   modelInvalidJson: boolean;
   /** Main model calls that return an empty `length` stop before the normal one. */
   modelEmptyLengths: number;
+  /** Answers a main model call from its user message; undefined falls through. */
+  modelReply?: (user: string) => Response | undefined;
   recheckContent: string;
   recheckStatus: number;
   /** A re-check reply whose 200 content is not JSON (three failed attempts). */
@@ -596,6 +598,10 @@ function recordedFetch(world: World): {
           return json({ error: { message: "recheck upstream failed" } }, world.recheckStatus);
         }
         return completion(world.recheckContent);
+      }
+      const custom = world.modelReply?.(String(messages[1]?.content ?? ""));
+      if (custom !== undefined) {
+        return custom;
       }
       if (world.modelStatus !== 200) {
         return json({ error: { message: world.modelMessage } }, world.modelStatus);
@@ -3564,5 +3570,187 @@ describe("runPrReview secrets", () => {
       expect(text).not.toContain(TOKEN);
       expect(text).not.toContain(API_KEY);
     }
+  });
+});
+
+/** A PR of six files with 220 added lines each: 1320 changed lines. */
+const PARTS_FILES = Array.from({ length: 6 }, (_value, index) => `src/part${index + 1}.ts`);
+const PARTS_LINES = Array.from(
+  { length: 220 },
+  (_value, index) => `export const value${index + 1} = compute(${index + 1});`,
+);
+const PARTS_DIFF = PARTS_FILES.map((file) =>
+  [
+    `diff --git a/${file} b/${file}`,
+    "new file mode 100644",
+    "--- /dev/null",
+    `+++ b/${file}`,
+    `@@ -0,0 +1,${PARTS_LINES.length} @@`,
+    ...PARTS_LINES.map((line) => `+${line}`),
+  ].join("\n"),
+).join("\n") + "\n";
+const PARTS_CONTENT = `${PARTS_LINES.join("\n")}\n`;
+
+function partsWorld(overrides: Partial<World> = {}): World {
+  return makeWorld({
+    diff: PARTS_DIFF,
+    files: Object.fromEntries(PARTS_FILES.map((file) => [file, PARTS_CONTENT])),
+    baseFiles: {},
+    ...overrides,
+  });
+}
+
+function partsFinding(file: string): Record<string, unknown> {
+  return {
+    ...FINDING,
+    file,
+    line: 3,
+    symbol: "",
+    reason: `compute(3) in ${file} is called before compute is defined, so the module throws on import.`,
+  };
+}
+
+/** The diff block of a model user message: which files a part holds. */
+function diffBlock(user: string): string {
+  return /<diff>([\s\S]*?)<\/diff>/.exec(user)?.[1] ?? "";
+}
+
+describe("runPrReview big pull requests in parts", () => {
+  it("splits a 1320-line PR into parts and posts the merged findings", async () => {
+    const world = partsWorld({
+      modelReply: (user) => {
+        const diff = diffBlock(user);
+        const file = PARTS_FILES.find((candidate) => diff.includes(`+++ b/${candidate}`));
+        return completion(JSON.stringify({ findings: file === undefined ? [] : [partsFinding(file)] }));
+      },
+    });
+    const { result, calls, logs } = await runReview(world);
+
+    expect(result).toMatchObject({ exitCode: 0, conclusion: "success" });
+    const requests = mainModelCalls(calls);
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(messageContent(request, 1)).toContain("<review_part>");
+    }
+    // Every file is in exactly one part.
+    for (const file of PARTS_FILES) {
+      expect(
+        requests.filter((request) => diffBlock(messageContent(request, 1)).includes(`+++ b/${file}`)),
+      ).toHaveLength(1);
+    }
+
+    const reviews = reviewCalls(calls);
+    expect(reviews).toHaveLength(1);
+    const comments = (reviews[0]!.body as { comments: Array<{ path: string }> }).comments;
+    expect(comments.map((comment) => comment.path).sort()).toEqual(["src/part1.ts", "src/part5.ts"]);
+
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 2");
+    expect(summary).toContain("- Parts: 2 of 2 reviewed");
+    expect(summary).toContain("- Tokens: 246 in / 90 out");
+    expect(logs).toContain("Bugbot: reviewing 2 parts");
+    expect(logs.some((line) => line.startsWith("Bugbot: tokens_in=246 tokens_out=90"))).toBe(true);
+  });
+
+  it("keeps the complete findings of a reply cut off mid-JSON, with no retry", async () => {
+    const world = partsWorld({
+      modelReply: (user) => {
+        const diff = diffBlock(user);
+        const file = PARTS_FILES.find((candidate) => diff.includes(`+++ b/${candidate}`)) ?? "";
+        const whole = JSON.stringify(partsFinding(file));
+        return json({
+          id: "gen-test",
+          model: "deepseek/test",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "length",
+              message: {
+                role: "assistant",
+                content: `{"findings":[${whole},{"file":"${file}","line":9,"reason":"cut of`,
+              },
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 64_000, cost: 0.05 },
+        });
+      },
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result).toMatchObject({ exitCode: 0, conclusion: "success" });
+    expect(mainModelCalls(calls)).toHaveLength(2);
+    const reviews = reviewCalls(calls);
+    expect((reviews[0]!.body as { comments: unknown[] }).comments).toHaveLength(2);
+
+    const summary = summaryBody(world);
+    expect(summary).toContain("part 1 reply was cut off; kept its 1 complete finding");
+    expect(summary).toContain("- Cost: $0.1000");
+  });
+
+  it("posts the reviewed parts and flags the failed one when a part fails", async () => {
+    const world = partsWorld({
+      modelReply: (user) => {
+        const diff = diffBlock(user);
+        if (diff.includes("+++ b/src/part5.ts")) {
+          return json({ error: { message: "upstream exploded" } }, 400);
+        }
+        return completion(JSON.stringify({ findings: [partsFinding("src/part1.ts")] }));
+      },
+    });
+    const { result, calls } = await runReview(world);
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      conclusion: "neutral",
+      error: "1 of 2 review parts failed",
+    });
+    expect(reviewCalls(calls)).toHaveLength(1);
+
+    const summary = summaryBody(world);
+    expect(summary).toContain("- Posted this pass: 1");
+    expect(summary).toMatch(/- Parts: 1 of 2 reviewed; part 2 \(src\/part5\.ts, src\/part6\.ts\) failed: OpenRouter returned 400: upstream exploded/);
+
+    const finish = checkPatches(calls, 77);
+    const output = (finish.at(-1)!.body as { conclusion: string; output: { title: string } });
+    expect(output.conclusion).toBe("neutral");
+    expect(output.output.title).toBe("Bugbot reviewed only part of this PR");
+  });
+
+  it("retries a failed part on big_pr_model", async () => {
+    const world = partsWorld({
+      modelReply: (user) => {
+        const diff = diffBlock(user);
+        if (diff.includes("+++ b/src/part5.ts")) {
+          return json({ error: { message: "bad part" } }, 400);
+        }
+        return completion(JSON.stringify({ findings: [] }));
+      },
+    });
+    let bigCalls = 0;
+    const { result, calls } = await runReview(world, { BUGBOT_BIG_PR_MODEL: "google/gemini-test" });
+    for (const call of mainModelCalls(calls)) {
+      if ((call.body as { model: string }).model === "google/gemini-test") {
+        bigCalls += 1;
+      }
+    }
+
+    // The fake fails every request for part 2, whichever model is asked.
+    expect(bigCalls).toBe(1);
+    expect(result.conclusion).toBe("neutral");
+  });
+
+  it("names the failure in the check title when every part fails", async () => {
+    const world = partsWorld({ modelStatus: 400, modelMessage: "no such model" });
+    const { result, calls } = await runReview(world);
+
+    expect(result.conclusion).toBe("neutral");
+    expect(result.error).toContain("all 2 review parts failed; part 1: OpenRouter returned 400: no such model");
+    const summary = summaryBody(world);
+    expect(summary).toContain("Bugbot couldn't review: all 2 review parts failed");
+    expect(summary).toContain("- Parts: 0 of 2 reviewed");
+    const finish = checkPatches(calls, 77);
+    expect((finish.at(-1)!.body as { output: { title: string } }).output.title).toBe(
+      "Bugbot couldn't review",
+    );
   });
 });

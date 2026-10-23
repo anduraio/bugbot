@@ -81,6 +81,13 @@ export interface ModelResult {
   tokensOut: number;
   /** Safe per-attempt settings and usage, oldest first. Never model text. */
   attempts: readonly ModelAttempt[];
+  /** Provider-reported cost in USD over every 200 reply, when reported. */
+  cost?: number;
+  /**
+   * True when the reply stopped on `length` mid-JSON and only its complete
+   * findings were kept.
+   */
+  truncated?: boolean;
 }
 
 /**
@@ -100,6 +107,10 @@ export interface ModelAttempt {
   reasoningTokens: number;
   /** finish_reason, `http_<status>`, `timeout`, `non-json` or `network`. */
   outcome: string;
+  /** Provider-reported cost in USD, only when the provider reported one. */
+  cost?: number;
+  /** 1-based review part, set by the part runner when a PR is split. */
+  part?: number;
 }
 
 export interface DroppedFindings {
@@ -111,6 +122,8 @@ export interface DroppedFindings {
 export interface ParsedFindings {
   findings: Finding[];
   dropped: DroppedFindings;
+  /** Set when the JSON was cut off and only its complete findings were kept. */
+  truncated?: true;
 }
 
 /** A safe model failure: no key, no headers and no request body. */
@@ -120,16 +133,19 @@ export class BugbotModelError extends Error {
   readonly tokensOut: number;
   /** Safe per-attempt settings and usage, oldest first. */
   readonly attempts: readonly ModelAttempt[];
+  /** Provider-reported cost in USD, 0 when none was reported. */
+  readonly cost: number;
 
   constructor(
     message: string,
-    usage: { tokensIn?: number; tokensOut?: number } = {},
+    usage: { tokensIn?: number; tokensOut?: number; cost?: number } = {},
     attempts: readonly ModelAttempt[] = [],
   ) {
     super(message);
     this.name = "BugbotModelError";
     this.tokensIn = usage.tokensIn ?? 0;
     this.tokensOut = usage.tokensOut ?? 0;
+    this.cost = usage.cost ?? 0;
     this.attempts = attempts;
   }
 }
@@ -218,6 +234,13 @@ const defaultSleep: Sleep = (milliseconds) =>
 function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.min(Math.floor(value), Number.MAX_SAFE_INTEGER)
+    : 0;
+}
+
+/** Provider cost is untrusted too: a finite, non-negative number or 0. */
+function costOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
     : 0;
 }
 
@@ -342,6 +365,8 @@ interface CompletionDetails {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens: number;
+  /** `usage.cost` in USD, 0 when absent. */
+  cost: number;
   errorCode: string | null;
   errorMessage: string | null;
 }
@@ -380,6 +405,7 @@ function completionDetails(
     reasoningTokens:
       numberOrZero(usageDetails?.reasoning_tokens) ||
       numberOrZero(usage?.reasoning_tokens),
+    cost: costOrZero(usage?.cost),
     errorCode: topError.code ?? choiceError.code,
     errorMessage: topError.message ?? choiceError.message,
   };
@@ -500,6 +526,7 @@ export async function callModel(
   let lastStatus: number | null = null;
   let tokensIn = 0;
   let tokensOut = 0;
+  let cost = 0;
   const used: ModelAttempt[] = [];
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -513,6 +540,7 @@ export async function callModel(
     let attemptIn = 0;
     let attemptOut = 0;
     let attemptReasoning = 0;
+    let attemptCost = 0;
     let outcome = "network";
     let recorded = false;
 
@@ -530,6 +558,7 @@ export async function callModel(
         tokensOut: attemptOut,
         reasoningTokens: attemptReasoning,
         outcome,
+        ...(attemptCost > 0 ? { cost: attemptCost } : {}),
       });
     };
 
@@ -547,6 +576,8 @@ export async function callModel(
       response_format: { type: "json_object" },
       max_tokens: cap,
       reasoning: reasoningField(setting),
+      // Asks OpenRouter to report `usage.cost`, so the summary can log spend.
+      usage: { include: true },
     });
 
     try {
@@ -572,7 +603,11 @@ export async function callModel(
 
         if (!isRetryableStatus(response.status)) {
           recordAttempt();
-          throw new BugbotModelError(message, { tokensIn, tokensOut }, used);
+          throw new BugbotModelError(
+            message,
+            { tokensIn, tokensOut, cost },
+            used,
+          );
         }
 
         lastMessage = message;
@@ -595,10 +630,12 @@ export async function callModel(
           attemptIn = details.promptTokens;
           attemptOut = details.completionTokens;
           attemptReasoning = details.reasoningTokens;
+          attemptCost = details.cost;
           outcome = details.finishReason ?? "none";
           // A failed attempt still costs tokens. Keep them for the summary.
           tokensIn += details.promptTokens;
           tokensOut += details.completionTokens;
+          cost += details.cost;
 
           if (details.content === null) {
             log(diagnosticLine(details, cap, settingLabel));
@@ -611,22 +648,40 @@ export async function callModel(
               details.errorCode === null &&
               details.errorMessage === null;
           } else {
+            let cutOff = false;
             try {
               JSON.parse(details.content);
             } catch {
-              // A cut-off answer is a length stop even when some content made
-              // it out, so it gets the same one reasoning-off retry (F5-RV1-N1).
-              lastMessage =
+              // A reply cut off at the cap still keeps every finding that was
+              // written out in full. Only a cut-off with none of them, or a
+              // reply that is not JSON at all, is retried.
+              const salvaged =
                 details.finishReason === "length"
-                  ? truncatedContentCause(cap)
-                  : "model response content was not JSON";
-              lastDiagnosis = lastMessage;
-              lastStatus = response.status;
-              retryable = true;
-              lengthStop =
-                details.finishReason === "length" &&
-                details.errorCode === null &&
-                details.errorMessage === null;
+                  ? salvageFindingItems(details.content)
+                  : null;
+              if (salvaged !== null && salvaged.length > 0) {
+                cutOff = true;
+                log(
+                  `OpenRouter reply cut off at max_tokens=${cap}; keeping ${salvaged.length} complete finding${
+                    salvaged.length === 1 ? "" : "s"
+                  }`,
+                );
+              } else {
+                // A cut-off answer is a length stop even when some content
+                // made it out, so it gets the same one reasoning-off retry
+                // (F5-RV1-N1).
+                lastMessage =
+                  details.finishReason === "length"
+                    ? truncatedContentCause(cap)
+                    : "model response content was not JSON";
+                lastDiagnosis = lastMessage;
+                lastStatus = response.status;
+                retryable = true;
+                lengthStop =
+                  details.finishReason === "length" &&
+                  details.errorCode === null &&
+                  details.errorMessage === null;
+              }
             }
 
             if (!retryable) {
@@ -640,6 +695,8 @@ export async function callModel(
                 tokensIn,
                 tokensOut,
                 attempts: used,
+                ...(cost > 0 ? { cost } : {}),
+                ...(cutOff ? { truncated: true } : {}),
               };
             }
           }
@@ -702,7 +759,7 @@ export async function callModel(
     `${lastMessage}${statusSuffix} after ${attemptCount} attempt${
       attemptCount === 1 ? "" : "s"
     }`,
-    { tokensIn, tokensOut },
+    { tokensIn, tokensOut, cost },
     used,
   );
 }
@@ -719,16 +776,83 @@ function dropReason(index: number, issue: { path: PropertyKey[]; message: string
 }
 
 /**
+ * Every complete object in the `findings` array of a reply that was cut off
+ * mid-JSON, in order. The scan is string-aware, so braces inside a `reason`
+ * do not count. Returns null when no findings array starts at all; an object
+ * that was still being written when the reply stopped is left out.
+ */
+export function salvageFindingItems(raw: string): unknown[] | null {
+  const text = raw.trim().replace(/^```(?:json)?[ \t]*\n/i, "");
+  const key = /^\s*\{\s*"findings"\s*:\s*\[/.exec(text);
+  const start = key !== null ? key[0].length : text.startsWith("[") ? 1 : -1;
+  if (start === -1) {
+    return null;
+  }
+
+  const items: unknown[] = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let objectStart = -1;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{" || char === "[") {
+      if (depth === 0 && char === "{") {
+        objectStart = index;
+      }
+      depth += 1;
+    } else if (char === "}" || char === "]") {
+      if (depth === 0) {
+        // The findings array itself closed.
+        break;
+      }
+      depth -= 1;
+      if (depth === 0 && objectStart !== -1) {
+        try {
+          items.push(JSON.parse(text.slice(objectStart, index + 1)));
+        } catch {
+          // A malformed object is skipped; the next one may still parse.
+        }
+        objectStart = -1;
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
  * Parses `{"findings":[...]}` or a bare array, with one optional surrounding
- * Markdown fence. Items that fail FindingSchema are dropped with a short
+ * Markdown fence. A reply cut off mid-JSON keeps its complete findings and is
+ * marked `truncated`. Items that fail FindingSchema are dropped with a short
  * reason and never echoed.
  */
 export function parseJsonResponse(raw: string): ParsedFindings {
   let parsed: unknown;
+  let truncated = false;
   try {
     parsed = JSON.parse(stripFence(raw));
   } catch {
-    throw new BugbotModelError("model response was not valid JSON");
+    const salvaged = salvageFindingItems(raw);
+    if (salvaged === null || salvaged.length === 0) {
+      throw new BugbotModelError("model response was not valid JSON");
+    }
+    parsed = salvaged;
+    truncated = true;
   }
 
   let items: unknown[];
@@ -770,5 +894,6 @@ export function parseJsonResponse(raw: string): ParsedFindings {
   return {
     findings,
     dropped: { count: reasons.length, reasons },
+    ...(truncated ? { truncated: true as const } : {}),
   };
 }

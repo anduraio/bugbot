@@ -38,7 +38,6 @@ import {
 } from "./gh.js";
 import { INSTALL_HELP, runInstallSkill } from "./skill.js";
 import {
-  buildContext,
   changedLinesFromDiff,
   diffLineTexts,
   hunkContextsFromDiff,
@@ -48,7 +47,14 @@ import {
   type ReviewContext,
   type ReviewRequest,
 } from "./context.js";
-import { buildPrompt, loadSystemPrompt } from "./prompt.js";
+import { loadSystemPrompt } from "./prompt.js";
+import {
+  DEFAULT_PART_TOKENS,
+  PartsFailedError,
+  planParts,
+  reviewParts,
+  type PartOutcome,
+} from "./parts.js";
 import {
   BugbotModelError,
   DEFAULT_MAX_OUTPUT_TOKENS,
@@ -472,18 +478,64 @@ export async function runLocalReview(
       maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     };
 
-    const context = await buildContext(request, readFile, {
-      ...promptOptions,
+    const planned = await planParts({
+      request,
+      readFile,
+      promptOptions,
       systemPromptChars,
+      partTokens: parsePositiveEnv(
+        readEnv("BUGBOT_PART_TOKENS").trim(),
+        DEFAULT_PART_TOKENS,
+      ),
     });
-    const prompt = await buildPrompt(context, promptOptions);
+    const first = planned[0];
+    if (first === undefined) {
+      throw new Error("diff has no files");
+    }
+    // The first part's context stands for the whole review where a single
+    // value is needed; a split review merges skipped and truncated paths.
+    const context: ReviewContext =
+      planned.length === 1
+        ? first.context
+        : {
+            ...first.context,
+            diff,
+            files: planned.flatMap((part) => part.context.files),
+            skipped: [...new Set(planned.flatMap((part) => part.context.skipped))],
+            truncated: [
+              ...new Set(planned.flatMap((part) => part.context.truncated)),
+            ],
+            overBudget: planned.some((part) => part.context.overBudget),
+            estimatedTokens: planned.reduce(
+              (sum, part) => sum + part.context.estimatedTokens,
+              0,
+            ),
+          };
+    const estimatedTokens = planned.reduce(
+      (sum, part) => sum + part.prompt.estimatedTokens,
+      0,
+    );
 
     if (options.printPrompt === true) {
+      if (planned.length > 1) {
+        log(`Parts: ${planned.length}`);
+        for (const part of planned) {
+          log(
+            `Part ${part.index}: ${part.files.length} file${
+              part.files.length === 1 ? "" : "s"
+            }, ${part.context.totalChangedLines} changed lines, estimated tokens ${part.context.estimatedTokens}`,
+          );
+        }
+      }
       log(`Estimated tokens: ${context.estimatedTokens}`);
       log(`Skipped files: ${skippedLine(context.skipped)}`);
       log(`Truncated files: ${skippedLine(context.truncated)}`);
-      log(`System prompt: ${prompt.system.length} chars`);
-      log(`User message: ${prompt.user.length} chars`);
+      log(`System prompt: ${first.prompt.system.length} chars`);
+      log(
+        `User message: ${planned
+          .map((part) => part.prompt.user.length)
+          .join(" + ")} chars`,
+      );
 
       return {
         ...empty,
@@ -494,22 +546,24 @@ export async function runLocalReview(
       };
     }
 
-    const selection = selectModel({
-      model,
-      bigPrModel,
-      changedLines: context.totalChangedLines,
-      overBudget: context.overBudget,
-    });
-
-    if ("skip" in selection) {
-      log(`Bugbot couldn't review: ${selection.skip}`);
-      return {
-        ...empty,
-        estimatedTokens: prompt.estimatedTokens,
-        skipped: context.skipped,
-        truncated: context.truncated,
+    if (planned.length === 1) {
+      const selection = selectModel({
+        model,
+        bigPrModel,
+        changedLines: context.totalChangedLines,
         overBudget: context.overBudget,
-      };
+      });
+
+      if ("skip" in selection) {
+        log(`Bugbot couldn't review: ${selection.skip}`);
+        return {
+          ...empty,
+          estimatedTokens,
+          skipped: context.skipped,
+          truncated: context.truncated,
+          overBudget: context.overBudget,
+        };
+      }
     }
 
     const apiKey = readEnv("OPENROUTER_API_KEY");
@@ -517,20 +571,21 @@ export async function runLocalReview(
       throw new BugbotModelError("OPENROUTER_API_KEY is not set");
     }
 
-    const result = await callModel(
-      { model: selection.model, system: prompt.system, user: prompt.user },
-      {
+    const result = await reviewParts(planned, {
+      model,
+      bigPrModel,
+      modelOptions: {
         apiKey,
         fetch: deps.fetch,
         maxOutputTokens,
         reasoningEffort,
         reasoningMaxTokens,
-        log: (line) => log(line),
       },
-    );
+      log: (line) => log(line),
+    });
     tokensIn = result.tokensIn;
     tokensOut = result.tokensOut;
-    const parsed = parseJsonResponse(result.raw);
+    const parsed = { findings: result.findings, dropped: result.dropped };
 
     log(
       JSON.stringify(
@@ -539,6 +594,18 @@ export async function runLocalReview(
           dropped: parsed.dropped.count,
           tokens_in: tokensIn,
           tokens_out: tokensOut,
+          ...(result.cost > 0 ? { cost_usd: Number(result.cost.toFixed(6)) } : {}),
+          ...(result.parts.length > 1
+            ? {
+                parts: result.parts.map((part) => ({
+                  part: part.index,
+                  files: part.files,
+                  findings: part.findings,
+                  ...(part.error === null ? {} : { error: part.error }),
+                  ...(part.cutOff ? { cut_off: true } : {}),
+                })),
+              }
+            : {}),
         },
         null,
         2,
@@ -589,7 +656,7 @@ export async function runLocalReview(
 
     return {
       exitCode: 0,
-      model: selection.model,
+      model: result.requestedModel,
       findings: parsed.findings,
       dropped: parsed.dropped,
       planned: classified.post,
@@ -597,7 +664,7 @@ export async function runLocalReview(
       existing,
       tokensIn,
       tokensOut,
-      estimatedTokens: prompt.estimatedTokens,
+      estimatedTokens,
       skipped: context.skipped,
       truncated: context.truncated,
       overBudget: context.overBudget,
@@ -662,7 +729,7 @@ function capReason(text: string, secrets: readonly string[]): string {
       value = redact(value, secret);
     }
   }
-  return value.slice(0, 200);
+  return value.slice(0, 500);
 }
 
 function parsePositiveEnv(raw: string, fallback: number): number {
@@ -776,9 +843,49 @@ function reasoningLine(attempts: readonly ModelAttempt[]): string | undefined {
   return attempts
     .map(
       (attempt) =>
-        `#${attempt.attempt} ${attempt.reasoning} cap ${attempt.maxTokens} (${attempt.tokensIn} in / ${attempt.tokensOut} out, ${attempt.reasoningTokens} reasoning)`,
+        `${attempt.part === undefined ? "" : `part ${attempt.part} `}#${attempt.attempt} ${attempt.reasoning} cap ${attempt.maxTokens} (${attempt.tokensIn} in / ${attempt.tokensOut} out, ${attempt.reasoningTokens} reasoning)`,
     )
     .join("; ");
+}
+
+/** Paths shown per failed part in the summary. */
+const MAX_PART_FILES_SHOWN = 3;
+
+/**
+ * One summary line for a split review: how many parts were reviewed, each
+ * failed part with its files and reason, and each reply that was cut off.
+ * Undefined for a one-part review that was not cut off.
+ */
+function partsLine(
+  total: number,
+  outcomes: readonly PartOutcome[],
+  secrets: readonly string[],
+): string | undefined {
+  const cutOff = outcomes.filter((part) => part.error === null && part.cutOff);
+  if (total <= 1 && cutOff.length === 0) {
+    return undefined;
+  }
+
+  const failed = outcomes.filter((part) => part.error !== null);
+  const pieces = [`${total - failed.length} of ${total} reviewed`];
+  for (const part of failed) {
+    const shown = part.files.slice(0, MAX_PART_FILES_SHOWN).join(", ");
+    const more = part.files.length - MAX_PART_FILES_SHOWN;
+    pieces.push(
+      `part ${part.index} (${shown}${more > 0 ? ` and ${more} more` : ""}) failed: ${capReason(
+        part.error ?? "",
+        secrets,
+      )}`,
+    );
+  }
+  for (const part of cutOff) {
+    pieces.push(
+      `part ${part.index} reply was cut off; kept its ${part.findings} complete finding${
+        part.findings === 1 ? "" : "s"
+      }`,
+    );
+  }
+  return pieces.join("; ");
 }
 
 /** Digits-only run ids, deduplicated, oldest first. */
@@ -997,6 +1104,10 @@ export async function runPrReview(
     readEnv("BUGBOT_MAX_TOKENS").trim(),
     DEFAULT_MAX_TOKENS,
   );
+  const partTokens = parsePositiveEnv(
+    readEnv("BUGBOT_PART_TOKENS").trim(),
+    DEFAULT_PART_TOKENS,
+  );
   let maxOutputTokens: number;
   let reasoningEffort: ReasoningEffort;
   let reasoningMaxTokens: number | undefined;
@@ -1161,7 +1272,13 @@ export async function runPrReview(
   let tokensIn = 0;
   let tokensOut = 0;
   let attempts: readonly ModelAttempt[] = [];
+  /** Provider-reported USD for every request this pass, 0 when unreported. */
+  let cost = 0;
+  let partsTotal = 0;
+  let partOutcomes: readonly PartOutcome[] = [];
   let modelUsed = model;
+  /** Requested id of the review model; the re-check reuses it. */
+  let reviewModel = model;
   let truncated: readonly string[] = [];
   let threadRunIds: string[] = [];
   let scope: ScopeLines | undefined;
@@ -1321,31 +1438,24 @@ export async function runPrReview(
         maxTokens,
       };
 
-      const context = await buildContext(request, readFile, {
-        commentSicko,
+      const planned = await planParts({
+        request,
+        readFile,
+        promptOptions: { commentSicko },
         systemPromptChars,
+        partTokens,
       });
-      const prompt = await buildPrompt(context, { commentSicko });
-      truncated = context.truncated;
+      truncated = [...new Set(planned.flatMap((part) => part.context.truncated))];
+      partsTotal = planned.length;
 
-      const selection = selectModel({
-        model,
-        bigPrModel,
-        changedLines: context.totalChangedLines,
-        overBudget: context.overBudget,
-      });
-      if ("skip" in selection) {
-        throw new Error(selection.skip);
-      }
-      modelUsed = redact(selection.model, apiKey);
-
-      if (apiKey === "") {
+      if (apiKey === "" && planned.length > 1) {
         throw new BugbotModelError("OPENROUTER_API_KEY is not set");
       }
 
-      const result = await callModel(
-        { model: selection.model, system: prompt.system, user: prompt.user },
-        {
+      const result = await reviewParts(planned, {
+        model,
+        bigPrModel,
+        modelOptions: {
           apiKey,
           fetch: deps.fetch,
           sleep: deps.sleep,
@@ -1353,18 +1463,26 @@ export async function runPrReview(
           maxOutputTokens,
           reasoningEffort,
           reasoningMaxTokens,
-          log: (line) => log(line),
         },
-      );
+        log: (line) => log(line),
+      });
       tokensIn = result.tokensIn;
       tokensOut = result.tokensOut;
+      cost = result.cost;
       attempts = result.attempts;
-      modelUsed = redact(
-        result.model.trim() === "" ? selection.model : result.model,
-        apiKey,
+      partOutcomes = result.parts;
+      reviewModel = result.requestedModel;
+      modelUsed = redact(result.model, apiKey);
+      log(
+        `Bugbot: tokens_in=${tokensIn} tokens_out=${tokensOut}${
+          cost > 0 ? ` cost_usd=${cost.toFixed(4)}` : ""
+        }`,
       );
 
-      const parsedResponse = parseJsonResponse(result.raw);
+      const parsedResponse = {
+        findings: result.findings,
+        dropped: result.dropped,
+      };
 
       const threads = await listBugbotThreads(github);
       threadsListed = true;
@@ -1592,7 +1710,7 @@ export async function runPrReview(
             let recheck: ModelResult;
             try {
               recheck = await callModel(
-                { model: selection.model, system: RECHECK_SYSTEM_PROMPT, user },
+                { model: reviewModel, system: RECHECK_SYSTEM_PROMPT, user },
                 {
                   apiKey,
                   fetch: deps.fetch,
@@ -1621,11 +1739,13 @@ export async function runPrReview(
               if (caught instanceof BugbotModelError) {
                 tokensIn += caught.tokensIn;
                 tokensOut += caught.tokensOut;
+                cost += caught.cost;
               }
               throw caught;
             }
             tokensIn += recheck.tokensIn;
             tokensOut += recheck.tokensOut;
+            cost += recheck.cost ?? 0;
 
             const fixed = fixedThreadIds(
               parseRecheckResponse(recheck.raw, known),
@@ -1666,7 +1786,12 @@ export async function runPrReview(
       ) {
         tokensIn = caught.tokensIn;
         tokensOut = caught.tokensOut;
+        cost = caught.cost;
         attempts = caught.attempts;
+      }
+      if (caught instanceof PartsFailedError) {
+        partOutcomes = caught.parts;
+        modelUsed = redact(caught.requestedModel, apiKey);
       }
       log(`Bugbot couldn't review: ${error}`);
     }
@@ -1692,6 +1817,12 @@ export async function runPrReview(
   const passCount = allRuns.length;
   const runs = allRuns.slice(-200);
   const reasoning = reasoningLine(attempts);
+  const parts = partsLine(partsTotal, partOutcomes, secrets);
+  const failedParts = partOutcomes.filter((part) => part.error !== null).length;
+  const partFailureReason =
+    error === null && failedParts > 0
+      ? `${failedParts} of ${partsTotal} review parts failed`
+      : null;
   const postFailureReason =
     error === null && failedToPost > 0
       ? `${failedToPost} finding${
@@ -1705,7 +1836,9 @@ export async function runPrReview(
     model: modelUsed,
     tokensIn,
     tokensOut,
+    ...(cost > 0 ? { cost } : {}),
     ...(reasoning === undefined ? {} : { reasoning }),
+    ...(parts === undefined ? {} : { parts }),
     posted,
     // S8D-B4: a pass that failed before listBugbotThreads must not write 0
     // over the last known count. Keep the previous summary's value, or say
@@ -1767,7 +1900,11 @@ export async function runPrReview(
     const outputText =
       error !== null
         ? `Bugbot couldn't review: ${error}`
-        : failedToPost > 0
+        : partFailureReason !== null
+          ? `Bugbot reviewed part of this pull request: ${posted} inline comment${
+              posted === 1 ? "" : "s"
+            }; ${partFailureReason}.`
+          : failedToPost > 0
           ? `Bugbot reviewed this pull request: ${posted} inline comment${
               posted === 1 ? "" : "s"
             }; ${failedToPost} finding${
@@ -1781,7 +1918,15 @@ export async function runPrReview(
         ? outputText
         : `${outputText} Reasoning: ${reasoning}.`;
     const conclusion =
-      error !== null || postFailureReason !== null ? "neutral" : "success";
+      error !== null || postFailureReason !== null || partFailureReason !== null
+        ? "neutral"
+        : "success";
+    const title =
+      error !== null
+        ? "Bugbot couldn't review"
+        : partFailureReason !== null
+          ? "Bugbot reviewed only part of this PR"
+          : "Bugbot";
 
     if (handles.length > 0) {
       let finishFailure: unknown = null;
@@ -1792,6 +1937,7 @@ export async function runPrReview(
             handle,
             conclusion,
             output,
+            title,
           );
           if (dryRun) {
             log(planLine(planned));
@@ -1837,6 +1983,11 @@ export async function runPrReview(
   if (postFailureReason !== null) {
     log(`Bugbot: ${postFailureReason}`);
     return { exitCode: 0, conclusion: "neutral", error: postFailureReason };
+  }
+
+  if (partFailureReason !== null) {
+    log(`Bugbot: ${partFailureReason}`);
+    return { exitCode: 0, conclusion: "neutral", error: partFailureReason };
   }
 
   log(

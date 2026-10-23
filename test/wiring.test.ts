@@ -58,6 +58,19 @@ describe("max_output_tokens wiring", () => {
     );
   });
 
+  it("declares part_tokens and forwards it as BUGBOT_PART_TOKENS", () => {
+    const action = readFileSync(join(root, "action.yml"), "utf8");
+    expect(action).toMatch(/part_tokens:[\s\S]*?default: "50000"/);
+    expect(action).toContain("BUGBOT_PART_TOKENS: ${{ inputs.part_tokens }}");
+
+    const workflow = readFileSync(
+      join(root, ".github/workflows/review.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/^      part_tokens:/gm)).toHaveLength(2);
+    expect(workflow).toContain("part_tokens: ${{ inputs.part_tokens }}");
+  });
+
   it("declares reasoning_effort and forwards it (fix5b)", () => {
     const action = readFileSync(join(root, "action.yml"), "utf8");
     expect(action).toContain("reasoning_effort:");

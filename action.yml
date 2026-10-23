@@ -17,6 +17,10 @@ inputs:
     description: Output cap sent as max_tokens. An empty length stop retries once at the same cap with reasoning off.
     required: false
     default: "64000"
+  part_tokens:
+    description: Input token budget for each part when a big pull request is split and reviewed in parts.
+    required: false
+    default: "50000"
   reasoning_effort:
     description: Reasoning effort for the first attempt (max, xhigh, high, medium, low, minimal, none). Default high; none turns reasoning off.
     required: false
@@ -49,6 +53,7 @@ runs:
         BUGBOT_BIG_PR_MODEL: ${{ inputs.big_pr_model }}
         BUGBOT_MAX_TOKENS: ${{ inputs.max_tokens }}
         BUGBOT_MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+        BUGBOT_PART_TOKENS: ${{ inputs.part_tokens }}
         BUGBOT_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
         BUGBOT_REASONING_MAX_TOKENS: ${{ inputs.reasoning_max_tokens }}
         BUGBOT_MIN_CONFIDENCE: ${{ inputs.min_confidence }}

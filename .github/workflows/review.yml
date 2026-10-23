@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: "64000"
+      part_tokens:
+        description: Input token budget for each part when a big pull request is split and reviewed in parts.
+        required: false
+        type: string
+        default: "50000"
       reasoning_effort:
         description: Reasoning effort for the first attempt (max, xhigh, high, medium, low, minimal, none). Default high; none turns reasoning off.
         required: false
@@ -96,6 +101,11 @@ on:
         required: false
         type: string
         default: "64000"
+      part_tokens:
+        description: Input token budget for each part when a big pull request is split and reviewed in parts.
+        required: false
+        type: string
+        default: "50000"
       reasoning_effort:
         description: Reasoning effort for the first attempt (max, xhigh, high, medium, low, minimal, none). Default high; none turns reasoning off.
         required: false
@@ -265,6 +275,7 @@ jobs:
           big_pr_model: ${{ inputs.big_pr_model }}
           max_tokens: ${{ inputs.max_tokens }}
           max_output_tokens: ${{ inputs.max_output_tokens }}
+          part_tokens: ${{ inputs.part_tokens }}
           reasoning_effort: ${{ inputs.reasoning_effort }}
           reasoning_max_tokens: ${{ inputs.reasoning_max_tokens }}
           min_confidence: ${{ inputs.min_confidence }}

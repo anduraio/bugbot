@@ -25,6 +25,16 @@ export interface ReviewRequest {
   body?: string;
   /** Input token budget, estimated at about 4 characters per token. */
   maxTokens?: number;
+  /** Set when a big PR is split and this request reviews one part of it. */
+  part?: ReviewPart;
+}
+
+export interface ReviewPart {
+  /** 1-based. */
+  index: number;
+  total: number;
+  /** Changed paths reviewed in the other parts, for the model's awareness. */
+  otherFiles: readonly string[];
 }
 
 export interface ContextFile {
@@ -60,6 +70,8 @@ export interface ReviewContext {
   changedLines: ChangedLines;
   /** Added plus removed lines across the parsed diff. */
   totalChangedLines: number;
+  /** Which part of a split PR this context reviews. */
+  part?: ReviewPart;
 }
 
 export type FileStatus = "added" | "modified" | "deleted" | "renamed";
@@ -1087,6 +1099,7 @@ export async function buildContext(
     systemPromptChars,
     changedLines: parsed.changedLines,
     totalChangedLines: parsed.totalChangedLines,
+    ...(request.part === undefined ? {} : { part: request.part }),
   };
 
   context.estimatedTokens = estimateTokens(context, files, skipped, [], skipReasons);
