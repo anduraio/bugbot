@@ -64,6 +64,7 @@ import {
   type Sleep,
 } from "./model.js";
 import {
+  RECHECK_MAX_OUTPUT_TOKENS,
   RECHECK_SYSTEM_PROMPT,
   buildRecheckUser,
   fixedThreadIds,
@@ -1597,10 +1598,11 @@ export async function runPrReview(
                   fetch: deps.fetch,
                   sleep: deps.sleep,
                   timeoutMs: deps.modelTimeoutMs,
-                  maxOutputTokens: 2_000,
+                  maxOutputTokens: RECHECK_MAX_OUTPUT_TOKENS,
                   reasoningEffort,
-                  // The re-check has a smaller cap, so its reasoning budget
-                  // must stay below it even when a review budget is larger.
+                  // The re-check has a smaller cap than the review, so its
+                  // reasoning budget must stay well below it even when a
+                  // review budget is larger.
                   ...(reasoningMaxTokens === undefined
                     ? {}
                     : {

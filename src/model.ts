@@ -37,14 +37,15 @@ export interface ModelOptions {
   /** OPENROUTER_API_KEY. Read from the shell environment by the CLI. */
   apiKey?: string;
   /**
-   * Output token cap sent as `max_tokens`. Default 64000. An empty `length`
-   * stop retries once at the same cap with reasoning off.
+   * Output token cap sent as `max_tokens`. Default 64000. A `length` stop
+   * retries once at the same cap with reasoning off, as one extra attempt
+   * outside the retry budget.
    */
   maxOutputTokens?: number;
   /**
    * OpenRouter `reasoning.effort` for the first attempt. Default `high`, sent
    * explicitly as `reasoning.effort`. A `length` stop turns it off on the
-   * single retry.
+   * single retry, unless it is already off.
    */
   reasoningEffort?: ReasoningEffort;
   /**
@@ -173,6 +174,11 @@ function reasoningLabel(setting: ReasoningSetting): string {
   return setting.kind === "effort"
     ? `effort=${setting.effort}`
     : `max_tokens=${setting.maxTokens}`;
+}
+
+/** True when the request already turns reasoning off. */
+function reasoningOff(setting: ReasoningSetting): boolean {
+  return setting.kind === "effort" && setting.effort === "none";
 }
 
 /**
@@ -441,6 +447,11 @@ function emptyContentCause(details: CompletionDetails, cap: number): string {
   return `OpenRouter returned no message content (finish_reason "${details.finishReason}")`;
 }
 
+/** A length stop with partial content: the JSON answer was cut off. */
+function truncatedContentCause(cap: number): string {
+  return `the model used its whole ${cap}-token output budget and returned incomplete JSON (finish_reason "length"); try a model that reasons less or raise \`max_output_tokens\``;
+}
+
 /**
  * POSTs one JSON-only chat completion. Retries network errors, timeouts, 429,
  * 5xx and a 200 whose content is not JSON. 400/401/402/403/404 fail on the
@@ -466,6 +477,8 @@ export async function callModel(
       : defaultAttemptTimeoutMs(baseCap);
   const retries = Math.max(0, options.retries ?? DEFAULT_RETRIES);
   const totalAttempts = 1 + retries;
+  /** Counted attempts plus, once, the reasoning-off attempt after a length stop. */
+  let maxAttempts = totalAttempts;
   const log = options.log ?? ((line: string) => console.warn(line));
   let cap = maxOutputTokens;
   let reasoning = firstReasoningSetting(
@@ -474,9 +487,10 @@ export async function callModel(
     options.reasoningMaxTokens,
   );
   /**
-   * After a length stop, one retry runs with reasoning off. A transient
-   * failure on that retry may still be retried, but a second length stop ends
-   * the call: there is no bigger cap and no second fallback.
+   * After a length stop, one retry runs with reasoning off. That retry does
+   * not count against `retries`, so a transient failure cannot use it up. It
+   * runs once: a length stop on the retry itself, or an already-off setting,
+   * ends the call. There is no bigger cap and no second fallback.
    */
   let lengthFallbackActive = false;
 
@@ -488,7 +502,7 @@ export async function callModel(
   let tokensOut = 0;
   const used: ModelAttempt[] = [];
 
-  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const setting = reasoning;
     const settingLabel = reasoningLabel(setting);
     const attemptTimeoutMs = scaledAttemptTimeout(timeoutMs, cap, baseCap);
@@ -520,7 +534,7 @@ export async function callModel(
     };
 
     log(
-      `OpenRouter attempt ${attempt + 1}/${totalAttempts}: max_tokens=${cap} reasoning=${settingLabel}`,
+      `OpenRouter attempt ${attempt + 1}/${maxAttempts}: max_tokens=${cap} reasoning=${settingLabel}`,
     );
 
     const body = JSON.stringify({
@@ -600,9 +614,19 @@ export async function callModel(
             try {
               JSON.parse(details.content);
             } catch {
-              lastMessage = "model response content was not JSON";
+              // A cut-off answer is a length stop even when some content made
+              // it out, so it gets the same one reasoning-off retry (F5-RV1-N1).
+              lastMessage =
+                details.finishReason === "length"
+                  ? truncatedContentCause(cap)
+                  : "model response content was not JSON";
+              lastDiagnosis = lastMessage;
               lastStatus = response.status;
               retryable = true;
+              lengthStop =
+                details.finishReason === "length" &&
+                details.errorCode === null &&
+                details.errorMessage === null;
             }
 
             if (!retryable) {
@@ -647,18 +671,25 @@ export async function callModel(
 
     recordAttempt();
 
-    if (!retryable || attempt === totalAttempts - 1) {
+    if (!retryable) {
       break;
     }
 
     if (lengthStop) {
-      // A second length stop already came from the reasoning-off retry. There
-      // is no bigger cap and no second fallback, so stop here.
-      if (lengthFallbackActive) {
+      // The reasoning-off retry is one extra attempt outside the retry budget.
+      // It runs once, only when reasoning is not already off.
+      if (lengthFallbackActive || reasoningOff(setting)) {
         break;
       }
       lengthFallbackActive = true;
       reasoning = { kind: "effort", effort: "none" };
+      if (attempt === totalAttempts - 1) {
+        // Every counted attempt is used, so let the fallback run as the one
+        // extra attempt even though it is beyond `retries` (F5-RV1-B1).
+        maxAttempts = totalAttempts + 1;
+      }
+    } else if (attempt === maxAttempts - 1) {
+      break;
     }
 
     const backoff = 500 * 2 ** attempt + Math.floor(Math.random() * 250);

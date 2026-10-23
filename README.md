@@ -174,7 +174,7 @@ The model comes from `BUGBOT_MODEL` (default
 `deepseek/deepseek-v4.1-flash-1017`) and is sent through OpenRouter. Tokens in
 and out are logged as `tokens_in` and `tokens_out` for every run. Prices come
 from OpenRouter's model page; the worst case below uses the $1.20 per million
-output tokens price Andura measured for DeepSeek v4.1 flash.
+output tokens price measured for DeepSeek v4.1 flash.
 
 `--local` extras:
 
@@ -189,16 +189,18 @@ output tokens price Andura measured for DeepSeek v4.1 flash.
 - `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
   (default 64000). A set value must be a whole number from 1000 to 128000;
   anything else ends the pass with a clear message before any model request.
-  An empty `length` stop retries once at the same cap with reasoning off; the
-  cap never grows. The per-attempt timeout is derived from the cap at about
-  80 tokens/s (at least 120 s, at most 1800 s), so the default 64000-token cap
-  gets 800 s.
+  A `length` stop (empty content, or content that is not valid JSON) retries
+  once at the same cap with reasoning off. That retry is one extra attempt
+  outside the retry budget, so transient failures cannot use it up; it runs
+  once, and an effort already set to `none` is not resent. The cap never
+  grows. The per-attempt timeout is derived from the cap at about 80 tokens/s
+  (at least 120 s, at most 1800 s), so the default 64000-token cap gets 800 s.
 - `BUGBOT_REASONING_EFFORT` sets `reasoning.effort` on the first attempt
   (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`). The default is
   `high`; it is sent explicitly as `reasoning.effort`, so the model cannot pick
   its own level. A bad value ends the pass before any request. On a `length`
-  stop with empty content the single retry always sends
-  `reasoning.effort: "none"`.
+  stop the single retry sends `reasoning.effort: "none"` unless the effort is
+  already `none`.
 - `BUGBOT_REASONING_MAX_TOKENS` is an optional reasoning budget sent as
   `reasoning.max_tokens` for models that honor it (anthropic, google/gemini
   and qwen ids). Empty, the default, sends no budget. A set value must be a
@@ -231,9 +233,11 @@ The first attempt reasons at high effort by default: it sends
 `reasoning: { effort: "high" }`, not a token budget. The output cap is 64000
 tokens, and no `reasoning.max_tokens` budget is sent unless
 `reasoning_max_tokens` is set (anthropic, google/gemini and qwen ids only).
-If an attempt stops on `length` with no content, Bugbot makes exactly one retry
-at the same cap with reasoning off (`reasoning.effort: "none"`); the cap is
-never raised.
+If an attempt stops on `length` (empty content, or truncated content that is
+not valid JSON), Bugbot makes exactly one retry at the same cap with reasoning
+off (`reasoning.effort: "none"`). That retry does not count against the two
+normal retries, so it still runs after transient failures; the cap is never
+raised and an effort already set to `none` is not resent.
 
 To switch back to a smaller reasoning spend, set `reasoning_effort: low` (or
 `BUGBOT_REASONING_EFFORT=low` locally), or lower `max_output_tokens`. For an
@@ -241,13 +245,14 @@ allow-listed model, `reasoning_max_tokens` sets a budget instead. All are one
 input and need no code change.
 
 Worst case for one review with the defaults (64000 output cap, two retries,
-one re-check): six OpenRouter requests (three review attempts, three re-check
-attempts), at most 198000 output tokens, about 46 minutes of per-attempt
-timeouts, and at $1.20 per million output tokens, about $0.24. Input tokens
-are extra. At the maximum accepted `max_output_tokens` of 128000 the output
-worst case is 390000 tokens, about $0.47, and about 86 minutes. The reusable
-workflow sets no `timeout-minutes`, so GitHub's 360-minute job default still
-covers the worst case.
+one re-check): eight OpenRouter requests (three review attempts, one extra
+reasoning-off review attempt after a `length` stop, and four re-check attempts
+at the re-check's own 16000 cap), at most 320000 output tokens, about 67
+minutes of per-attempt timeouts, and at $1.20 per million output tokens, about
+$0.38. Input tokens are extra. At the maximum accepted `max_output_tokens` of
+128000 the output worst case is 576000 tokens, about $0.69, and about 120
+minutes. The reusable workflow sets no `timeout-minutes`, so GitHub's
+360-minute job default still covers the worst case.
 
 ## Development
 

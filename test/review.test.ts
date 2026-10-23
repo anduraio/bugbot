@@ -399,6 +399,8 @@ interface World {
   recheckStatus: number;
   /** A re-check reply whose 200 content is not JSON (three failed attempts). */
   recheckInvalidJson: boolean;
+  /** Re-check calls that return an empty `length` stop before the normal one. */
+  recheckEmptyLengths: number;
   /** First comment ids whose reply POST answers 500. */
   replyFailures: number[];
   startCheckHangs: boolean;
@@ -461,6 +463,7 @@ function makeWorld(overrides: Partial<World> = {}): World {
     recheckContent: JSON.stringify({ results: [] }),
     recheckStatus: 200,
     recheckInvalidJson: false,
+    recheckEmptyLengths: 0,
     replyFailures: [],
     startCheckHangs: false,
     startCheckStatus: 200,
@@ -564,6 +567,30 @@ function recordedFetch(world: World): {
       if (messages[0]!.content.includes("re-check")) {
         if (world.recheckInvalidJson) {
           return completion("this is not json");
+        }
+        if (world.recheckEmptyLengths > 0) {
+          world.recheckEmptyLengths -= 1;
+          return json({
+            id: "gen-test",
+            model: "deepseek/test",
+            choices: [
+              {
+                index: 0,
+                finish_reason: "length",
+                native_finish_reason: "length",
+                message: {
+                  role: "assistant",
+                  content: "",
+                  reasoning: "hidden re-check reasoning",
+                },
+              },
+            ],
+            usage: {
+              prompt_tokens: 900,
+              completion_tokens: 16_000,
+              completion_tokens_details: { reasoning_tokens: 15_000 },
+            },
+          });
         }
         if (world.recheckStatus !== 200) {
           return json({ error: { message: "recheck upstream failed" } }, world.recheckStatus);
@@ -2056,6 +2083,67 @@ describe("runPrReview re-check and replies", () => {
     expect(replyCalls(calls)).toHaveLength(0);
     // Main 123/45 plus three failed re-check replies at 123/45 each.
     expect(summaryBody(world)).toContain("- Tokens: 492 in / 180 out");
+  });
+
+  it("sends the re-check at its own 16000 cap with the configured effort (F5-RV1-N3)", async () => {
+    const world = await fixedWorld(0.9);
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    const rechecks = recheckModelCalls(calls);
+    expect(rechecks).toHaveLength(1);
+    const body = rechecks[0]!.body as {
+      max_tokens: number;
+      reasoning?: unknown;
+    };
+    expect(body.max_tokens).toBe(16_000);
+    expect(body.reasoning).toEqual({ effort: "high" });
+  });
+
+  it("keeps the reasoning-off fallback on the re-check (F5-RV1-N3)", async () => {
+    const world = await fixedWorld(0.9);
+    world.recheckEmptyLengths = 1;
+    const { result, calls } = await runReview(world, {}, {}, "333");
+
+    expect(result.conclusion).toBe("success");
+    const rechecks = recheckModelCalls(calls);
+    expect(rechecks).toHaveLength(2);
+    expect(
+      rechecks.map((call) => {
+        const body = call.body as {
+          max_tokens: number;
+          reasoning?: unknown;
+        };
+        return [body.max_tokens, body.reasoning];
+      }),
+    ).toEqual([
+      [16_000, { effort: "high" }],
+      [16_000, { effort: "none" }],
+    ]);
+    expect(replyCalls(calls)).toHaveLength(1);
+  });
+
+  it("clamps the re-check reasoning budget to 1024 (F5-RV1-N4)", async () => {
+    const world = await fixedWorld(0.9);
+    const { result, calls } = await runReview(
+      world,
+      {
+        BUGBOT_MODEL: "anthropic/claude-sonnet-4",
+        BUGBOT_REASONING_MAX_TOKENS: "8000",
+      },
+      {},
+      "333",
+    );
+
+    expect(result.conclusion).toBe("success");
+    const rechecks = recheckModelCalls(calls);
+    expect(rechecks).toHaveLength(1);
+    const body = rechecks[0]!.body as {
+      max_tokens: number;
+      reasoning?: unknown;
+    };
+    expect(body.max_tokens).toBe(16_000);
+    expect(body.reasoning).toEqual({ max_tokens: 1_024 });
   });
 
   it("does not reply at 0.7 confidence", async () => {

@@ -57,6 +57,14 @@ export const RECHECK_OUTDATED_CONTEXT_LINES = 80;
 export const RECHECK_DIFF_HUNK_CHARS = 2_000;
 
 /**
+ * Output cap for the re-check call. A verdict needs only a few dozen tokens,
+ * but at high effort a reasoning model can spend the whole cap before it
+ * answers, so this leaves room for both (F5-RV1-N3). The timeout is derived
+ * from this cap like any other call.
+ */
+export const RECHECK_MAX_OUTPUT_TOKENS = 16_000;
+
+/**
  * The re-check user message is capped at this many characters. Threads that do
  * not fit are left open for a later pass, oldest first.
  */
