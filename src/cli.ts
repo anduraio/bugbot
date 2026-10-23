@@ -51,10 +51,14 @@ import {
 import { buildPrompt, loadSystemPrompt } from "./prompt.js";
 import {
   BugbotModelError,
+  DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
+  DEFAULT_REASONING_MAX_TOKENS,
+  MIN_REASONING_MAX_TOKENS,
   callModel,
   parseJsonResponse,
   type DroppedFindings,
   type FetchLike,
+  type ModelAttempt,
   type ModelResult,
   type Sleep,
 } from "./model.js";
@@ -434,6 +438,10 @@ export async function runLocalReview(
     const maxOutputTokens = maxOutputTokensFromEnv(
       readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
     );
+    const reasoningMaxTokens = reasoningMaxTokensFromEnv(
+      readEnv("BUGBOT_REASONING_MAX_TOKENS").trim(),
+      maxOutputTokens,
+    );
     const readDiff =
       deps.readDiff ?? ((path: string) => readTextFile(path, "utf8"));
     const diff = await readDiff(options.diffPath);
@@ -511,6 +519,7 @@ export async function runLocalReview(
         apiKey,
         fetch: deps.fetch,
         maxOutputTokens,
+        reasoningMaxTokens,
         log: (line) => log(line),
       },
     );
@@ -680,6 +689,63 @@ function maxOutputTokensFromEnv(raw: string): number {
   }
 
   return value;
+}
+
+const MAX_REASONING_MAX_TOKENS = 64_000;
+
+/**
+ * The reasoning budget becomes `reasoning.max_tokens` for allow-listed
+ * models, so it is validated here instead of being silently replaced. It must
+ * stay strictly below the highest `max_tokens` the retry ladder can send
+ * (`max_output_tokens` or the 32000 default ceiling, whichever is higher), or
+ * reasoning could still consume a whole attempt. Empty means the default.
+ */
+function reasoningMaxTokensFromEnv(raw: string, maxOutputTokens: number): number {
+  const ceiling = Math.max(
+    maxOutputTokens,
+    DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
+  );
+  if (raw === "") {
+    if (DEFAULT_REASONING_MAX_TOKENS >= ceiling) {
+      throw new Error(
+        `BUGBOT_REASONING_MAX_TOKENS default must be strictly below the ${ceiling}-token output ceiling`,
+      );
+    }
+    return DEFAULT_REASONING_MAX_TOKENS;
+  }
+
+  const value = /^[0-9]+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MIN_REASONING_MAX_TOKENS ||
+    value > MAX_REASONING_MAX_TOKENS
+  ) {
+    throw new Error(
+      `BUGBOT_REASONING_MAX_TOKENS must be a whole number from ${MIN_REASONING_MAX_TOKENS} to ${MAX_REASONING_MAX_TOKENS} (got ${JSON.stringify(raw.slice(0, 40))})`,
+    );
+  }
+
+  if (value >= ceiling) {
+    throw new Error(
+      `BUGBOT_REASONING_MAX_TOKENS must be strictly below the ${ceiling}-token output ceiling (got ${value})`,
+    );
+  }
+
+  return value;
+}
+
+/** Safe per-attempt settings for the summary line: names and counts only. */
+function reasoningLine(attempts: readonly ModelAttempt[]): string | undefined {
+  if (attempts.length === 0) {
+    return undefined;
+  }
+
+  return attempts
+    .map(
+      (attempt) =>
+        `#${attempt.attempt} ${attempt.reasoning} cap ${attempt.maxTokens} (${attempt.tokensIn} in / ${attempt.tokensOut} out, ${attempt.reasoningTokens} reasoning)`,
+    )
+    .join("; ");
 }
 
 /** Digits-only run ids, deduplicated, oldest first. */
@@ -899,9 +965,14 @@ export async function runPrReview(
     DEFAULT_MAX_TOKENS,
   );
   let maxOutputTokens: number;
+  let reasoningMaxTokens: number;
   try {
     maxOutputTokens = maxOutputTokensFromEnv(
       readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+    );
+    reasoningMaxTokens = reasoningMaxTokensFromEnv(
+      readEnv("BUGBOT_REASONING_MAX_TOKENS").trim(),
+      maxOutputTokens,
     );
   } catch (error) {
     // A bad model parameter fails before any GitHub or model request.
@@ -1052,6 +1123,7 @@ export async function runPrReview(
   let threadsListed = false;
   let tokensIn = 0;
   let tokensOut = 0;
+  let attempts: readonly ModelAttempt[] = [];
   let modelUsed = model;
   let truncated: readonly string[] = [];
   let threadRunIds: string[] = [];
@@ -1242,11 +1314,13 @@ export async function runPrReview(
           sleep: deps.sleep,
           timeoutMs: deps.modelTimeoutMs,
           maxOutputTokens,
+          reasoningMaxTokens,
           log: (line) => log(line),
         },
       );
       tokensIn = result.tokensIn;
       tokensOut = result.tokensOut;
+      attempts = result.attempts;
       modelUsed = redact(
         result.model.trim() === "" ? selection.model : result.model,
         apiKey,
@@ -1487,6 +1561,9 @@ export async function runPrReview(
                   sleep: deps.sleep,
                   timeoutMs: deps.modelTimeoutMs,
                   maxOutputTokens: 2_000,
+                  // The re-check has a smaller cap, so its reasoning budget
+                  // must stay below it even when a review budget is larger.
+                  reasoningMaxTokens: Math.min(reasoningMaxTokens, 1_024),
                   log: (line) => log(line),
                 },
               );
@@ -1542,6 +1619,7 @@ export async function runPrReview(
       ) {
         tokensIn = caught.tokensIn;
         tokensOut = caught.tokensOut;
+        attempts = caught.attempts;
       }
       log(`Bugbot couldn't review: ${error}`);
     }
@@ -1566,6 +1644,7 @@ export async function runPrReview(
   ]);
   const passCount = allRuns.length;
   const runs = allRuns.slice(-200);
+  const reasoning = reasoningLine(attempts);
   const postFailureReason =
     error === null && failedToPost > 0
       ? `${failedToPost} finding${
@@ -1579,6 +1658,7 @@ export async function runPrReview(
     model: modelUsed,
     tokensIn,
     tokensOut,
+    ...(reasoning === undefined ? {} : { reasoning }),
     posted,
     // S8D-B4: a pass that failed before listBugbotThreads must not write 0
     // over the last known count. Keep the previous summary's value, or say
@@ -1637,7 +1717,7 @@ export async function runPrReview(
       }
     }
 
-    const output =
+    const outputText =
       error !== null
         ? `Bugbot couldn't review: ${error}`
         : failedToPost > 0
@@ -1649,6 +1729,10 @@ export async function runPrReview(
           : `Bugbot reviewed this pull request: ${posted} inline comment${
               posted === 1 ? "" : "s"
             }, pass ${passCount}.`;
+    const output =
+      reasoning === undefined
+        ? outputText
+        : `${outputText} Reasoning: ${reasoning}.`;
     const conclusion =
       error !== null || postFailureReason !== null ? "neutral" : "success";
 

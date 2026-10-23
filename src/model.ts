@@ -34,11 +34,18 @@ export interface ModelOptions {
    */
   maxOutputTokensCeiling?: number;
   /**
-   * Optional OpenRouter `reasoning.effort`. Omitted by default. After a
-   * `length` stop that produced reasoning, the retry uses `low` unless this
-   * is set, so reasoning cannot eat the whole bigger cap again.
+   * Optional OpenRouter `reasoning.effort` override, used on the first
+   * attempt even for a model that honors `reasoning.max_tokens`. Without it
+   * an effort-only model reasons at `low` and an allow-listed model gets
+   * `reasoning.max_tokens` = `reasoningMaxTokens`.
    */
-  reasoningEffort?: "low" | "medium" | "high";
+  reasoningEffort?: "none" | "low" | "medium" | "high" | "max";
+  /**
+   * Reasoning budget sent as `reasoning.max_tokens` for the models in
+   * `modelHonorsReasoningMaxTokens`. Default 8000. It is only sent to those
+   * models; effort-only models turn it into an effort level instead.
+   */
+  reasoningMaxTokens?: number;
   /** Retries after the first attempt. Default: 2. */
   retries?: number;
   /** Injectable fetch, so tests make no network call. */
@@ -61,6 +68,26 @@ export interface ModelResult {
   /** Usage summed over every 200 reply, including retried empty ones. */
   tokensIn: number;
   tokensOut: number;
+  /** Safe per-attempt settings and usage, oldest first. Never model text. */
+  attempts: readonly ModelAttempt[];
+}
+
+/**
+ * What one attempt sent and cost. `reasoning` is a fixed setting label such
+ * as `effort=low` or `max_tokens=8000`; no reasoning or prompt text is kept.
+ */
+export interface ModelAttempt {
+  /** 1-based attempt number. */
+  attempt: number;
+  /** `max_tokens` sent for this attempt. */
+  maxTokens: number;
+  /** `effort=<level>`, `effort=none` or `max_tokens=<n>`. */
+  reasoning: string;
+  tokensIn: number;
+  tokensOut: number;
+  reasoningTokens: number;
+  /** finish_reason, `http_<status>`, `timeout`, `non-json` or `network`. */
+  outcome: string;
 }
 
 export interface DroppedFindings {
@@ -79,24 +106,123 @@ export class BugbotModelError extends Error {
   /** Tokens the provider reported, summed over every 200 reply. */
   readonly tokensIn: number;
   readonly tokensOut: number;
+  /** Safe per-attempt settings and usage, oldest first. */
+  readonly attempts: readonly ModelAttempt[];
 
   constructor(
     message: string,
     usage: { tokensIn?: number; tokensOut?: number } = {},
+    attempts: readonly ModelAttempt[] = [],
   ) {
     super(message);
     this.name = "BugbotModelError";
     this.tokensIn = usage.tokensIn ?? 0;
     this.tokensOut = usage.tokensOut ?? 0;
+    this.attempts = attempts;
   }
 }
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
-const DEFAULT_MAX_OUTPUT_TOKENS_CEILING = 32_000;
+/** The highest `max_tokens` the retry ladder may use without configuration. */
+export const DEFAULT_MAX_OUTPUT_TOKENS_CEILING = 32_000;
+export const DEFAULT_REASONING_MAX_TOKENS = 8_000;
+/** Provider minimum for a `reasoning.max_tokens` budget. */
+export const MIN_REASONING_MAX_TOKENS = 1_024;
 const DEFAULT_RETRIES = 2;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_ATTEMPT_TIMEOUT_MS = 300_000;
+
+/**
+ * Models that honor `reasoning.max_tokens`. OpenRouter's
+ * `GET /api/v1/models` reports `supports_max_tokens: true` for these ids.
+ * Effort-only models (including DeepSeek) turn a `max_tokens` budget into an
+ * effort level, so they must use `reasoning.effort` instead. This is a static
+ * allow-list on purpose: no runtime model lookup.
+ */
+export function modelHonorsReasoningMaxTokens(model: string): boolean {
+  const id = model.trim().toLowerCase();
+
+  return (
+    id.startsWith("anthropic/") ||
+    id.startsWith("google/gemini") ||
+    id.startsWith("qwen/")
+  );
+}
+
+type ReasoningSetting =
+  | { readonly kind: "effort"; readonly effort: "low" | "medium" | "high" | "max" }
+  | { readonly kind: "budget"; readonly maxTokens: number }
+  | { readonly kind: "off" };
+
+/** A fixed, safe name for the request's reasoning setting. */
+function reasoningLabel(setting: ReasoningSetting): string {
+  if (setting.kind === "off") {
+    return "effort=none";
+  }
+
+  return setting.kind === "effort"
+    ? `effort=${setting.effort}`
+    : `max_tokens=${setting.maxTokens}`;
+}
+
+/**
+ * The first attempt always reasons unless an override says otherwise:
+ * a budget for an allow-listed model, `low` effort for every other model.
+ */
+function firstReasoningSetting(
+  model: string,
+  effort: ModelOptions["reasoningEffort"],
+  maxTokens: number,
+): ReasoningSetting {
+  if (effort === "none") {
+    return { kind: "off" };
+  }
+
+  if (effort !== undefined) {
+    return { kind: "effort", effort };
+  }
+
+  return modelHonorsReasoningMaxTokens(model)
+    ? { kind: "budget", maxTokens }
+    : { kind: "effort", effort: "low" };
+}
+
+/**
+ * After a `length` stop with empty content, an effort-only model must stop
+ * reasoning at once. An allow-listed model halves its budget first and turns
+ * reasoning off on the final attempt, which always answers.
+ */
+function retryReasoningSetting(
+  current: ReasoningSetting,
+  model: string,
+  maxTokens: number,
+): ReasoningSetting {
+  if (!modelHonorsReasoningMaxTokens(model)) {
+    return { kind: "off" };
+  }
+
+  const budget = current.kind === "budget" ? current.maxTokens : maxTokens;
+
+  // Never go below the provider minimum; a 1024 budget cannot be halved.
+  return {
+    kind: "budget",
+    maxTokens: Math.max(MIN_REASONING_MAX_TOKENS, Math.floor(budget / 2)),
+  };
+}
+
+/** The exact `reasoning` object sent to OpenRouter. */
+function reasoningField(
+  setting: ReasoningSetting,
+): { effort: string } | { max_tokens: number } {
+  if (setting.kind === "off") {
+    return { effort: "none" };
+  }
+
+  return setting.kind === "effort"
+    ? { effort: setting.effort }
+    : { max_tokens: setting.maxTokens };
+}
 
 const defaultSleep: Sleep = (milliseconds) =>
   new Promise((resolve) => {
@@ -262,8 +388,14 @@ function completionDetails(
 }
 
 /** One safe line per empty completion: no prompt, reasoning or key text. */
-function diagnosticLine(details: CompletionDetails, cap: number): string {
+function diagnosticLine(
+  details: CompletionDetails,
+  cap: number,
+  reasoning: string,
+): string {
   const parts = [
+    `max_tokens=${cap}`,
+    `reasoning=${reasoning}`,
     `finish_reason=${details.finishReason ?? "none"}`,
     `native_finish_reason=${details.nativeFinishReason ?? "none"}`,
     `reasoning_chars=${details.reasoningChars}`,
@@ -280,7 +412,7 @@ function diagnosticLine(details: CompletionDetails, cap: number): string {
     }
   }
 
-  return `OpenRouter empty completion (max_tokens ${cap}): ${parts.join(" ")}`;
+  return `OpenRouter empty completion: ${parts.join(" ")}`;
 }
 
 /** Plain words for the final neutral line, never provider content. */
@@ -345,10 +477,16 @@ export async function callModel(
     options.maxOutputTokensCeiling ?? DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
   );
   const retries = Math.max(0, options.retries ?? DEFAULT_RETRIES);
-  const attempts = 1 + retries;
+  const totalAttempts = 1 + retries;
   const log = options.log ?? ((line: string) => console.warn(line));
+  const reasoningMaxTokens =
+    options.reasoningMaxTokens ?? DEFAULT_REASONING_MAX_TOKENS;
   let cap = maxOutputTokens;
-  let reasoningEffort = options.reasoningEffort;
+  let reasoning = firstReasoningSetting(
+    call.model,
+    options.reasoningEffort,
+    reasoningMaxTokens,
+  );
 
   let lastMessage = "OpenRouter request failed";
   /** The last empty-reply cause, kept when a later attempt times out. */
@@ -356,13 +494,42 @@ export async function callModel(
   let lastStatus: number | null = null;
   let tokensIn = 0;
   let tokensOut = 0;
+  const used: ModelAttempt[] = [];
 
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    const setting = reasoning;
+    const settingLabel = reasoningLabel(setting);
     const attemptTimeoutMs = scaledAttemptTimeout(timeoutMs, cap, baseCap);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
     let retryable = false;
     let growCap = false;
+    let attemptIn = 0;
+    let attemptOut = 0;
+    let attemptReasoning = 0;
+    let outcome = "network";
+    let recorded = false;
+
+    /** Records this attempt once, whichever branch ends it. */
+    const recordAttempt = (): void => {
+      if (recorded) {
+        return;
+      }
+      recorded = true;
+      used.push({
+        attempt: attempt + 1,
+        maxTokens: cap,
+        reasoning: settingLabel,
+        tokensIn: attemptIn,
+        tokensOut: attemptOut,
+        reasoningTokens: attemptReasoning,
+        outcome,
+      });
+    };
+
+    log(
+      `OpenRouter attempt ${attempt + 1}/${totalAttempts}: max_tokens=${cap} reasoning=${settingLabel}`,
+    );
 
     const body = JSON.stringify({
       model: call.model,
@@ -373,9 +540,7 @@ export async function callModel(
       temperature: 0,
       response_format: { type: "json_object" },
       max_tokens: cap,
-      ...(reasoningEffort === undefined
-        ? {}
-        : { reasoning: { effort: reasoningEffort } }),
+      reasoning: reasoningField(setting),
     });
 
     try {
@@ -393,13 +558,15 @@ export async function callModel(
       const text = await response.text();
 
       if (!response.ok) {
+        outcome = `http_${response.status}`;
         const message = `OpenRouter returned ${response.status}${providerDetail(
           text,
           apiKey,
         )}`;
 
         if (!isRetryableStatus(response.status)) {
-          throw new BugbotModelError(message, { tokensIn, tokensOut });
+          recordAttempt();
+          throw new BugbotModelError(message, { tokensIn, tokensOut }, used);
         }
 
         lastMessage = message;
@@ -410,6 +577,7 @@ export async function callModel(
         try {
           payload = JSON.parse(text);
         } catch {
+          outcome = "non-json";
           lastMessage = "OpenRouter returned a non-JSON response";
           lastStatus = response.status;
           retryable = true;
@@ -418,12 +586,16 @@ export async function callModel(
 
         if (payload !== undefined) {
           const details = completionDetails(payload, apiKey);
+          attemptIn = details.promptTokens;
+          attemptOut = details.completionTokens;
+          attemptReasoning = details.reasoningTokens;
+          outcome = details.finishReason ?? "none";
           // A failed attempt still costs tokens. Keep them for the summary.
           tokensIn += details.promptTokens;
           tokensOut += details.completionTokens;
 
           if (details.content === null) {
-            log(diagnosticLine(details, cap));
+            log(diagnosticLine(details, cap, settingLabel));
             lastDiagnosis = emptyContentCause(details, cap);
             lastMessage = lastDiagnosis;
             lastStatus = response.status;
@@ -432,18 +604,6 @@ export async function callModel(
               details.finishReason === "length" &&
               details.errorCode === null &&
               details.errorMessage === null;
-
-            // A reasoning model can spend the whole cap on hidden reasoning.
-            // Bound it on the retry so the bigger cap can reach an answer.
-            if (
-              growCap &&
-              reasoningEffort === undefined &&
-              (details.reasoningChars > 0 ||
-                details.reasoningDetails > 0 ||
-                details.reasoningTokens > 0)
-            ) {
-              reasoningEffort = "low";
-            }
           } else {
             try {
               JSON.parse(details.content);
@@ -457,11 +617,13 @@ export async function callModel(
               const record = recordOf(payload);
               const model = stringField(record?.model) ?? call.model;
 
+              recordAttempt();
               return {
                 raw: details.content,
                 model,
                 tokensIn,
                 tokensOut,
+                attempts: used,
               };
             }
           }
@@ -469,16 +631,19 @@ export async function callModel(
       }
     } catch (error) {
       if (error instanceof BugbotModelError) {
+        recordAttempt();
         throw error;
       }
 
       if (isAbort(error) || controller.signal.aborted) {
+        outcome = "timeout";
         lastMessage = `OpenRouter request timed out after ${attemptTimeoutMs} ms`;
         if (lastDiagnosis !== null) {
           lastMessage += `; earlier attempt: ${lastDiagnosis}`;
         }
         lastStatus = null;
       } else {
+        outcome = "network";
         const reason = error instanceof Error ? error.message : String(error);
         lastMessage = `OpenRouter request failed: ${safeText(reason, apiKey)}`;
         lastStatus = null;
@@ -488,12 +653,25 @@ export async function callModel(
       clearTimeout(timer);
     }
 
-    if (!retryable || attempt === attempts - 1) {
+    recordAttempt();
+
+    if (!retryable || attempt === totalAttempts - 1) {
       break;
     }
 
-    if (growCap) {
-      cap = Math.min(cap * 2, ceiling);
+    const nextIsFinal = attempt + 2 === totalAttempts;
+    if (nextIsFinal) {
+      // The last attempt always answers with reasoning off. A finite output
+      // cap is what remains, so grow it once only on this attempt.
+      reasoning = { kind: "off" };
+      if (growCap) {
+        cap = Math.min(cap * 2, ceiling);
+      }
+    } else if (growCap) {
+      // One retry at the same cap with reasoning bounded, then a bigger cap
+      // on the final attempt. This bounds worst-case tokens and time while
+      // still giving a genuinely long answer more room.
+      reasoning = retryReasoningSetting(reasoning, call.model, reasoningMaxTokens);
     }
 
     const backoff = 500 * 2 ** attempt + Math.floor(Math.random() * 250);
@@ -502,10 +680,11 @@ export async function callModel(
 
   const statusSuffix = lastStatus === null ? "" : ` (last status ${lastStatus})`;
   throw new BugbotModelError(
-    `${lastMessage}${statusSuffix} after ${attempts} attempt${
-      attempts === 1 ? "" : "s"
+    `${lastMessage}${statusSuffix} after ${totalAttempts} attempt${
+      totalAttempts === 1 ? "" : "s"
     }`,
     { tokensIn, tokensOut },
+    used,
   );
 }
 

@@ -1028,6 +1028,19 @@ describe("upsertSummary", () => {
     );
   });
 
+  it("renders the per-attempt reasoning settings and token counts (fix5)", () => {
+    const body = renderSummary(
+      reviewSummary({
+        reasoning:
+          "#1 effort=low cap 8000 (900 in / 8000 out, 7000 reasoning); #2 effort=none cap 8000 (800 in / 8000 out, 0 reasoning)",
+      }),
+    );
+
+    expect(body).toContain(
+      "- Reasoning: #1 effort=low cap 8000 (900 in / 8000 out, 7000 reasoning); #2 effort=none cap 8000 (800 in / 8000 out, 0 reasoning)",
+    );
+  });
+
   it("edits the bot's existing summary in place", async () => {
     const { fetchFn, calls } = recording((call) =>
       call.method === "GET"

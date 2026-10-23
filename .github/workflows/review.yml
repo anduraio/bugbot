@@ -29,7 +29,12 @@ on:
         type: string
         default: "120000"
       max_output_tokens:
-        description: Output cap sent as max_tokens. Doubled after an empty length stop, up to 32000.
+        description: Output cap sent as max_tokens. A length stop retries at the same cap, then doubles once, up to 32000.
+        required: false
+        type: string
+        default: "8000"
+      reasoning_max_tokens:
+        description: Reasoning budget for models that honor reasoning.max_tokens. Must be strictly below the output ceiling.
         required: false
         type: string
         default: "8000"
@@ -82,7 +87,12 @@ on:
         type: string
         default: "120000"
       max_output_tokens:
-        description: Output cap sent as max_tokens. Doubled after an empty length stop, up to 32000.
+        description: Output cap sent as max_tokens. A length stop retries at the same cap, then doubles once, up to 32000.
+        required: false
+        type: string
+        default: "8000"
+      reasoning_max_tokens:
+        description: Reasoning budget for models that honor reasoning.max_tokens. Must be strictly below the output ceiling.
         required: false
         type: string
         default: "8000"
@@ -245,6 +255,7 @@ jobs:
           big_pr_model: ${{ inputs.big_pr_model }}
           max_tokens: ${{ inputs.max_tokens }}
           max_output_tokens: ${{ inputs.max_output_tokens }}
+          reasoning_max_tokens: ${{ inputs.reasoning_max_tokens }}
           min_confidence: ${{ inputs.min_confidence }}
           dry_run: ${{ inputs.dry_run }}
           comment_sicko: ${{ inputs.comment_sicko }}

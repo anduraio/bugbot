@@ -367,6 +367,95 @@ describe("runLocalReview", () => {
     );
   });
 
+  it("rejects an invalid reasoning_max_tokens before any model call (fix5)", async () => {
+    const cases = [
+      { raw: "abc", message: "must be a whole number from 1024 to 64000" },
+      { raw: "0", message: "must be a whole number from 1024 to 64000" },
+      { raw: "1023", message: "must be a whole number from 1024 to 64000" },
+      { raw: "64001", message: "must be a whole number from 1024 to 64000" },
+      { raw: "8000.5", message: "must be a whole number from 1024 to 64000" },
+      {
+        raw: "32000",
+        message: "must be strictly below the 32000-token output ceiling",
+      },
+    ];
+
+    for (const item of cases) {
+      let calls = 0;
+      const lines: string[] = [];
+      const result = await runLocalReview(
+        { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+        {
+          fetch: async () => {
+            calls += 1;
+            return new Response(modelResponse, { status: 200 });
+          },
+          env: envWith({
+            OPENROUTER_API_KEY: "test-key",
+            BUGBOT_REASONING_MAX_TOKENS: item.raw,
+          }),
+          log: (line) => lines.push(line),
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(calls).toBe(0);
+      expect(result.tokensIn).toBe(0);
+      expect(lines.join("\n")).toContain(
+        `Bugbot couldn't review: BUGBOT_REASONING_MAX_TOKENS ${item.message}`,
+      );
+    }
+  });
+
+  it("rejects a reasoning budget at or above a raised output ceiling (fix5)", async () => {
+    let calls = 0;
+    const lines: string[] = [];
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async () => {
+          calls += 1;
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({
+          OPENROUTER_API_KEY: "test-key",
+          BUGBOT_MAX_OUTPUT_TOKENS: "64000",
+          BUGBOT_REASONING_MAX_TOKENS: "64000",
+        }),
+        log: (line) => lines.push(line),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(calls).toBe(0);
+    expect(lines.join("\n")).toContain(
+      "BUGBOT_REASONING_MAX_TOKENS must be strictly below the 64000-token output ceiling",
+    );
+  });
+
+  it("sends an accepted reasoning budget to an allow-listed model (fix5)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({
+          OPENROUTER_API_KEY: "test-key",
+          BUGBOT_MODEL: "anthropic/claude-sonnet-4",
+          BUGBOT_REASONING_MAX_TOKENS: "31999",
+        }),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.reasoning).toEqual({ max_tokens: 31_999 });
+  });
+
   it("refuses paths that try to leave the repo dir", async () => {
     const root = await mkdtemp(join(tmpdir(), "bugbot-local-"));
     const lines: string[] = [];

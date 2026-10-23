@@ -57,4 +57,21 @@ describe("max_output_tokens wiring", () => {
       "max_output_tokens: ${{ inputs.max_output_tokens }}",
     );
   });
+
+  it("declares reasoning_max_tokens and forwards it (fix5)", () => {
+    const action = readFileSync(join(root, "action.yml"), "utf8");
+    expect(action).toContain("reasoning_max_tokens:");
+    expect(action).toContain(
+      "BUGBOT_REASONING_MAX_TOKENS: ${{ inputs.reasoning_max_tokens }}",
+    );
+
+    const workflow = readFileSync(
+      join(root, ".github/workflows/review.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/^      reasoning_max_tokens:/gm)).toHaveLength(2);
+    expect(workflow).toContain(
+      "reasoning_max_tokens: ${{ inputs.reasoning_max_tokens }}",
+    );
+  });
 });

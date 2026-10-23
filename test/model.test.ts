@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BugbotModelError,
   callModel,
+  modelHonorsReasoningMaxTokens,
   parseJsonResponse,
   scaledAttemptTimeout,
   type FetchLike,
@@ -12,6 +13,24 @@ const CALL = {
   system: "system text",
   user: "user text",
 };
+
+function expectedBody(
+  model: string,
+  maxTokens: number,
+  reasoning: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    model,
+    messages: [
+      { role: "system", content: CALL.system },
+      { role: "user", content: CALL.user },
+    ],
+    temperature: 0,
+    response_format: { type: "json_object" },
+    max_tokens: maxTokens,
+    reasoning,
+  };
+}
 
 function completion(content: string, tokensIn = 100, tokensOut = 20): string {
   return JSON.stringify({
@@ -302,7 +321,7 @@ describe("callModel", () => {
     expect(scaledAttemptTimeout(10, 2_000, 2_000)).toBe(10);
   });
 
-  it("gives the 32000 rung more time and keeps the earlier length diagnosis", async () => {
+  it("gives the 16000 final rung more time and keeps the earlier length diagnosis", async () => {
     const bodies: Array<{ max_tokens: number }> = [];
     const fakeFetch: FetchLike = async (_input, init) => {
       bodies.push(JSON.parse(String(init?.body)) as { max_tokens: number });
@@ -334,12 +353,12 @@ describe("callModel", () => {
 
     const message = caught instanceof Error ? caught.message : String(caught);
     expect(bodies.map((body) => body.max_tokens)).toEqual([
-      8_000, 16_000, 32_000,
+      8_000, 8_000, 16_000,
     ]);
-    // 10 ms at 8000 becomes 40 ms at 32000.
-    expect(message).toContain("timed out after 40 ms");
+    // 10 ms at 8000 becomes 20 ms at 16000.
+    expect(message).toContain("timed out after 20 ms");
     expect(message).toContain(
-      "whole 16000-token output budget on reasoning",
+      "whole 8000-token output budget on reasoning",
     );
     expect(caught).toMatchObject({ tokensIn: 1_800, tokensOut: 16_000 });
   });
@@ -404,10 +423,11 @@ describe("callModel", () => {
     expect(message).not.toContain(key);
     expect(message).toContain("bad key [redacted]");
     expect(message.length).toBeLessThan(500);
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).not.toContain(key);
-    expect(logs[0]).toContain("error_message=bad key [redacted]");
-    expect((logs[0] ?? "").length).toBeLessThan(500);
+    const diagnostic = logs.find((line) => line.includes("error_message="));
+    expect(diagnostic).toBeDefined();
+    expect(logs.join("\n")).not.toContain(key);
+    expect(diagnostic).toContain("error_message=bad key [redacted]");
+    expect((diagnostic ?? "").length).toBeLessThan(500);
   });
 
   it("does not grow the cap after a provider error inside a 200 body (M3)", async () => {
@@ -446,28 +466,199 @@ describe("callModel", () => {
     expect(caps).toEqual([8_000, 8_000]);
   });
 
-  it("sends no reasoning field when no reasoning was seen (M4)", async () => {
-    const bodies: Array<{ max_tokens: number; reasoning?: unknown }> = [];
+  it("sends the exact reasoning setting for every DeepSeek attempt (effort-only)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const logs: string[] = [];
     const fakeFetch: FetchLike = async (_input, init) => {
-      bodies.push(
-        JSON.parse(String(init?.body)) as {
-          max_tokens: number;
-          reasoning?: unknown;
-        },
-      );
-      return bodies.length === 1 ? emptyStop() : ok('{"findings":[]}');
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (bodies.length === 1) {
+        return emptyStop({
+          reasoning: "hidden chain of thought",
+          tokensIn: 900,
+          tokensOut: 8_000,
+          reasoningTokens: 7_900,
+        });
+      }
+      if (bodies.length === 2) {
+        return emptyStop({ tokensIn: 800, tokensOut: 8_000 });
+      }
+      return ok('{"findings":[]}', 100, 20);
     };
 
-    await callModel(CALL, {
+    const result = await callModel(CALL, {
       apiKey: "sk-test-key",
       fetch: fakeFetch,
       maxOutputTokens: 8_000,
       sleep: async () => undefined,
-      log: () => undefined,
+      log: (line) => logs.push(line),
     });
 
-    expect(bodies.map((body) => body.max_tokens)).toEqual([8_000, 16_000]);
-    expect(bodies[1]?.reasoning).toBeUndefined();
+    expect(bodies).toEqual([
+      expectedBody(CALL.model, 8_000, { effort: "low" }),
+      expectedBody(CALL.model, 8_000, { effort: "none" }),
+      expectedBody(CALL.model, 16_000, { effort: "none" }),
+    ]);
+    // Usage is summed over all three attempts, including both empty ones.
+    expect(result.tokensIn).toBe(1_800);
+    expect(result.tokensOut).toBe(16_020);
+    expect(result.attempts).toEqual([
+      {
+        attempt: 1,
+        maxTokens: 8_000,
+        reasoning: "effort=low",
+        tokensIn: 900,
+        tokensOut: 8_000,
+        reasoningTokens: 7_900,
+        outcome: "length",
+      },
+      {
+        attempt: 2,
+        maxTokens: 8_000,
+        reasoning: "effort=none",
+        tokensIn: 800,
+        tokensOut: 8_000,
+        reasoningTokens: 0,
+        outcome: "length",
+      },
+      {
+        attempt: 3,
+        maxTokens: 16_000,
+        reasoning: "effort=none",
+        tokensIn: 100,
+        tokensOut: 20,
+        reasoningTokens: 0,
+        outcome: "none",
+      },
+    ]);
+    expect(logs).toContain(
+      "OpenRouter attempt 1/3: max_tokens=8000 reasoning=effort=low",
+    );
+    expect(logs).toContain(
+      "OpenRouter attempt 2/3: max_tokens=8000 reasoning=effort=none",
+    );
+    expect(logs).toContain(
+      "OpenRouter attempt 3/3: max_tokens=16000 reasoning=effort=none",
+    );
+    for (const line of logs) {
+      expect(line).not.toContain("hidden chain of thought");
+    }
+  });
+
+  it("sends a halved reasoning budget then turns it off for an allow-listed model", async () => {
+    const model = "anthropic/claude-sonnet-4";
+    const bodies: Array<Record<string, unknown>> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return bodies.length < 3
+        ? emptyStop({ reasoning: "hidden", tokensIn: 500, tokensOut: 8_000 })
+        : ok('{"findings":[]}', 100, 20);
+    };
+
+    const result = await callModel(
+      { ...CALL, model },
+      {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        maxOutputTokens: 8_000,
+        reasoningMaxTokens: 4_000,
+        sleep: async () => undefined,
+        log: () => undefined,
+      },
+    );
+
+    expect(bodies).toEqual([
+      expectedBody(model, 8_000, { max_tokens: 4_000 }),
+      expectedBody(model, 8_000, { max_tokens: 2_000 }),
+      expectedBody(model, 16_000, { effort: "none" }),
+    ]);
+    expect(result.attempts.map((attempt) => attempt.reasoning)).toEqual([
+      "max_tokens=4000",
+      "max_tokens=2000",
+      "effort=none",
+    ]);
+    expect(result.tokensIn).toBe(1_100);
+    expect(result.tokensOut).toBe(16_020);
+  });
+
+  it("keeps a halved allow-listed budget at the 1024 provider minimum (fix5)", async () => {
+    const model = "qwen/qwen3-235b-a22b";
+    const bodies: Array<Record<string, unknown>> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return bodies.length === 1
+        ? emptyStop()
+        : ok('{"findings":[]}');
+    };
+
+    await callModel(
+      { ...CALL, model },
+      {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        maxOutputTokens: 8_000,
+        reasoningMaxTokens: 1_024,
+        sleep: async () => undefined,
+        log: () => undefined,
+      },
+    );
+
+    expect(bodies[1]?.reasoning).toEqual({ max_tokens: 1_024 });
+  });
+
+  it("turns reasoning off on the only retry of an allow-listed model", async () => {
+    const model = "google/gemini-2.5-pro";
+    const bodies: Array<Record<string, unknown>> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return bodies.length === 1
+        ? emptyStop()
+        : ok('{"findings":[]}');
+    };
+
+    await callModel(
+      { ...CALL, model },
+      {
+        apiKey: "sk-test-key",
+        fetch: fakeFetch,
+        retries: 1,
+        maxOutputTokens: 8_000,
+        reasoningMaxTokens: 4_000,
+        sleep: async () => undefined,
+        log: () => undefined,
+      },
+    );
+
+    // The second attempt is final, so it must not reason at all.
+    expect(bodies).toEqual([
+      expectedBody(model, 8_000, { max_tokens: 4_000 }),
+      expectedBody(model, 16_000, { effort: "none" }),
+    ]);
+  });
+
+  it("only sends reasoning.max_tokens to the allow-listed model families", () => {
+    expect(modelHonorsReasoningMaxTokens("anthropic/claude-sonnet-4")).toBe(true);
+    expect(modelHonorsReasoningMaxTokens("google/gemini-2.5-pro")).toBe(true);
+    expect(modelHonorsReasoningMaxTokens("qwen/qwen3-235b-a22b")).toBe(true);
+    expect(modelHonorsReasoningMaxTokens("deepseek/deepseek-v4.1-flash")).toBe(
+      false,
+    );
+    expect(modelHonorsReasoningMaxTokens("openai/gpt-5")).toBe(false);
+    expect(modelHonorsReasoningMaxTokens("meta-llama/llama-4")).toBe(false);
+  });
+
+  it("uses effort low for a non-allow-listed model even with a budget configured", async () => {
+    let body: Record<string, unknown> = {};
+    await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: async (_input, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return ok('{"findings":[]}');
+      },
+      reasoningMaxTokens: 4_000,
+    });
+
+    expect(body.reasoning).toEqual({ effort: "low" });
+    expect(body.max_tokens).toBe(8_000);
   });
 
   it("never grows the cap past the ceiling (M6)", async () => {
@@ -490,7 +681,7 @@ describe("callModel", () => {
       }),
     ).rejects.toBeInstanceOf(BugbotModelError);
 
-    expect(caps).toEqual([8_000, 10_000, 10_000]);
+    expect(caps).toEqual([8_000, 8_000, 10_000]);
   });
 
   it("never puts the key in an error message or a logged line", async () => {
@@ -545,7 +736,7 @@ describe("callModel", () => {
     expect(calls).toBe(0);
   });
 
-  it("doubles the cap and bounds reasoning after an empty length stop", async () => {
+  it("retries the same cap with reasoning off after an empty length stop", async () => {
     const bodies: Array<{
       max_tokens: number;
       reasoning?: { effort: string };
@@ -577,18 +768,22 @@ describe("callModel", () => {
       log: (line) => logs.push(line),
     });
 
-    expect(bodies.map((body) => body.max_tokens)).toEqual([8_000, 16_000]);
-    expect(bodies[0]?.reasoning).toBeUndefined();
-    expect(bodies[1]?.reasoning).toEqual({ effort: "low" });
+    expect(bodies.map((body) => body.max_tokens)).toEqual([8_000, 8_000]);
+    expect(bodies[0]?.reasoning).toEqual({ effort: "low" });
+    expect(bodies[1]?.reasoning).toEqual({ effort: "none" });
     // The empty attempt's usage still counts: 100 + 900 in, 20 + 8,000 out.
     expect(result.tokensIn).toBe(1_000);
     expect(result.tokensOut).toBe(8_020);
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain(" finish_reason=length");
-    expect(logs[0]).toContain("native_finish_reason=length");
-    expect(logs[0]).toContain("reasoning_chars=23");
-    expect(logs[0]).toContain("reasoning_tokens=7900");
-    expect(logs[0]).not.toContain("hidden chain of thought");
+    const diagnostics = logs.filter((line) =>
+      line.includes("OpenRouter empty completion:"),
+    );
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toContain(" finish_reason=length");
+    expect(diagnostics[0]).toContain("native_finish_reason=length");
+    expect(diagnostics[0]).toContain("reasoning_chars=23");
+    expect(diagnostics[0]).toContain("reasoning_tokens=7900");
+    expect(diagnostics[0]).toContain("reasoning=effort=low");
+    expect(logs.join("\n")).not.toContain("hidden chain of thought");
   });
 
   it("names the reasoning budget when every attempt stops on length", async () => {
@@ -616,18 +811,32 @@ describe("callModel", () => {
 
     const message = caught instanceof Error ? caught.message : String(caught);
     expect(bodies.map((body) => body.max_tokens)).toEqual([
-      8_000, 16_000, 32_000,
+      8_000, 8_000, 16_000,
     ]);
-    expect(message).toContain("whole 32000-token output budget on reasoning");
+    expect(message).toContain("whole 16000-token output budget on reasoning");
     expect(message).toContain('finish_reason "length"');
     expect(message).toContain("raise `max_output_tokens`");
     expect(message).toContain("after 3 attempts");
     expect(caught).toBeInstanceOf(BugbotModelError);
     expect(caught).toMatchObject({ tokensIn: 2_700, tokensOut: 24_000 });
-    expect(logs).toHaveLength(3);
-    for (const line of logs) {
+    expect(
+      (caught as BugbotModelError).attempts.map((attempt) => ({
+        maxTokens: attempt.maxTokens,
+        reasoning: attempt.reasoning,
+      })),
+    ).toEqual([
+      { maxTokens: 8_000, reasoning: "effort=low" },
+      { maxTokens: 8_000, reasoning: "effort=none" },
+      { maxTokens: 16_000, reasoning: "effort=none" },
+    ]);
+    const diagnostics = logs.filter((line) =>
+      line.includes("OpenRouter empty completion:"),
+    );
+    expect(diagnostics).toHaveLength(3);
+    for (const line of diagnostics) {
       expect(line).toContain(" finish_reason=length");
     }
+    expect(logs).toHaveLength(6);
   });
 
   it("reports a provider error inside a 200 body and logs its code", async () => {
@@ -652,10 +861,10 @@ describe("callModel", () => {
       "OpenRouter returned an error inside a 200 response: 502 upstream exploded",
     );
 
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain("error_code=502");
-    expect(logs[0]).toContain("error_message=upstream exploded");
-    expect(logs[0]).toContain(" finish_reason=none");
+    const diagnostic = logs.find((line) => line.includes("error_code=502"));
+    expect(diagnostic).toBeDefined();
+    expect(diagnostic).toContain("error_message=upstream exploded");
+    expect(diagnostic).toContain(" finish_reason=none");
   });
 
   it("counts usage from an empty reply on the thrown error", async () => {
@@ -695,11 +904,14 @@ describe("callModel", () => {
       ),
     ).rejects.toBeInstanceOf(BugbotModelError);
 
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain(`reasoning_chars=${reasoning.length}`);
-    expect(logs[0]).not.toContain(system);
-    expect(logs[0]).not.toContain(user);
-    expect(logs[0]).not.toContain(reasoning);
+    const diagnostic = logs.find((line) =>
+      line.includes(`reasoning_chars=${reasoning.length}`),
+    );
+    expect(diagnostic).toBeDefined();
+    expect(diagnostic).toContain(`reasoning_chars=${reasoning.length}`);
+    expect(logs.join("\n")).not.toContain(system);
+    expect(logs.join("\n")).not.toContain(user);
+    expect(logs.join("\n")).not.toContain(reasoning);
   });
 
   it("sends an explicit reasoning effort when one is configured", async () => {
@@ -715,6 +927,49 @@ describe("callModel", () => {
       },
       reasoningEffort: "high",
     });
+
+    expect(body.reasoning).toEqual({ effort: "high" });
+  });
+
+  it("respects a max reasoning effort override on attempt 1 (fix5)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fakeFetch: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return bodies.length === 1
+        ? emptyStop()
+        : ok('{"findings":[]}');
+    };
+
+    await callModel(CALL, {
+      apiKey: "sk-test-key",
+      fetch: fakeFetch,
+      maxOutputTokens: 8_000,
+      reasoningEffort: "max",
+      sleep: async () => undefined,
+      log: () => undefined,
+    });
+
+    // Attempt 1 honors the override; the final attempt still answers with
+    // reasoning off.
+    expect(bodies[0]?.reasoning).toEqual({ effort: "max" });
+    expect(bodies[1]?.reasoning).toEqual({ effort: "none" });
+  });
+
+  it("honors an effort override over a budget for an allow-listed model (fix5)", async () => {
+    let body: Record<string, unknown> = {};
+    await callModel(
+      { ...CALL, model: "anthropic/claude-sonnet-4" },
+      {
+        apiKey: "sk-test-key",
+        fetch: async (_input, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return ok('{"findings":[]}');
+        },
+        reasoningEffort: "high",
+        reasoningMaxTokens: 4_000,
+        retries: 0,
+      },
+    );
 
     expect(body.reasoning).toEqual({ effort: "high" });
   });

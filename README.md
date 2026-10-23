@@ -189,23 +189,34 @@ choose.
 - `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
   (default 8000). A set value must be a whole number from 1000 to 64000;
   anything else ends the pass with a clear message before any model request.
-  A `length` stop with empty content retries with twice the cap, up to 32000,
-  and bounds reasoning to `low` when the stop spent tokens on reasoning. Each
-  attempt's timeout (120 s by default) grows with the cap it sends, bounded at
-  300 s, so the biggest retry has time to finish.
+  A `length` stop with empty content retries once at the same cap with
+  reasoning bounded (off for effort-only models), then once at twice the cap
+  (capped at 32000) with reasoning off. Each attempt's timeout (120 s by
+  default) grows with the cap it sends, bounded at 300 s, so the biggest
+  retry has time to finish.
+- `BUGBOT_REASONING_MAX_TOKENS` is the reasoning budget sent as
+  `reasoning.max_tokens` for models that honor it (default 8000). It must be
+  a whole number from 1024 to 64000 and strictly below the highest output cap
+  (`max_output_tokens` or 32000, whichever is higher); a bad value ends the
+  pass before any request. Reasoning is on by default: an allow-listed model
+  gets this budget, every other model gets `reasoning.effort: "low"`. On a
+  `length` stop with empty content an allow-listed model halves the budget on
+  the first retry and every model turns reasoning off on the final attempt.
 
 ## Workflow inputs
 
 The reusable workflow and the composite action accept `model`, `big_pr_model`,
 `max_tokens` (input budget, default 120000), `max_output_tokens` (model output
-cap, default 8000), `min_confidence`, `dry_run` and `comment_sicko`.
-`max_output_tokens` is passed to the CLI as `BUGBOT_MAX_OUTPUT_TOKENS`.
+cap, default 8000), `reasoning_max_tokens` (reasoning budget, default 8000,
+passed as `BUGBOT_REASONING_MAX_TOKENS`), `min_confidence`, `dry_run` and
+`comment_sicko`.
 
-An empty model reply logs one line with `finish_reason`,
-`native_finish_reason`, the reasoning character count, the usage numbers and
-any provider `error` code and message. It never logs the prompt or the
-reasoning text. Safe usage from those failed attempts is still counted in the
-summary's `Tokens` line.
+An empty model reply logs one line with its `max_tokens`, the reasoning
+setting, `finish_reason`, `native_finish_reason`, the reasoning character
+count, the usage numbers and any provider `error` code and message. It never
+logs the prompt or the reasoning text. Every attempt also logs its setting,
+and the summary shows the same settings and token counts. Safe usage from
+those failed attempts is still counted in the summary's `Tokens` line.
 
 ## Development
 

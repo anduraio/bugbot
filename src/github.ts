@@ -787,6 +787,11 @@ export interface ReviewSummary {
   model: string;
   tokensIn: number;
   tokensOut: number;
+  /**
+   * Safe per-attempt reasoning settings and token counts for the main model
+   * call, for example `#1 effort=low cap 8000 (...)`.
+   */
+  reasoning?: string;
   /** Inline comments posted by this pass only. */
   posted: number;
   /**
@@ -1322,6 +1327,14 @@ export function renderSummary(summary: ReviewSummary, secret: string): string {
     `- Passes: ${summary.passCount}`,
     `- Model: ${redact(summary.model, secret)}`,
     `- Tokens: ${summary.tokensIn} in / ${summary.tokensOut} out`,
+    ...(summary.reasoning === undefined || summary.reasoning.trim() === ""
+      ? []
+      : [
+          `- Reasoning: ${oneLine(
+            redact(summary.reasoning, secret),
+            500,
+          )}`,
+        ]),
     `- Posted this pass: ${summary.posted}`,
     `- Open Bugbot comments: ${
       typeof summary.openComments === "number"
