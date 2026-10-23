@@ -51,8 +51,8 @@ import {
 import { buildPrompt, loadSystemPrompt } from "./prompt.js";
 import {
   BugbotModelError,
-  DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
-  DEFAULT_REASONING_MAX_TOKENS,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_REASONING_EFFORT,
   MIN_REASONING_MAX_TOKENS,
   callModel,
   parseJsonResponse,
@@ -60,6 +60,7 @@ import {
   type FetchLike,
   type ModelAttempt,
   type ModelResult,
+  type ReasoningEffort,
   type Sleep,
 } from "./model.js";
 import {
@@ -161,7 +162,6 @@ export interface LocalReviewResult {
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 const DEFAULT_MAX_TOKENS = 120_000;
-const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
 
 function emptyDropped(): DroppedFindings {
   return { count: 0, reasons: [] };
@@ -438,6 +438,9 @@ export async function runLocalReview(
     const maxOutputTokens = maxOutputTokensFromEnv(
       readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
     );
+    const reasoningEffort = reasoningEffortFromEnv(
+      readEnv("BUGBOT_REASONING_EFFORT").trim(),
+    );
     const reasoningMaxTokens = reasoningMaxTokensFromEnv(
       readEnv("BUGBOT_REASONING_MAX_TOKENS").trim(),
       maxOutputTokens,
@@ -519,6 +522,7 @@ export async function runLocalReview(
         apiKey,
         fetch: deps.fetch,
         maxOutputTokens,
+        reasoningEffort,
         reasoningMaxTokens,
         log: (line) => log(line),
       },
@@ -665,12 +669,13 @@ function parsePositiveEnv(raw: string, fallback: number): number {
 }
 
 const MIN_MAX_OUTPUT_TOKENS = 1_000;
-const MAX_MAX_OUTPUT_TOKENS = 64_000;
+const MAX_MAX_OUTPUT_TOKENS = 128_000;
 
 /**
  * `max_output_tokens` becomes a real provider parameter, so a value that is
- * set is validated instead of silently replaced. The range keeps the retry
- * ladder usable and the request inside a sane limit; empty means the default.
+ * set is validated instead of silently replaced. The range keeps one request
+ * inside a sane limit; empty means the default. An empty `length` stop retries
+ * at the same cap, so this is also the largest cap a pass can send.
  */
 function maxOutputTokensFromEnv(raw: string): number {
   if (raw === "") {
@@ -691,27 +696,54 @@ function maxOutputTokensFromEnv(raw: string): number {
   return value;
 }
 
+const REASONING_EFFORTS = [
+  "max",
+  "xhigh",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "none",
+] as const satisfies readonly ReasoningEffort[];
+
+function isReasoningEffort(value: string): value is ReasoningEffort {
+  return (REASONING_EFFORTS as readonly string[]).includes(value);
+}
+
+/**
+ * Attempt 1 reasons at high effort by default, sent explicitly as
+ * `reasoning.effort`. A set value is validated here so a typo fails before any
+ * request.
+ */
+function reasoningEffortFromEnv(raw: string): ReasoningEffort {
+  if (raw === "") {
+    return DEFAULT_REASONING_EFFORT;
+  }
+
+  const value = raw.toLowerCase();
+  if (!isReasoningEffort(value)) {
+    throw new Error(
+      `BUGBOT_REASONING_EFFORT must be one of ${REASONING_EFFORTS.join(", ")} (got ${JSON.stringify(raw.slice(0, 40))})`,
+    );
+  }
+
+  return value;
+}
+
 const MAX_REASONING_MAX_TOKENS = 64_000;
 
 /**
  * The reasoning budget becomes `reasoning.max_tokens` for allow-listed
  * models, so it is validated here instead of being silently replaced. It must
- * stay strictly below the highest `max_tokens` the retry ladder can send
- * (`max_output_tokens` or the 32000 default ceiling, whichever is higher), or
- * reasoning could still consume a whole attempt. Empty means the default.
+ * stay strictly below the output cap or reasoning could still consume a whole
+ * attempt. Empty means no budget: the configured (default high) effort applies.
  */
-function reasoningMaxTokensFromEnv(raw: string, maxOutputTokens: number): number {
-  const ceiling = Math.max(
-    maxOutputTokens,
-    DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
-  );
+function reasoningMaxTokensFromEnv(
+  raw: string,
+  maxOutputTokens: number,
+): number | undefined {
   if (raw === "") {
-    if (DEFAULT_REASONING_MAX_TOKENS >= ceiling) {
-      throw new Error(
-        `BUGBOT_REASONING_MAX_TOKENS default must be strictly below the ${ceiling}-token output ceiling`,
-      );
-    }
-    return DEFAULT_REASONING_MAX_TOKENS;
+    return undefined;
   }
 
   const value = /^[0-9]+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
@@ -725,9 +757,9 @@ function reasoningMaxTokensFromEnv(raw: string, maxOutputTokens: number): number
     );
   }
 
-  if (value >= ceiling) {
+  if (value >= maxOutputTokens) {
     throw new Error(
-      `BUGBOT_REASONING_MAX_TOKENS must be strictly below the ${ceiling}-token output ceiling (got ${value})`,
+      `BUGBOT_REASONING_MAX_TOKENS must be strictly below the ${maxOutputTokens}-token output ceiling (got ${value})`,
     );
   }
 
@@ -965,10 +997,14 @@ export async function runPrReview(
     DEFAULT_MAX_TOKENS,
   );
   let maxOutputTokens: number;
-  let reasoningMaxTokens: number;
+  let reasoningEffort: ReasoningEffort;
+  let reasoningMaxTokens: number | undefined;
   try {
     maxOutputTokens = maxOutputTokensFromEnv(
       readEnv("BUGBOT_MAX_OUTPUT_TOKENS").trim(),
+    );
+    reasoningEffort = reasoningEffortFromEnv(
+      readEnv("BUGBOT_REASONING_EFFORT").trim(),
     );
     reasoningMaxTokens = reasoningMaxTokensFromEnv(
       readEnv("BUGBOT_REASONING_MAX_TOKENS").trim(),
@@ -1314,6 +1350,7 @@ export async function runPrReview(
           sleep: deps.sleep,
           timeoutMs: deps.modelTimeoutMs,
           maxOutputTokens,
+          reasoningEffort,
           reasoningMaxTokens,
           log: (line) => log(line),
         },
@@ -1561,9 +1598,17 @@ export async function runPrReview(
                   sleep: deps.sleep,
                   timeoutMs: deps.modelTimeoutMs,
                   maxOutputTokens: 2_000,
+                  reasoningEffort,
                   // The re-check has a smaller cap, so its reasoning budget
                   // must stay below it even when a review budget is larger.
-                  reasoningMaxTokens: Math.min(reasoningMaxTokens, 1_024),
+                  ...(reasoningMaxTokens === undefined
+                    ? {}
+                    : {
+                        reasoningMaxTokens: Math.min(
+                          reasoningMaxTokens,
+                          1_024,
+                        ),
+                      }),
                   log: (line) => log(line),
                 },
               );

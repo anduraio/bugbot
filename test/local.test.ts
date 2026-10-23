@@ -363,11 +363,11 @@ describe("runLocalReview", () => {
     expect(calls).toBe(0);
     expect(result.tokensIn).toBe(0);
     expect(lines.join("\n")).toContain(
-      "Bugbot couldn't review: BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 64000",
+      "Bugbot couldn't review: BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 128000",
     );
   });
 
-  it("rejects an invalid reasoning_max_tokens before any model call (fix5)", async () => {
+  it("rejects an invalid reasoning_max_tokens before any model call (fix5, fix5b)", async () => {
     const cases = [
       { raw: "abc", message: "must be a whole number from 1024 to 64000" },
       { raw: "0", message: "must be a whole number from 1024 to 64000" },
@@ -375,8 +375,8 @@ describe("runLocalReview", () => {
       { raw: "64001", message: "must be a whole number from 1024 to 64000" },
       { raw: "8000.5", message: "must be a whole number from 1024 to 64000" },
       {
-        raw: "32000",
-        message: "must be strictly below the 32000-token output ceiling",
+        raw: "64000",
+        message: "must be strictly below the 64000-token output ceiling",
       },
     ];
 
@@ -433,7 +433,76 @@ describe("runLocalReview", () => {
     );
   });
 
-  it("sends an accepted reasoning budget to an allow-listed model (fix5)", async () => {
+  it("sends effort high by default (fix5b)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({ OPENROUTER_API_KEY: "test-key" }),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.reasoning).toEqual({ effort: "high" });
+    expect(bodies[0]?.max_tokens).toBe(64_000);
+  });
+
+  it("rejects an invalid reasoning_effort before any model call (fix5b)", async () => {
+    for (const raw of ["auto", "highest", "0"]) {
+      let calls = 0;
+      const lines: string[] = [];
+      const result = await runLocalReview(
+        { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+        {
+          fetch: async () => {
+            calls += 1;
+            return new Response(modelResponse, { status: 200 });
+          },
+          env: envWith({
+            OPENROUTER_API_KEY: "test-key",
+            BUGBOT_REASONING_EFFORT: raw,
+          }),
+          log: (line) => lines.push(line),
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(calls).toBe(0);
+      expect(lines.join("\n")).toContain(
+        "Bugbot couldn't review: BUGBOT_REASONING_EFFORT must be one of max, xhigh, high, medium, low, minimal, none",
+      );
+    }
+  });
+
+  it("sends an accepted reasoning effort (fix5b)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const result = await runLocalReview(
+      { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
+      {
+        fetch: async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(modelResponse, { status: 200 });
+        },
+        env: envWith({
+          OPENROUTER_API_KEY: "test-key",
+          BUGBOT_REASONING_EFFORT: "low",
+        }),
+        log: () => undefined,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.reasoning).toEqual({ effort: "low" });
+  });
+
+  it("sends the budget, not the effort, for an allow-listed model (fix5b)", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const result = await runLocalReview(
       { diffPath: join(fixtureDir, "change.diff"), repoDir: fixtureDir },
@@ -445,7 +514,8 @@ describe("runLocalReview", () => {
         env: envWith({
           OPENROUTER_API_KEY: "test-key",
           BUGBOT_MODEL: "anthropic/claude-sonnet-4",
-          BUGBOT_REASONING_MAX_TOKENS: "31999",
+          BUGBOT_REASONING_EFFORT: "low",
+          BUGBOT_REASONING_MAX_TOKENS: "4000",
         }),
         log: () => undefined,
       },
@@ -453,7 +523,7 @@ describe("runLocalReview", () => {
 
     expect(result.exitCode).toBe(0);
     expect(bodies).toHaveLength(1);
-    expect(bodies[0]?.reasoning).toEqual({ max_tokens: 31_999 });
+    expect(bodies[0]?.reasoning).toEqual({ max_tokens: 4_000 });
   });
 
   it("refuses paths that try to leave the repo dir", async () => {

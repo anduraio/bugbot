@@ -1000,11 +1000,43 @@ describe("runPrReview pass 1", () => {
     const requests = mainModelCalls(calls);
     expect(requests).toHaveLength(1);
     expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(1_234);
-    // DeepSeek is effort-only: a budget would be turned into an effort level,
-    // so it gets the default reasoning on with effort low instead.
+    // DeepSeek is effort-only, so effort high is sent explicitly.
+    expect(
+      (requests[0]!.body as { reasoning?: unknown }).reasoning,
+    ).toEqual({ effort: "high" });
+  });
+
+  it("passes BUGBOT_REASONING_EFFORT to the model request (fix5b)", async () => {
+    const world = makeWorld();
+    const { calls } = await runReview(world, {
+      BUGBOT_REASONING_EFFORT: "low",
+    });
+
+    const requests = mainModelCalls(calls);
+    expect(requests).toHaveLength(1);
     expect(
       (requests[0]!.body as { reasoning?: unknown }).reasoning,
     ).toEqual({ effort: "low" });
+  });
+
+  it("turns reasoning off on the one length retry (fix5b)", async () => {
+    const world = makeWorld({ modelEmptyLengths: 1 });
+    const { calls } = await runReview(world);
+
+    const requests = mainModelCalls(calls);
+    expect(requests).toHaveLength(2);
+    expect(
+      (requests[0]!.body as { reasoning?: unknown }).reasoning,
+    ).toEqual({ effort: "high" });
+    expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(
+      64_000,
+    );
+    expect(
+      (requests[1]!.body as { reasoning?: unknown }).reasoning,
+    ).toEqual({ effort: "none" });
+    expect((requests[1]!.body as { max_tokens: number }).max_tokens).toBe(
+      64_000,
+    );
   });
 
   it("passes BUGBOT_REASONING_MAX_TOKENS to an allow-listed model", async () => {
@@ -1037,14 +1069,14 @@ describe("runPrReview pass 1", () => {
   });
 });
 
-describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4)", () => {
+describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4, fix5b)", () => {
   const invalid = [
     "abc",
     "0",
     "-5",
     "8000.5",
     "999",
-    "64001",
+    "128001",
     "99999999999999999999",
     "8e3",
   ];
@@ -1058,7 +1090,7 @@ describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4)", () => {
 
       expect(result).toMatchObject({ exitCode: 0, conclusion: "none" });
       expect(result.error).toContain(
-        "BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 64000",
+        "BUGBOT_MAX_OUTPUT_TOKENS must be a whole number from 1000 to 128000",
       );
       // No GitHub request and no model call: the pass fails before both.
       expect(calls).toHaveLength(0);
@@ -1070,7 +1102,7 @@ describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4)", () => {
     });
   }
 
-  for (const value of ["1000", "64000"]) {
+  for (const value of ["1000", "64000", "128000"]) {
     it(`accepts the boundary value ${value}`, async () => {
       const world = makeWorld();
       const { calls } = await runReview(world, {
@@ -1086,14 +1118,14 @@ describe("BUGBOT_MAX_OUTPUT_TOKENS validation (F23-RV1-N4)", () => {
   }
 });
 
-describe("BUGBOT_REASONING_MAX_TOKENS validation (fix5)", () => {
+describe("BUGBOT_REASONING_MAX_TOKENS validation (fix5, fix5b)", () => {
   const invalid = [
     "abc",
     "0",
     "1023",
     "64001",
     "8000.5",
-    "32000",
+    "64000",
   ];
 
   for (const value of invalid) {
@@ -1105,8 +1137,8 @@ describe("BUGBOT_REASONING_MAX_TOKENS validation (fix5)", () => {
 
       expect(result).toMatchObject({ exitCode: 0, conclusion: "none" });
       expect(result.error).toContain(
-        value === "32000"
-          ? "BUGBOT_REASONING_MAX_TOKENS must be strictly below the 32000-token output ceiling"
+        value === "64000"
+          ? "BUGBOT_REASONING_MAX_TOKENS must be strictly below the 64000-token output ceiling"
           : "BUGBOT_REASONING_MAX_TOKENS must be a whole number from 1024 to 64000",
       );
       // No GitHub request and no model call: the pass fails before both.
@@ -1117,7 +1149,7 @@ describe("BUGBOT_REASONING_MAX_TOKENS validation (fix5)", () => {
     });
   }
 
-  for (const value of ["1024", "31999"]) {
+  for (const value of ["1024", "31999", "63999"]) {
     it(`accepts the boundary value ${value}`, async () => {
       const world = makeWorld();
       const { calls } = await runReview(world, {
@@ -1136,16 +1168,77 @@ describe("BUGBOT_REASONING_MAX_TOKENS validation (fix5)", () => {
   it("rejects a budget at or above a raised output ceiling", async () => {
     const world = makeWorld();
     const { result, calls } = await runReview(world, {
-      BUGBOT_MAX_OUTPUT_TOKENS: "64000",
-      BUGBOT_REASONING_MAX_TOKENS: "64000",
+      BUGBOT_MAX_OUTPUT_TOKENS: "10000",
+      BUGBOT_REASONING_MAX_TOKENS: "10000",
     });
 
     expect(result).toMatchObject({ exitCode: 0, conclusion: "none" });
     expect(result.error).toContain(
-      "BUGBOT_REASONING_MAX_TOKENS must be strictly below the 64000-token output ceiling",
+      "BUGBOT_REASONING_MAX_TOKENS must be strictly below the 10000-token output ceiling",
     );
     expect(calls).toHaveLength(0);
   });
+
+  it("sends effort high when neither effort nor budget is configured (fix5b)", async () => {
+    const world = makeWorld();
+    const { calls } = await runReview(world, {
+      BUGBOT_MODEL: "anthropic/claude-sonnet-4",
+    });
+
+    const requests = mainModelCalls(calls);
+    expect(requests).toHaveLength(1);
+    expect(
+      (requests[0]!.body as { reasoning?: unknown }).reasoning,
+    ).toEqual({ effort: "high" });
+    expect((requests[0]!.body as { max_tokens: number }).max_tokens).toBe(
+      64_000,
+    );
+  });
+});
+
+describe("BUGBOT_REASONING_EFFORT validation (fix5b)", () => {
+  const invalid = ["auto", "HIGHEST", "0", "medium,high"];
+
+  for (const value of invalid) {
+    it(`rejects ${JSON.stringify(value)} before any request`, async () => {
+      const world = makeWorld();
+      const { result, calls, logs } = await runReview(world, {
+        BUGBOT_REASONING_EFFORT: value,
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, conclusion: "none" });
+      expect(result.error).toContain(
+        "BUGBOT_REASONING_EFFORT must be one of max, xhigh, high, medium, low, minimal, none",
+      );
+      expect(calls).toHaveLength(0);
+      expect(
+        logs.some((line) => line.includes("BUGBOT_REASONING_EFFORT")),
+      ).toBe(true);
+    });
+  }
+
+  for (const value of [
+    "max",
+    "xhigh",
+    "high",
+    "medium",
+    "low",
+    "minimal",
+    "none",
+  ]) {
+    it(`accepts ${value}`, async () => {
+      const world = makeWorld();
+      const { calls } = await runReview(world, {
+        BUGBOT_REASONING_EFFORT: value,
+      });
+
+      const requests = mainModelCalls(calls);
+      expect(requests).toHaveLength(1);
+      expect(
+        (requests[0]!.body as { reasoning?: unknown }).reasoning,
+      ).toEqual({ effort: value });
+    });
+  }
 });
 
 describe("runPrReview post failures (S6B-B1)", () => {
@@ -2775,16 +2868,15 @@ describe("runPrReview failures", () => {
     expect(result.exitCode).toBe(0);
     expect(result.conclusion).toBe("neutral");
     expect(result.error).toContain(
-      "whole 16000-token output budget on reasoning",
+      "whole 64000-token output budget on reasoning",
     );
 
     const summary = summaryBody(world);
-    expect(summary).toContain("- Tokens: 2700 in / 24000 out");
+    expect(summary).toContain("- Tokens: 1800 in / 16000 out");
     expect(summary).toContain("Bugbot couldn't review:");
-    expect(summary).toContain("whole 16000-token output budget on reasoning");
-    expect(summary).toContain("- Reasoning: #1 effort=low cap 8000");
-    expect(summary).toContain("#2 effort=none cap 8000");
-    expect(summary).toContain("#3 effort=none cap 16000");
+    expect(summary).toContain("whole 64000-token output budget on reasoning");
+    expect(summary).toContain("- Reasoning: #1 effort=high cap 64000");
+    expect(summary).toContain("#2 effort=none cap 64000");
 
     const finish = callsWhere(
       calls,
@@ -2793,12 +2885,8 @@ describe("runPrReview failures", () => {
     );
     const output = (finish[0]!.body as { output: { summary: string } }).output
       .summary;
-    expect(output).toContain("Reasoning: #1 effort=low cap 8000");
-    expect(output).toContain("#2 effort=none cap 8000");
-    expect(output).toContain("#3 effort=none cap 16000");
-    expect(summary).toContain("- Reasoning: #1 effort=low cap 8000");
-    expect(summary).toContain("#2 effort=none cap 8000");
-    expect(summary).toContain("#3 effort=none cap 16000");
+    expect(output).toContain("Reasoning: #1 effort=high cap 64000");
+    expect(output).toContain("#2 effort=none cap 64000");
     expect(logs.some((line) => line.includes(" finish_reason=length"))).toBe(true);
     expect(logs.some((line) => line.includes("hidden reasoning text"))).toBe(
       false,

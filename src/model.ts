@@ -20,30 +20,39 @@ export type FetchLike = (
 
 export type Sleep = (milliseconds: number) => Promise<void>;
 
+/** OpenRouter `reasoning.effort` values this client accepts. */
+export type ReasoningEffort =
+  | "max"
+  | "xhigh"
+  | "high"
+  | "medium"
+  | "low"
+  | "minimal"
+  | "none";
+
+/** Attempt 1 reasons at high effort unless configured otherwise. */
+export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "high";
+
 export interface ModelOptions {
   /** OPENROUTER_API_KEY. Read from the shell environment by the CLI. */
   apiKey?: string;
   /**
-   * Output token cap sent as `max_tokens`. Default 8000. A `length` stop
-   * with empty content doubles it, up to `maxOutputTokensCeiling`.
+   * Output token cap sent as `max_tokens`. Default 64000. An empty `length`
+   * stop retries once at the same cap with reasoning off.
    */
   maxOutputTokens?: number;
   /**
-   * Highest `max_tokens` a retry after a `length` stop may grow to.
-   * Default 32000; never below `maxOutputTokens`.
+   * OpenRouter `reasoning.effort` for the first attempt. Default `high`, sent
+   * explicitly as `reasoning.effort`. A `length` stop turns it off on the
+   * single retry.
    */
-  maxOutputTokensCeiling?: number;
+  reasoningEffort?: ReasoningEffort;
   /**
-   * Optional OpenRouter `reasoning.effort` override, used on the first
-   * attempt even for a model that honors `reasoning.max_tokens`. Without it
-   * an effort-only model reasons at `low` and an allow-listed model gets
-   * `reasoning.max_tokens` = `reasoningMaxTokens`.
-   */
-  reasoningEffort?: "none" | "low" | "medium" | "high" | "max";
-  /**
-   * Reasoning budget sent as `reasoning.max_tokens` for the models in
-   * `modelHonorsReasoningMaxTokens`. Default 8000. It is only sent to those
-   * models; effort-only models turn it into an effort level instead.
+   * Optional reasoning budget sent as `reasoning.max_tokens`. Omitted by
+   * default. It is only sent to the models in `modelHonorsReasoningMaxTokens`;
+   * every other model ignores it. When both this and `reasoningEffort` are
+   * set, the budget wins for an allow-listed model and the effort wins for
+   * every other model.
    */
   reasoningMaxTokens?: number;
   /** Retries after the first attempt. Default: 2. */
@@ -53,8 +62,9 @@ export interface ModelOptions {
   /** Injectable sleep, so tests do not wait for backoff. */
   sleep?: Sleep;
   /**
-   * Per-attempt timeout for the first cap. Default 120 seconds. A retry with
-   * a bigger output cap gets proportionally more time, up to 300 seconds.
+   * Per-attempt timeout for the first cap, mainly for tests. Without it the
+   * timeout is derived from the cap: cap / 80 tokens per second, at least
+   * 120 s and at most 1800 s, so a 64000-token reply can finish.
    */
   timeoutMs?: number;
   /** One-line diagnostic sink for an empty completion. Default console.warn. */
@@ -74,14 +84,15 @@ export interface ModelResult {
 
 /**
  * What one attempt sent and cost. `reasoning` is a fixed setting label such
- * as `effort=low` or `max_tokens=8000`; no reasoning or prompt text is kept.
+ * as `effort=high` or `max_tokens=8000`; no reasoning or prompt text
+ * is kept.
  */
 export interface ModelAttempt {
   /** 1-based attempt number. */
   attempt: number;
   /** `max_tokens` sent for this attempt. */
   maxTokens: number;
-  /** `effort=<level>`, `effort=none` or `max_tokens=<n>`. */
+  /** `effort=<level>` or `max_tokens=<n>`. */
   reasoning: string;
   tokensIn: number;
   tokensOut: number;
@@ -123,22 +134,25 @@ export class BugbotModelError extends Error {
 }
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MAX_OUTPUT_TOKENS = 8_000;
-/** The highest `max_tokens` the retry ladder may use without configuration. */
-export const DEFAULT_MAX_OUTPUT_TOKENS_CEILING = 32_000;
-export const DEFAULT_REASONING_MAX_TOKENS = 8_000;
+/** Default output cap. A length stop retries at the same cap with reasoning off. */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
 /** Provider minimum for a `reasoning.max_tokens` budget. */
 export const MIN_REASONING_MAX_TOKENS = 1_024;
 const DEFAULT_RETRIES = 2;
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_ATTEMPT_TIMEOUT_MS = 300_000;
+const MIN_ATTEMPT_TIMEOUT_MS = 120_000;
+const MAX_ATTEMPT_TIMEOUT_MS = 1_800_000;
+/**
+ * Measured throughput is roughly 90 tokens/s. A slightly slower 80 tokens/s
+ * gives a 64000-token reply about 13 minutes instead of 12.
+ */
+const TOKENS_PER_SECOND = 80;
 
 /**
  * Models that honor `reasoning.max_tokens`. OpenRouter's
  * `GET /api/v1/models` reports `supports_max_tokens: true` for these ids.
- * Effort-only models (including DeepSeek) turn a `max_tokens` budget into an
- * effort level, so they must use `reasoning.effort` instead. This is a static
- * allow-list on purpose: no runtime model lookup.
+ * Effort-only models (including DeepSeek) do not, so a configured budget is
+ * ignored for them and `reasoning.effort` is the only override. This is a
+ * static allow-list on purpose: no runtime model lookup.
  */
 export function modelHonorsReasoningMaxTokens(model: string): boolean {
   const id = model.trim().toLowerCase();
@@ -151,74 +165,39 @@ export function modelHonorsReasoningMaxTokens(model: string): boolean {
 }
 
 type ReasoningSetting =
-  | { readonly kind: "effort"; readonly effort: "low" | "medium" | "high" | "max" }
-  | { readonly kind: "budget"; readonly maxTokens: number }
-  | { readonly kind: "off" };
+  | { readonly kind: "effort"; readonly effort: ReasoningEffort }
+  | { readonly kind: "budget"; readonly maxTokens: number };
 
 /** A fixed, safe name for the request's reasoning setting. */
 function reasoningLabel(setting: ReasoningSetting): string {
-  if (setting.kind === "off") {
-    return "effort=none";
-  }
-
   return setting.kind === "effort"
     ? `effort=${setting.effort}`
     : `max_tokens=${setting.maxTokens}`;
 }
 
 /**
- * The first attempt always reasons unless an override says otherwise:
- * a budget for an allow-listed model, `low` effort for every other model.
+ * Attempt 1 always sends an explicit setting. For an allow-listed model a
+ * configured budget wins over the effort; for every other model the effort
+ * wins and a budget is ignored.
  */
 function firstReasoningSetting(
   model: string,
-  effort: ModelOptions["reasoningEffort"],
-  maxTokens: number,
+  effort: ReasoningEffort,
+  maxTokens: number | undefined,
 ): ReasoningSetting {
-  if (effort === "none") {
-    return { kind: "off" };
+  // The budget is only valid for an allow-listed model; elsewhere it is
+  // ignored, and the configured effort still applies.
+  if (modelHonorsReasoningMaxTokens(model) && maxTokens !== undefined) {
+    return { kind: "budget", maxTokens };
   }
 
-  if (effort !== undefined) {
-    return { kind: "effort", effort };
-  }
-
-  return modelHonorsReasoningMaxTokens(model)
-    ? { kind: "budget", maxTokens }
-    : { kind: "effort", effort: "low" };
-}
-
-/**
- * After a `length` stop with empty content, an effort-only model must stop
- * reasoning at once. An allow-listed model halves its budget first and turns
- * reasoning off on the final attempt, which always answers.
- */
-function retryReasoningSetting(
-  current: ReasoningSetting,
-  model: string,
-  maxTokens: number,
-): ReasoningSetting {
-  if (!modelHonorsReasoningMaxTokens(model)) {
-    return { kind: "off" };
-  }
-
-  const budget = current.kind === "budget" ? current.maxTokens : maxTokens;
-
-  // Never go below the provider minimum; a 1024 budget cannot be halved.
-  return {
-    kind: "budget",
-    maxTokens: Math.max(MIN_REASONING_MAX_TOKENS, Math.floor(budget / 2)),
-  };
+  return { kind: "effort", effort };
 }
 
 /** The exact `reasoning` object sent to OpenRouter. */
 function reasoningField(
   setting: ReasoningSetting,
-): { effort: string } | { max_tokens: number } {
-  if (setting.kind === "off") {
-    return { effort: "none" };
-  }
-
+): { effort: ReasoningEffort } | { max_tokens: number } {
   return setting.kind === "effort"
     ? { effort: setting.effort }
     : { max_tokens: setting.maxTokens };
@@ -237,9 +216,22 @@ function numberOrZero(value: unknown): number {
 }
 
 /**
+ * The automatic per-attempt timeout for a cap: about 80 tokens/s, never below
+ * 120 s and never above 1800 s. At the default 64000-token cap this is 800 s,
+ * enough for a reply measured at roughly 90 tokens/s.
+ */
+export function defaultAttemptTimeoutMs(cap: number): number {
+  const needed = Math.ceil(((cap > 0 ? cap : 0) / TOKENS_PER_SECOND) * 1_000);
+  return Math.min(
+    MAX_ATTEMPT_TIMEOUT_MS,
+    Math.max(MIN_ATTEMPT_TIMEOUT_MS, needed),
+  );
+}
+
+/**
  * A bigger `max_tokens` gives the model more to write, so a retried attempt
- * gets more time: the first attempt keeps `timeoutMs`, each bigger cap scales
- * it, and one hung request is still bounded by `MAX_ATTEMPT_TIMEOUT_MS`.
+ * gets more time proportionally. An explicit `timeoutMs` is the base for the
+ * smallest cap; one hung request is still bounded by `MAX_ATTEMPT_TIMEOUT_MS`.
  */
 export function scaledAttemptTimeout(
   timeoutMs: number,
@@ -466,27 +458,27 @@ export async function callModel(
   const fetchFn: FetchLike =
     options.fetch ?? ((input, init) => globalThis.fetch(input, init));
   const sleep = options.sleep ?? defaultSleep;
+  const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const baseCap = maxOutputTokens > 0 ? maxOutputTokens : DEFAULT_MAX_OUTPUT_TOKENS;
   const timeoutMs =
     options.timeoutMs !== undefined && options.timeoutMs > 0
       ? options.timeoutMs
-      : DEFAULT_TIMEOUT_MS;
-  const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
-  const baseCap = maxOutputTokens > 0 ? maxOutputTokens : DEFAULT_MAX_OUTPUT_TOKENS;
-  const ceiling = Math.max(
-    maxOutputTokens,
-    options.maxOutputTokensCeiling ?? DEFAULT_MAX_OUTPUT_TOKENS_CEILING,
-  );
+      : defaultAttemptTimeoutMs(baseCap);
   const retries = Math.max(0, options.retries ?? DEFAULT_RETRIES);
   const totalAttempts = 1 + retries;
   const log = options.log ?? ((line: string) => console.warn(line));
-  const reasoningMaxTokens =
-    options.reasoningMaxTokens ?? DEFAULT_REASONING_MAX_TOKENS;
   let cap = maxOutputTokens;
   let reasoning = firstReasoningSetting(
     call.model,
-    options.reasoningEffort,
-    reasoningMaxTokens,
+    options.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+    options.reasoningMaxTokens,
   );
+  /**
+   * After a length stop, one retry runs with reasoning off. A transient
+   * failure on that retry may still be retried, but a second length stop ends
+   * the call: there is no bigger cap and no second fallback.
+   */
+  let lengthFallbackActive = false;
 
   let lastMessage = "OpenRouter request failed";
   /** The last empty-reply cause, kept when a later attempt times out. */
@@ -503,7 +495,7 @@ export async function callModel(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
     let retryable = false;
-    let growCap = false;
+    let lengthStop = false;
     let attemptIn = 0;
     let attemptOut = 0;
     let attemptReasoning = 0;
@@ -600,7 +592,7 @@ export async function callModel(
             lastMessage = lastDiagnosis;
             lastStatus = response.status;
             retryable = true;
-            growCap =
+            lengthStop =
               details.finishReason === "length" &&
               details.errorCode === null &&
               details.errorMessage === null;
@@ -659,19 +651,14 @@ export async function callModel(
       break;
     }
 
-    const nextIsFinal = attempt + 2 === totalAttempts;
-    if (nextIsFinal) {
-      // The last attempt always answers with reasoning off. A finite output
-      // cap is what remains, so grow it once only on this attempt.
-      reasoning = { kind: "off" };
-      if (growCap) {
-        cap = Math.min(cap * 2, ceiling);
+    if (lengthStop) {
+      // A second length stop already came from the reasoning-off retry. There
+      // is no bigger cap and no second fallback, so stop here.
+      if (lengthFallbackActive) {
+        break;
       }
-    } else if (growCap) {
-      // One retry at the same cap with reasoning bounded, then a bigger cap
-      // on the final attempt. This bounds worst-case tokens and time while
-      // still giving a genuinely long answer more room.
-      reasoning = retryReasoningSetting(reasoning, call.model, reasoningMaxTokens);
+      lengthFallbackActive = true;
+      reasoning = { kind: "effort", effort: "none" };
     }
 
     const backoff = 500 * 2 ** attempt + Math.floor(Math.random() * 250);
@@ -679,9 +666,10 @@ export async function callModel(
   }
 
   const statusSuffix = lastStatus === null ? "" : ` (last status ${lastStatus})`;
+  const attemptCount = used.length;
   throw new BugbotModelError(
-    `${lastMessage}${statusSuffix} after ${totalAttempts} attempt${
-      totalAttempts === 1 ? "" : "s"
+    `${lastMessage}${statusSuffix} after ${attemptCount} attempt${
+      attemptCount === 1 ? "" : "s"
     }`,
     { tokensIn, tokensOut },
     used,

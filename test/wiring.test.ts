@@ -58,6 +58,40 @@ describe("max_output_tokens wiring", () => {
     );
   });
 
+  it("declares reasoning_effort and forwards it (fix5b)", () => {
+    const action = readFileSync(join(root, "action.yml"), "utf8");
+    expect(action).toContain("reasoning_effort:");
+    expect(action).toContain(
+      "BUGBOT_REASONING_EFFORT: ${{ inputs.reasoning_effort }}",
+    );
+
+    const workflow = readFileSync(
+      join(root, ".github/workflows/review.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/^      reasoning_effort:/gm)).toHaveLength(2);
+    expect(workflow).toContain(
+      "reasoning_effort: ${{ inputs.reasoning_effort }}",
+    );
+  });
+
+  it("defaults max_output_tokens to 64000, effort to high, budget to off (fix5b)", () => {
+    const action = readFileSync(join(root, "action.yml"), "utf8");
+    expect(action).toMatch(
+      /max_output_tokens:[\s\S]*?default: "64000"/,
+    );
+    expect(action).toMatch(/reasoning_effort:[\s\S]*?default: "high"/);
+    expect(action).toMatch(/reasoning_max_tokens:[\s\S]*?default: ""/);
+
+    const workflow = readFileSync(
+      join(root, ".github/workflows/review.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/default: "64000"/g)).toHaveLength(2);
+    expect(workflow.match(/reasoning_effort:[\s\S]*?default: "high"/g)).toHaveLength(2);
+    expect(workflow.match(/reasoning_max_tokens:[\s\S]*?default: ""/g)).toHaveLength(2);
+  });
+
   it("declares reasoning_max_tokens and forwards it (fix5)", () => {
     const action = readFileSync(join(root, "action.yml"), "utf8");
     expect(action).toContain("reasoning_max_tokens:");

@@ -789,7 +789,7 @@ export interface ReviewSummary {
   tokensOut: number;
   /**
    * Safe per-attempt reasoning settings and token counts for the main model
-   * call, for example `#1 effort=low cap 8000 (...)`.
+   * call, for example `#1 default cap 64000 (...)`.
    */
   reasoning?: string;
   /** Inline comments posted by this pass only. */

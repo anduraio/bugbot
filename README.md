@@ -172,9 +172,9 @@ node dist/cli.js review --local --diff change.diff --repo-dir . --print-prompt
 
 The model comes from `BUGBOT_MODEL` (default
 `deepseek/deepseek-v4.1-flash-1017`) and is sent through OpenRouter. Tokens in
-and out are logged as `tokens_in` and `tokens_out` for every run. Prices are
-never hardcoded: read them from OpenRouter's model page for the model you
-choose.
+and out are logged as `tokens_in` and `tokens_out` for every run. Prices come
+from OpenRouter's model page; the worst case below uses the $1.20 per million
+output tokens price Andura measured for DeepSeek v4.1 flash.
 
 `--local` extras:
 
@@ -187,28 +187,35 @@ choose.
   or a context that is over budget after truncation. Without it, those
   reviews are skipped with a reason instead of sent past the budget.
 - `BUGBOT_MAX_OUTPUT_TOKENS` is the model output cap sent as `max_tokens`
-  (default 8000). A set value must be a whole number from 1000 to 64000;
+  (default 64000). A set value must be a whole number from 1000 to 128000;
   anything else ends the pass with a clear message before any model request.
-  A `length` stop with empty content retries once at the same cap with
-  reasoning bounded (off for effort-only models), then once at twice the cap
-  (capped at 32000) with reasoning off. Each attempt's timeout (120 s by
-  default) grows with the cap it sends, bounded at 300 s, so the biggest
-  retry has time to finish.
-- `BUGBOT_REASONING_MAX_TOKENS` is the reasoning budget sent as
-  `reasoning.max_tokens` for models that honor it (default 8000). It must be
-  a whole number from 1024 to 64000 and strictly below the highest output cap
-  (`max_output_tokens` or 32000, whichever is higher); a bad value ends the
-  pass before any request. Reasoning is on by default: an allow-listed model
-  gets this budget, every other model gets `reasoning.effort: "low"`. On a
-  `length` stop with empty content an allow-listed model halves the budget on
-  the first retry and every model turns reasoning off on the final attempt.
+  An empty `length` stop retries once at the same cap with reasoning off; the
+  cap never grows. The per-attempt timeout is derived from the cap at about
+  80 tokens/s (at least 120 s, at most 1800 s), so the default 64000-token cap
+  gets 800 s.
+- `BUGBOT_REASONING_EFFORT` sets `reasoning.effort` on the first attempt
+  (`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`). The default is
+  `high`; it is sent explicitly as `reasoning.effort`, so the model cannot pick
+  its own level. A bad value ends the pass before any request. On a `length`
+  stop with empty content the single retry always sends
+  `reasoning.effort: "none"`.
+- `BUGBOT_REASONING_MAX_TOKENS` is an optional reasoning budget sent as
+  `reasoning.max_tokens` for models that honor it (anthropic, google/gemini
+  and qwen ids). Empty, the default, sends no budget. A set value must be a
+  whole number from 1024 to 64000 and strictly below the output cap; a bad
+  value ends the pass before any request. On an effort-only model such as
+  DeepSeek the budget is ignored; when both effort and budget are set, the
+  budget wins for an allow-listed model and the effort wins for every other
+  model.
 
 ## Workflow inputs
 
 The reusable workflow and the composite action accept `model`, `big_pr_model`,
 `max_tokens` (input budget, default 120000), `max_output_tokens` (model output
-cap, default 8000), `reasoning_max_tokens` (reasoning budget, default 8000,
-passed as `BUGBOT_REASONING_MAX_TOKENS`), `min_confidence`, `dry_run` and
+cap, default 64000), `reasoning_effort` (first-attempt reasoning, default
+`high`, passed as `BUGBOT_REASONING_EFFORT`), `reasoning_max_tokens` (optional
+reasoning budget, default empty = off, passed as
+`BUGBOT_REASONING_MAX_TOKENS`), `min_confidence`, `dry_run` and
 `comment_sicko`.
 
 An empty model reply logs one line with its `max_tokens`, the reasoning
@@ -217,6 +224,30 @@ count, the usage numbers and any provider `error` code and message. It never
 logs the prompt or the reasoning text. Every attempt also logs its setting,
 and the summary shows the same settings and token counts. Safe usage from
 those failed attempts is still counted in the summary's `Tokens` line.
+
+## Cost and reasoning
+
+The first attempt reasons at high effort by default: it sends
+`reasoning: { effort: "high" }`, not a token budget. The output cap is 64000
+tokens, and no `reasoning.max_tokens` budget is sent unless
+`reasoning_max_tokens` is set (anthropic, google/gemini and qwen ids only).
+If an attempt stops on `length` with no content, Bugbot makes exactly one retry
+at the same cap with reasoning off (`reasoning.effort: "none"`); the cap is
+never raised.
+
+To switch back to a smaller reasoning spend, set `reasoning_effort: low` (or
+`BUGBOT_REASONING_EFFORT=low` locally), or lower `max_output_tokens`. For an
+allow-listed model, `reasoning_max_tokens` sets a budget instead. All are one
+input and need no code change.
+
+Worst case for one review with the defaults (64000 output cap, two retries,
+one re-check): six OpenRouter requests (three review attempts, three re-check
+attempts), at most 198000 output tokens, about 46 minutes of per-attempt
+timeouts, and at $1.20 per million output tokens, about $0.24. Input tokens
+are extra. At the maximum accepted `max_output_tokens` of 128000 the output
+worst case is 390000 tokens, about $0.47, and about 86 minutes. The reusable
+workflow sets no `timeout-minutes`, so GitHub's 360-minute job default still
+covers the worst case.
 
 ## Development
 

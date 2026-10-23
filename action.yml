@@ -14,13 +14,17 @@ inputs:
     required: false
     default: "120000"
   max_output_tokens:
-    description: Output cap sent as max_tokens. A length stop retries at the same cap, then doubles once, up to 32000.
+    description: Output cap sent as max_tokens. An empty length stop retries once at the same cap with reasoning off.
     required: false
-    default: "8000"
+    default: "64000"
+  reasoning_effort:
+    description: Reasoning effort for the first attempt (max, xhigh, high, medium, low, minimal, none). Default high; none turns reasoning off.
+    required: false
+    default: "high"
   reasoning_max_tokens:
-    description: Reasoning budget for models that honor reasoning.max_tokens. Must be strictly below the output ceiling.
+    description: Optional reasoning budget sent as reasoning.max_tokens for models that honor it. Empty leaves the budget off. Must be strictly below the output cap.
     required: false
-    default: "8000"
+    default: ""
   min_confidence:
     description: Minimum confidence for an inline comment.
     required: false
@@ -45,6 +49,7 @@ runs:
         BUGBOT_BIG_PR_MODEL: ${{ inputs.big_pr_model }}
         BUGBOT_MAX_TOKENS: ${{ inputs.max_tokens }}
         BUGBOT_MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+        BUGBOT_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
         BUGBOT_REASONING_MAX_TOKENS: ${{ inputs.reasoning_max_tokens }}
         BUGBOT_MIN_CONFIDENCE: ${{ inputs.min_confidence }}
         BUGBOT_DRY_RUN: ${{ inputs.dry_run }}
